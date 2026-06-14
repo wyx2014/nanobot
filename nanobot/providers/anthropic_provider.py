@@ -250,14 +250,18 @@ class AnthropicProvider(LLMProvider):
     @staticmethod
     def _convert_image_block(block: dict[str, Any]) -> dict[str, Any] | None:
         """Convert OpenAI image_url block to Anthropic image block."""
+        _SUPPORTED_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
         url = (block.get("image_url") or {}).get("url", "")
         if not url:
             return None
-        m = re.match(r"data:(image/\w+);base64,(.+)", url, re.DOTALL)
+        m = re.match(r"data:(image/[A-Za-z0-9.+-]+);base64,(.+)", url, re.DOTALL)
         if m:
+            mime = m.group(1)
+            if mime not in _SUPPORTED_MIMES:
+                return None
             return {
                 "type": "image",
-                "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)},
+                "source": {"type": "base64", "media_type": mime, "data": m.group(2)},
             }
         return {
             "type": "image",

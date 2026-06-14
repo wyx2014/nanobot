@@ -1,6 +1,6 @@
 ---
 name: weather
-description: Get current weather and forecasts (no API key required).
+description: 获取当前天气和天气预报（无需 API 密钥）。
 homepage: https://wttr.in/:help
 metadata: {"nanobot":{"emoji":"🌤️","requires":{"bins":["curl"]}}}
 ---

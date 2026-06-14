@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import urllib.parse
+from pathlib import Path
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
 from typing import Any, Mapping
@@ -15,6 +16,7 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.bus.events import (
     INBOUND_META_RUNTIME_CONTROL,
     RUNTIME_CONTROL_ACK,
@@ -161,6 +163,108 @@ def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None
     return None
 
 
+_ARTIFACT_EXTENSIONS: frozenset[str] = frozenset((
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".pdf", ".csv", ".xlsx", ".docx", ".html", ".txt",
+))
+_SKIP_ARTIFACT_DIRS: frozenset[str] = frozenset((
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+))
+
+
+def _artifact_snapshot(root: str | None) -> dict[Path, tuple[int, int]]:
+    if not root:
+        return {}
+    base = Path(root).expanduser().resolve(strict=False)
+    if not base.is_dir():
+        return {}
+    out: dict[Path, tuple[int, int]] = {}
+    stack = [base]
+    visited = 0
+    while stack and visited < 3000:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name in _SKIP_ARTIFACT_DIRS:
+                continue
+            visited += 1
+            if visited >= 3000:
+                break
+            try:
+                if entry.is_dir():
+                    stack.append(entry)
+                    continue
+                if not entry.is_file() or entry.suffix.lower() not in _ARTIFACT_EXTENSIONS:
+                    continue
+                stat = entry.stat()
+            except OSError:
+                continue
+            out[entry.resolve(strict=False)] = (stat.st_mtime_ns, stat.st_size)
+    return out
+
+
+def _changed_artifacts(
+    root: str | None,
+    before: dict[Path, tuple[int, int]],
+) -> list[Path]:
+    after = _artifact_snapshot(root)
+    changed: list[Path] = []
+    for path, stamp in after.items():
+        if before.get(path) != stamp:
+            changed.append(path)
+    return sorted(changed, key=lambda p: str(p))
+
+
+def _copy_artifacts_to_workspace(
+    *,
+    server_cwd: str | None,
+    before: dict[Path, tuple[int, int]],
+    result_text: str,
+) -> str:
+    if not server_cwd:
+        return result_text
+    source_root = Path(server_cwd).expanduser().resolve(strict=False)
+    if not source_root.is_dir():
+        return result_text
+    access = current_tool_workspace(source_root, restrict_to_workspace=False)
+    workspace = access.project_path
+    if workspace is None:
+        return result_text
+    workspace = Path(workspace).expanduser().resolve(strict=False)
+    if workspace == source_root:
+        return result_text
+
+    copied: list[tuple[Path, Path]] = []
+    for src in _changed_artifacts(server_cwd, before):
+        try:
+            rel = src.relative_to(source_root)
+        except ValueError:
+            rel = Path(src.name)
+        dst = workspace / rel
+        if dst.resolve(strict=False) == src.resolve(strict=False):
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            logger.warning("MCP artifact copy failed: {} -> {} ({})", src, dst, exc)
+            continue
+        copied.append((src, dst))
+
+    if not copied:
+        return result_text
+
+    updated = result_text
+    for src, dst in copied:
+        updated = updated.replace(str(src), str(dst))
+    copied_lines = "\n".join(f"- {dst}" for _, dst in copied)
+    note = "Artifacts copied to current workspace:\n" + copied_lines
+    return f"{updated}\n\n{note}" if updated else note
+
+
 def _normalize_schema_for_openai(schema: Any) -> dict[str, Any]:
     """Normalize only nullable JSON Schema patterns for tool definitions."""
     if not isinstance(schema, dict):
@@ -248,7 +352,7 @@ class MCPToolWrapper(_MCPWrapperBase):
 
     _plugin_discoverable = False
 
-    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
+    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30, server_cwd: str | None = None):
         self._set_mcp_connection(session, server_name)
         self._original_name = tool_def.name
         self._name = _sanitize_name(f"mcp_{server_name}_{tool_def.name}")
@@ -256,6 +360,7 @@ class MCPToolWrapper(_MCPWrapperBase):
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
         self._tool_timeout = tool_timeout
+        self._server_cwd = server_cwd
 
     @property
     def name(self) -> str:
@@ -274,6 +379,7 @@ class MCPToolWrapper(_MCPWrapperBase):
 
         retried_transient = False
         refreshed_session = False
+        artifact_snapshot = _artifact_snapshot(self._server_cwd)
         while True:
             try:
                 result = await asyncio.wait_for(
@@ -333,7 +439,12 @@ class MCPToolWrapper(_MCPWrapperBase):
                         parts.append(block.text)
                     else:
                         parts.append(str(block))
-                return "\n".join(parts) or "(no output)"
+                text = "\n".join(parts) or "(no output)"
+                return _copy_artifacts_to_workspace(
+                    server_cwd=self._server_cwd,
+                    before=artifact_snapshot,
+                    result_text=text,
+                )
 
         return "(MCP tool call failed)"  # Unreachable, but satisfies type checkers
 
@@ -704,7 +815,7 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout, server_cwd=cfg.cwd or None)
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1

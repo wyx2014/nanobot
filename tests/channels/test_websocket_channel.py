@@ -396,6 +396,44 @@ async def test_webui_user_transcript_append_failure_does_not_block_inbound(
 
 
 @pytest.mark.asyncio
+async def test_webui_message_envelope_appends_user_transcript(
+    bus: MagicMock,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nanobot.webui.transcript import read_transcript_lines
+
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    channel = _ch(bus)
+    conn = MagicMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "message",
+            "chat_id": "chat-1",
+            "content": "hello",
+            "webui": True,
+            "cli_apps": [{"name": "codex"}],
+            "mcp_presets": [{"name": "browser"}],
+        },
+    )
+
+    lines = read_transcript_lines("websocket:chat-1")
+    assert lines == [
+        {
+            "event": "user",
+            "chat_id": "chat-1",
+            "text": "hello",
+            "cli_apps": [{"name": "codex"}],
+            "mcp_presets": [{"name": "browser"}],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_plain_websocket_message_does_not_mark_webui(bus: MagicMock) -> None:
     channel = _ch(bus)
     conn = MagicMock()

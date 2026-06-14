@@ -1063,6 +1063,20 @@ def update_model_configuration(query: QueryParams) -> dict[str, Any]:
     return settings_payload()
 
 
+def delete_model_configuration(query: QueryParams) -> dict[str, Any]:
+    name = (_query_first(query, "name") or "").strip()
+    if not name or name == "default":
+        raise WebUISettingsError("model configuration name is required")
+
+    config = load_config()
+    if name in config.model_presets:
+        del config.model_presets[name]
+        if config.agents.defaults.model_preset == name:
+            config.agents.defaults.model_preset = None
+        save_config(config)
+    return settings_payload()
+
+
 def update_provider_settings(query: QueryParams) -> dict[str, Any]:
     provider_name = (_query_first(query, "provider") or "").strip()
     if not provider_name:

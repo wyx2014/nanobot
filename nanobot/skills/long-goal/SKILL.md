@@ -1,6 +1,6 @@
 ---
 name: long-goal
-description: Sustained objectives via long_task / complete_goal — idempotent goal wording, project-style modular work, early web/doc research, Runtime Context metadata.
+description: 通过 long_task 和 complete_goal 持续推进的长期目标管理 —— 幂等的目标描述、项目化模块分工、前置网页/文档调研、运行期上下文元数据。
 ---
 
 # Long-running objectives (`long_task` / `complete_goal`)

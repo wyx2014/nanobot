@@ -106,6 +106,7 @@ class BedrockProvider(LLMProvider):
 
     @staticmethod
     def _image_url_block(block: dict[str, Any]) -> dict[str, Any] | None:
+        _SUPPORTED_FORMATS = {"png", "jpeg", "gif", "webp"}
         url = (block.get("image_url") or {}).get("url", "")
         if not isinstance(url, str) or not url:
             return None
@@ -115,6 +116,8 @@ class BedrockProvider(LLMProvider):
         fmt = match.group(1).lower()
         if fmt == "jpg":
             fmt = "jpeg"
+        if fmt not in _SUPPORTED_FORMATS:
+            return {"text": f"(unsupported image format: {fmt})"}
         try:
             data = base64.b64decode(match.group(2), validate=False)
         except Exception:

@@ -1851,10 +1851,10 @@ def has_pending_tool_calls(lines: list[dict[str, Any]]) -> bool:
 def build_webui_thread_response(
     session_key: str,
     *,
+    session_messages: list[dict[str, Any]] | None = None,
     augment_user_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
     augment_assistant_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
     augment_assistant_text: Callable[[str], str] | None = None,
-    session_messages: list[dict[str, Any]] | None = None,
     limit: int | None = None,
     direction: str | None = None,
     before: str | None = None,

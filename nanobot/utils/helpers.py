@@ -171,10 +171,21 @@ def detect_image_mime(data: bytes) -> str | None:
     return None
 
 
+_VISION_SUPPORTED_MIMES: frozenset[str] = frozenset({
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+})
+
+
 def build_image_content_blocks(
     raw: bytes, mime: str, path: str, label: str
 ) -> list[dict[str, Any]]:
-    """Build native image blocks plus a short text label."""
+    """Build native image blocks plus a short text label.
+
+    Only embeds formats supported by vision APIs (PNG/JPEG/GIF/WebP).
+    Unsupported formats (e.g. SVG) fall back to the text label only.
+    """
+    if mime not in _VISION_SUPPORTED_MIMES:
+        return [{"type": "text", "text": label}]
     b64 = base64.b64encode(raw).decode()
     return [
         {

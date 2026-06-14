@@ -1,6 +1,6 @@
 ---
 name: cron
-description: Schedule reminders and recurring tasks.
+description: 调度定时提醒和周期性重复任务。
 ---
 
 # Cron

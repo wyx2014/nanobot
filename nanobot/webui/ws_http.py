@@ -169,6 +169,7 @@ class GatewayHTTPHandler:
         self._runtime_surface = runtime_surface
 
         from nanobot.webui.settings_api import runtime_capabilities as _rc
+        from nanobot.webui.schedule_routes import WebUIScheduleRouter
         from nanobot.webui.settings_routes import WebUISettingsRouter
 
         self._capabilities = _rc(runtime_surface, runtime_capabilities_overrides or {})
@@ -181,6 +182,14 @@ class GatewayHTTPHandler:
             error_response=_http_error,
             runtime_surface=runtime_surface,
             runtime_capabilities=self._capabilities,
+        )
+        self.schedule_routes = WebUIScheduleRouter(
+            cron_service=cron_service,
+            check_api_token=self.check_api_token,
+            parse_query=_parse_query,
+            json_response=_http_json_response,
+            error_response=_http_error,
+            logger=self._log,
         )
 
     def workspace_controls_available(self, connection: Any) -> bool:
@@ -223,6 +232,10 @@ class GatewayHTTPHandler:
 
         # Settings routes (delegated)
         response = await self.settings_routes.dispatch(request, got)
+        if response is not None:
+            return response
+
+        response = await self.schedule_routes.dispatch(request, got)
         if response is not None:
             return response
 
@@ -373,7 +386,10 @@ class GatewayHTTPHandler:
         cleaned = []
         for s in sessions:
             key = s.get("key")
-            if not (isinstance(key, str) and key.startswith("websocket:")):
+            if not (
+                isinstance(key, str)
+                and (key.startswith("websocket:") or key.startswith("cron:"))
+            ):
                 continue
             row = {k: v for k, v in s.items() if k != "path"}
             chat_id = key.split(":", 1)[1]
@@ -393,7 +409,7 @@ class GatewayHTTPHandler:
         decoded_key = _decode_api_key(key)
         if decoded_key is None:
             return _http_error(400, "invalid session key")
-        if not _is_websocket_channel_session_key(decoded_key):
+        if not _is_webui_readable_session_key(decoded_key):
             return _http_error(404, "session not found")
         data = self.session_manager.read_session_file(decoded_key)
         if data is None:
@@ -410,7 +426,7 @@ class GatewayHTTPHandler:
         decoded_key = _decode_api_key(key)
         if decoded_key is None:
             return _http_error(400, "invalid session key")
-        if not _is_websocket_channel_session_key(decoded_key):
+        if not _is_webui_readable_session_key(decoded_key):
             return _http_error(404, "session not found")
         scope = self.workspaces.scope_for_session_key(decoded_key)
         session_messages: list[dict[str, Any]] | None = None
@@ -433,6 +449,7 @@ class GatewayHTTPHandler:
         before = _query_first(query, "before")
         data = build_webui_thread_response(
             decoded_key,
+            session_messages=session_messages,
             augment_user_media=self.media.augment_transcript_media,
             augment_assistant_media=self.media.augment_transcript_media,
             augment_assistant_text=lambda text: self.media.rewrite_local_markdown_images(
@@ -664,3 +681,6 @@ class GatewayHTTPHandler:
 
 def _is_websocket_channel_session_key(key: str) -> bool:
     return key.startswith("websocket:")
+
+def _is_webui_readable_session_key(key: str) -> bool:
+    return key.startswith("websocket:") or key.startswith("cron:")

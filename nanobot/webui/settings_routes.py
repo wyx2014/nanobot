@@ -23,6 +23,7 @@ from nanobot.webui.mcp_presets_api import mcp_presets_settings_action
 from nanobot.webui.settings_api import (
     WebUISettingsError,
     create_model_configuration,
+    delete_model_configuration,
     decorate_settings_payload,
     login_oauth_provider,
     logout_oauth_provider,
@@ -37,12 +38,15 @@ from nanobot.webui.settings_api import (
     update_transcription_settings,
     update_web_search_settings,
 )
+from nanobot.webui.skills_api import WebUISkillsError, skills_action, skills_payload
 from nanobot.webui.version_check import check_for_update
 
 QueryParams = dict[str, list[str]]
 
 _MCP_VALUES_HEADER = "X-Nanobot-MCP-Values"
 _MCP_VALUES_HEADER_MAX_BYTES = 64 * 1024
+_SKILL_VALUES_HEADER = "X-Nanobot-Skill-Values"
+_SKILL_VALUES_HEADER_MAX_BYTES = 512 * 1024
 
 _MCP_PRESET_ACTIONS_BY_PATH = {
     "/api/settings/mcp-presets/enable": "enable",
@@ -91,6 +95,8 @@ class WebUISettingsRouter:
             return self._handle_settings_model_configuration_create(request)
         if path == "/api/settings/model-configurations/update":
             return self._handle_settings_model_configuration_update(request)
+        if path == "/api/settings/model-configurations/delete":
+            return self._handle_settings_model_configuration_delete(request)
         if path == "/api/settings/provider/update":
             return self._handle_settings_provider_update(request)
         if path == "/api/settings/provider-models":
@@ -117,6 +123,18 @@ class WebUISettingsRouter:
             return await self._handle_settings_cli_apps_action(request, "uninstall")
         if path == "/api/settings/cli-apps/test":
             return await self._handle_settings_cli_apps_action(request, "test")
+        if path == "/api/settings/skills":
+            return self._handle_settings_skills(request)
+        if path == "/api/settings/skills/detail":
+            return self._handle_settings_skills_action(request, "detail")
+        if path == "/api/settings/skills/enable":
+            return self._handle_settings_skills_action(request, "enable")
+        if path == "/api/settings/skills/disable":
+            return self._handle_settings_skills_action(request, "disable")
+        if path == "/api/settings/skills/delete":
+            return self._handle_settings_skills_action(request, "delete")
+        if path == "/api/settings/skills/save":
+            return self._handle_settings_skills_action(request, "save")
         if path == "/api/settings/mcp-presets":
             return await self._handle_settings_mcp_presets(request)
         if path == "/api/settings/version-check":
@@ -182,6 +200,30 @@ class WebUISettingsRouter:
                 merged[key] = [text]
         return merged
 
+    def _parse_skills_query(self, request: WsRequest) -> QueryParams:
+        query = self._query(request)
+        raw = request.headers.get(_SKILL_VALUES_HEADER)
+        if not raw:
+            return query
+        if len(raw.encode("utf-8")) > _SKILL_VALUES_HEADER_MAX_BYTES:
+            raise WebUISkillsError("skills payload is too large")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise WebUISkillsError("invalid skills payload") from exc
+        if not isinstance(payload, dict):
+            raise WebUISkillsError("skills payload must be a JSON object")
+        merged = {key: list(values) for key, values in query.items()}
+        for key, value in payload.items():
+            if not isinstance(key, str) or not key:
+                raise WebUISkillsError("skills payload contains an invalid key")
+            if value is None:
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            if text:
+                merged[key] = [text]
+        return merged
+
     def _handle_settings(self, request: WsRequest) -> Response:
         if not self._authorized(request):
             return self._unauthorized()
@@ -222,6 +264,15 @@ class WebUISettingsRouter:
             return self._unauthorized()
         try:
             payload = update_model_configuration(self._query(request))
+        except WebUISettingsError as e:
+            return self._error_response(e.status, e.message)
+        return self._json_response(self._with_restart_state(payload))
+
+    def _handle_settings_model_configuration_delete(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            payload = delete_model_configuration(self._query(request))
         except WebUISettingsError as e:
             return self._error_response(e.status, e.message)
         return self._json_response(self._with_restart_state(payload))
@@ -334,6 +385,35 @@ class WebUISettingsRouter:
             message = getattr(e, "message", str(e))
             if status >= 500:
                 self.logger.exception("CLI Apps action '{}' failed", action)
+            return self._error_response(status, message)
+        return self._json_response(payload)
+
+    def _handle_settings_skills(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            payload = skills_payload()
+        except Exception:
+            self.logger.exception("failed to load skills payload")
+            return self._error_response(500, "failed to load skills")
+        return self._json_response(payload)
+
+    def _handle_settings_skills_action(
+        self,
+        request: WsRequest,
+        action: str,
+    ) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            payload = skills_action(action, self._parse_skills_query(request))
+        except WebUISkillsError as e:
+            return self._error_response(e.status, e.message)
+        except Exception as e:
+            status = getattr(e, "status", 500)
+            message = getattr(e, "message", str(e))
+            if status >= 500:
+                self.logger.exception("Skills action '{}' failed", action)
             return self._error_response(status, message)
         return self._json_response(payload)
 

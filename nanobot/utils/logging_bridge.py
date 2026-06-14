@@ -26,7 +26,24 @@ class _LoguruBridge(logging.Handler):
         frame, depth = logging.currentframe(), 2
         while frame and frame.f_code.co_filename == logging.__file__:
             frame, depth = frame.f_back, depth + 1
-        logger.opt(depth=depth, exception=record.exc_info).log(
+
+        exc_info = record.exc_info
+        if (
+            self.lib_name == "websockets"
+            and record.msg == "opening handshake failed"
+            and exc_info
+        ):
+            exc_type, exc_value, _ = exc_info
+            try:
+                from websockets.exceptions import InvalidMessage
+                if issubclass(exc_type, InvalidMessage) and str(exc_value) == "did not receive a valid HTTP request":
+                    # Demote to WARNING level and omit traceback for empty TCP connections / probes
+                    level = "WARNING"
+                    exc_info = None
+            except ImportError:
+                pass
+
+        logger.opt(depth=depth, exception=exc_info).log(
             level, "[{lib}] {message}", lib=self.lib_name, message=record.getMessage()
         )
 

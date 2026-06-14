@@ -372,6 +372,28 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def handle_memory_read(request: web.Request) -> web.Response:
+    """GET /v1/memory"""
+    agent_loop = request.app["agent_loop"]
+    content = agent_loop.context.memory.read_memory()
+    return web.json_response({"content": content})
+
+
+async def handle_session_info(request: web.Request) -> web.Response:
+    """GET /v1/session/{session_id}/info"""
+    sid = request.match_info["session_id"]
+    agent_loop = request.app["agent_loop"]
+    session = agent_loop.sessions.get_or_create(f"api:{sid}")
+    meta = session.metadata.get("_last_summary") or {}
+    return web.json_response(
+        {
+            "message_count": len(session.messages),
+            "last_summary": meta.get("text", "") if isinstance(meta, dict) else str(meta),
+            "last_consolidated": getattr(session, "last_consolidated", 0),
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -396,4 +418,6 @@ def create_app(
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/v1/memory", handle_memory_read)
+    app.router.add_get("/v1/session/{session_id}/info", handle_session_info)
     return app

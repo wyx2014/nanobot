@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Two-layer memory system with Dream-managed knowledge files.
+description: 具有 Dream 维护机制的双层知识库记忆系统。
 always: true
 ---
 
