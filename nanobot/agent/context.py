@@ -259,6 +259,10 @@ class ContextBuilder:
         if not media:
             return text
 
+        # Claude vision API only supports these MIME types.
+        # SVG and other formats cause count_token_failed errors.
+        _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
         images = []
         for path in media:
             p = Path(path)
@@ -266,7 +270,7 @@ class ContextBuilder:
                 continue
             raw = p.read_bytes()
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-            if not mime or not mime.startswith("image/"):
+            if not mime or mime not in _SUPPORTED_IMAGE_MIMES:
                 continue
             b64 = base64.b64encode(raw).decode()
             images.append({

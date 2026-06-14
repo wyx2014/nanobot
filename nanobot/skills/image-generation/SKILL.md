@@ -1,6 +1,6 @@
 ---
 name: image-generation
-description: Generate images and iteratively edit saved image artifacts.
+description: 生成图像并对已保存的图片资产进行迭代式编辑。
 ---
 
 # Image Generation

@@ -1,6 +1,6 @@
 ---
 name: my
-description: Check and set the agent's own runtime state (model, iterations, context window, token usage, web config). Use when diagnosing why something doesn't work ("why can't you search the web?", "why did you stop?"), checking resource limits before complex tasks, adapting configuration for long or simple tasks, or remembering user preferences across turns. Also use when the user asks what model you are running, how many tokens you've used, or what your settings are.
+description: 检查并设置智能体自身的运行状态（模型、迭代次数、上下文窗口、Token 使用量、网络配置等）。可用于诊断故障、前置资源检查、针对特定任务调整配置或记忆用户偏好，也可在用户询问模型版本、使用量和参数时使用。
 always: true
 ---
 

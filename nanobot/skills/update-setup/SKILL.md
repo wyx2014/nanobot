@@ -1,6 +1,6 @@
 ---
 name: update-setup
-description: One-time setup wizard for the nanobot upgrade skill. Triggers: setup update, configure update, 切设置更新, 初始化更新.
+description: 用于配置 nanobot 升级技能的一次性设置向导。触发词：setup update, configure update, 切设置更新, 初始化更新。
 ---
 
 # Update Setup

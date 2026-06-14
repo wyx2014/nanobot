@@ -130,7 +130,7 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     msg = ctx.msg
     total = await loop._cancel_active_tasks(ctx.key)
-    content = f"Stopped {total} task(s)." if total else "No active task to stop."
+    content = f"已停止 {total} 个任务。" if total else "没有运行中的任务。"
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content=content,
         metadata=dict(msg.metadata or {})

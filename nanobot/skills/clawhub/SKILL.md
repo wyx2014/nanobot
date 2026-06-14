@@ -1,6 +1,6 @@
 ---
 name: clawhub
-description: Search and install agent skills from ClawHub, the public skill registry.
+description: 从 ClawHub 公共技能注册中心搜索并安装智能体技能。
 homepage: https://clawhub.ai
 metadata: {"nanobot":{"emoji":"🦞"}}
 ---
