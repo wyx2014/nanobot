@@ -32,7 +32,9 @@ def _int(query: QueryParams, key: str, default: int) -> int:
 
 
 def _job_meta(job: CronJob) -> dict[str, Any]:
-    meta = job.payload.channel_meta if isinstance(job.payload.channel_meta, dict) else {}
+    meta = job.payload.origin_metadata if isinstance(job.payload.origin_metadata, dict) else {}
+    if not meta:
+        meta = job.payload.channel_meta if isinstance(job.payload.channel_meta, dict) else {}
     scoped = meta.get(_META_NS)
     return scoped if isinstance(scoped, dict) else {}
 
@@ -202,7 +204,7 @@ class WebUIScheduleRouter:
                 deliver=False,
                 channel="websocket",
                 to="direct",
-                channel_meta=self._meta(query, meta_schedule),
+                origin_metadata=self._meta(query, meta_schedule),
             )
             if not enabled:
                 self.cron.enable_job(job.id, False)
@@ -227,7 +229,7 @@ class WebUIScheduleRouter:
                 name=name,
                 schedule=schedule,
                 message=_message(prompt, skill_name),
-                channel_meta=self._meta(query, meta_schedule),
+                origin_metadata=self._meta(query, meta_schedule),
             )
         except ValueError as exc:
             return self._error_response(400, str(exc))

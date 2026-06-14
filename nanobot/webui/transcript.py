@@ -1848,6 +1848,16 @@ def has_pending_tool_calls(lines: list[dict[str, Any]]) -> bool:
     return False
 
 
+def backfill_missing_user_events(
+    lines: list[dict[str, Any]],
+    session_messages: list[dict[str, Any]] | None,
+    *,
+    session_key: str,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper for legacy transcript user-row backfill."""
+    return inject_missing_user_events_from_session(session_key, lines, session_messages)
+
+
 def build_webui_thread_response(
     session_key: str,
     *,

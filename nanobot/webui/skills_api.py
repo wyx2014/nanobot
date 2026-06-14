@@ -155,6 +155,9 @@ def skills_action(action: str, query: QueryParams) -> dict[str, Any]:
         return skills_payload(include_content=True, name=name)
 
     if action == "enable":
+        loader = _loader()
+        if not any(entry["name"] == name for entry in loader.list_skills(filter_unavailable=False)):
+            raise WebUISkillsError("unknown skill", status=404)
         disabled.discard(name)
         config.agents.defaults.disabled_skills = sorted(disabled)
         save_config(config)

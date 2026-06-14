@@ -718,6 +718,7 @@ class CronService:
         channel: str | None = ...,
         to: str | None = ...,
         channel_meta: dict | None = ...,
+        origin_metadata: dict | None = ...,
         delete_after_run: bool | None = None,
     ) -> CronJob | Literal["not_found", "protected"]:
         """Update mutable fields of an existing job. System jobs cannot be updated.
@@ -747,6 +748,8 @@ class CronService:
             job.payload.to = to
         if channel_meta is not ...:
             job.payload.channel_meta = channel_meta or {}
+        if origin_metadata is not ...:
+            job.payload.origin_metadata = origin_metadata or {}
         if delete_after_run is not None:
             job.delete_after_run = delete_after_run
         _normalize_agent_turn_job(job)

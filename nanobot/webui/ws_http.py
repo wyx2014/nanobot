@@ -456,7 +456,6 @@ class GatewayHTTPHandler:
                 text,
                 workspace_path=scope.project_path,
             ),
-            session_messages=session_messages,
             limit=limit,
             direction=direction,
             before=before,

@@ -6,6 +6,7 @@ from nanobot.webui.transcript import (
     WEBUI_TRANSCRIPT_SCHEMA_VERSION,
     append_fork_marker,
     append_transcript_object,
+    backfill_missing_user_events,
     build_webui_thread_response,
     fork_transcript_before_user_index,
     read_transcript_lines,
@@ -544,6 +545,35 @@ def test_build_response_restores_session_users_without_duplicating_new_transcrip
         ("user", "new prompt"),
         ("assistant", "new assistant"),
     ]
+
+
+def test_backfill_missing_user_events_from_session_messages() -> None:
+    lines = [
+        {"event": "delta", "chat_id": "legacy", "text": "a1"},
+        {"event": "stream_end", "chat_id": "legacy"},
+        {"event": "turn_end", "chat_id": "legacy"},
+        {"event": "delta", "chat_id": "legacy", "text": "a2"},
+        {"event": "stream_end", "chat_id": "legacy"},
+        {"event": "turn_end", "chat_id": "legacy"},
+    ]
+    backfilled = backfill_missing_user_events(
+        lines,
+        [
+            {"role": "user", "content": "q1", "cli_apps": [{"name": "codex"}]},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2", "mcp_presets": [{"name": "browser"}]},
+            {"role": "assistant", "content": "a2"},
+        ],
+        session_key="websocket:legacy",
+    )
+
+    msgs = replay_transcript_to_ui_messages(backfilled)
+
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user", "assistant"]
+    assert msgs[0]["content"] == "q1"
+    assert msgs[0]["cliApps"] == [{"name": "codex"}]
+    assert msgs[2]["content"] == "q2"
+    assert msgs[2]["mcpPresets"] == [{"name": "browser"}]
 
 
 def test_replay_augments_assistant_text() -> None:
