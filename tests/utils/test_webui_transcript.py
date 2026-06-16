@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from nanobot.webui.transcript import (
     WEBUI_TRANSCRIPT_SCHEMA_VERSION,
+    WebUITranscriptRecorder,
     append_fork_marker,
     append_transcript_object,
     backfill_missing_user_events,
@@ -23,6 +24,22 @@ def test_append_and_read_roundtrip(tmp_path, monkeypatch) -> None:
     lines = read_transcript_lines(key)
     assert len(lines) == 1
     assert lines[0]["text"] == "hello"
+
+
+def test_recorder_can_write_to_explicit_session_key(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    recorder = WebUITranscriptRecorder()
+    recorder.prepare_and_append(
+        "origin-chat",
+        {"event": "message", "chat_id": "origin-chat", "text": "done"},
+        metadata={"_webui_transcript_session_key": "cron:job:123:abcd"},
+        phase="answer",
+    )
+
+    assert read_transcript_lines("websocket:origin-chat") == []
+    lines = read_transcript_lines("cron:job:123:abcd")
+    assert len(lines) == 1
+    assert lines[0]["text"] == "done"
 
 
 def _force_small_transcript_budget(monkeypatch, *, limit: int = 520, target: int = 260) -> None:

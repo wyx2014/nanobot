@@ -1231,6 +1231,12 @@ class AgentLoop:
             outbound_metadata["slack"] = {"thread_ts": key.split(":", 2)[2]}
         if origin_message_id := msg.metadata.get("origin_message_id"):
             outbound_metadata["origin_message_id"] = origin_message_id
+        transcript_session_key = msg.metadata.get("_webui_transcript_session_key")
+        if isinstance(transcript_session_key, str) and transcript_session_key.strip():
+            outbound_metadata["_webui_transcript_session_key"] = transcript_session_key.strip()
+        webui_source = msg.metadata.get("_webui_message_source")
+        if isinstance(webui_source, dict):
+            outbound_metadata["_webui_message_source"] = dict(webui_source)
         return OutboundMessage(
             channel=channel,
             chat_id=chat_id,

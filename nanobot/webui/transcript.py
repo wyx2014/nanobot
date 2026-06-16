@@ -630,6 +630,13 @@ class WebUITranscriptRecorder:
             event["source"] = source
         self._annotate_turn(chat_id, event, metadata, phase)
 
+    @staticmethod
+    def _session_key_for_append(chat_id: str, metadata: dict[str, Any] | None) -> str:
+        override = (metadata or {}).get("_webui_transcript_session_key")
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+        return f"websocket:{chat_id}"
+
     def prepare_and_append(
         self,
         chat_id: str,
@@ -650,7 +657,7 @@ class WebUITranscriptRecorder:
         record = dict(event)
         if transcript_overrides:
             record.update(transcript_overrides)
-        self.append(chat_id, record)
+        self.append(chat_id, record, metadata=metadata)
 
     def append_user_message(
         self,
@@ -675,10 +682,16 @@ class WebUITranscriptRecorder:
             return
         self.prepare_and_append(chat_id, payload, metadata=metadata, phase="user")
 
-    def append(self, chat_id: str, event: dict[str, Any]) -> None:
+    def append(
+        self,
+        chat_id: str,
+        event: dict[str, Any],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         try:
             dup = json.loads(json.dumps(event, ensure_ascii=False))
-            append_transcript_object(f"websocket:{chat_id}", dup)
+            append_transcript_object(self._session_key_for_append(chat_id, metadata), dup)
         except (OSError, ValueError, TypeError) as e:
             self._log.warning("webui transcript append failed: {}", e)
 

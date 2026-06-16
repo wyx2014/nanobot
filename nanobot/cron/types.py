@@ -41,6 +41,16 @@ class CronRunRecord:
     status: Literal["ok", "error", "skipped"]
     duration_ms: int = 0
     error: str | None = None
+    run_id: str | None = None
+    session_key: str | None = None
+
+
+@dataclass
+class CronJobExecutionResult:
+    """Metadata returned by a job execution."""
+    response: str | None = None
+    run_id: str | None = None
+    session_key: str | None = None
 
 
 @dataclass

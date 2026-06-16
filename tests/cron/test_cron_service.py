@@ -5,7 +5,7 @@ import time
 import pytest
 
 from nanobot.cron.service import CronJobSkippedError, CronService
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronJobExecutionResult, CronPayload, CronSchedule
 
 
 async def _wait_until(predicate, *, timeout: float = 1.0, interval: float = 0.01) -> None:
@@ -344,6 +344,37 @@ async def test_execute_job_records_run_history(tmp_path) -> None:
     assert rec.status == "ok"
     assert rec.duration_ms >= 0
     assert rec.error is None
+
+
+@pytest.mark.asyncio
+async def test_execute_job_records_run_session_metadata(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+
+    async def run(_):
+        return CronJobExecutionResult(
+            response="done",
+            run_id="123:abcd",
+            session_key="cron:job:123:abcd",
+        )
+
+    service = CronService(store_path, on_job=run)
+    job = service.add_job(
+        name="hist",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+    )
+    await service.run_job(job.id)
+
+    loaded = service.get_job(job.id)
+    assert loaded is not None
+    rec = loaded.state.run_history[0]
+    assert rec.run_id == "123:abcd"
+    assert rec.session_key == "cron:job:123:abcd"
+
+    raw = json.loads(store_path.read_text())
+    history = raw["jobs"][0]["state"]["runHistory"]
+    assert history[0]["runId"] == "123:abcd"
+    assert history[0]["sessionKey"] == "cron:job:123:abcd"
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
-from nanobot.cron.types import CronJob
+from nanobot.cron.types import CronJob, CronJobExecutionResult
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
 from nanobot.utils.prompt_templates import render_template
 
@@ -64,7 +64,7 @@ async def run_bound_cron_job(
     *,
     agent: BoundCronAgent,
     cron: CronRunRecorder,
-) -> str | None:
+) -> CronJobExecutionResult:
     """Execute a session-bound cron job as a normal agent session turn."""
     session_key = job.payload.session_key
     if not session_key:
@@ -76,10 +76,11 @@ async def run_bound_cron_job(
         message=job.payload.message,
     )
     prompt_ref = _cron_prompt_ref(prompt)
-    run_id = f"{job.id}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    run_id = f"{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    run_session_key = f"cron:{job.id}:{run_id}"
     channel, chat_id, metadata = _bound_session_delivery_context(
         job,
-        turn_seed=f"cron:{job.id}",
+        turn_seed=run_session_key,
         source_label=job.name,
     )
     metadata[CRON_TRIGGER_META] = {
@@ -92,10 +93,12 @@ async def run_bound_cron_job(
         ),
     }
     metadata[CRON_DEFER_UNTIL_IDLE_META] = True
+    metadata["_webui_transcript_session_key"] = run_session_key
     run_record_base: dict[str, Any] = {
         "job_id": job.id,
         "job_name": job.name,
-        "session_key": session_key,
+        "parent_session_key": session_key,
+        "session_key": run_session_key,
         "prompt_ref": prompt_ref,
         "prompt_vars": {"message": job.payload.message},
         "rendered_prompt": prompt,
@@ -121,7 +124,7 @@ async def run_bound_cron_job(
                 chat_id=chat_id,
                 content=prompt,
                 metadata=metadata,
-                session_key_override=session_key,
+                session_key_override=run_session_key,
             )
         )
     except (Exception, asyncio.CancelledError) as exc:
@@ -148,4 +151,8 @@ async def run_bound_cron_job(
             "response": response,
         },
     )
-    return response
+    return CronJobExecutionResult(
+        response=response,
+        run_id=run_id,
+        session_key=run_session_key,
+    )

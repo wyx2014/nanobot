@@ -16,6 +16,7 @@ from loguru import logger
 
 from nanobot.cron.session_turns import is_bound_cron_job
 from nanobot.cron.types import (
+    CronJobExecutionResult,
     CronJob,
     CronJobState,
     CronPayload,
@@ -144,7 +145,7 @@ class CronService:
     def __init__(
         self,
         store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        on_job: Callable[[CronJob], Coroutine[Any, Any, str | CronJobExecutionResult | None]] | None = None,
         max_sleep_ms: int = 300_000,  # 5 minutes
     ):
         self.store_path = store_path
@@ -263,6 +264,8 @@ class CronService:
                                     status=r["status"],
                                     duration_ms=r.get("durationMs", 0),
                                     error=r.get("error"),
+                                    run_id=r.get("runId") or r.get("run_id"),
+                                    session_key=r.get("sessionKey") or r.get("session_key"),
                                 )
                                 for r in j.get("state", {}).get("runHistory", [])
                             ],
@@ -401,6 +404,8 @@ class CronService:
                                 "status": r.status,
                                 "durationMs": r.duration_ms,
                                 "error": r.error,
+                                "runId": r.run_id,
+                                "sessionKey": r.session_key,
                             }
                             for r in j.state.run_history
                         ],
@@ -562,11 +567,15 @@ class CronService:
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
         start_ms = _now_ms()
+        run_id: str | None = None
+        session_key: str | None = None
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
         try:
-            if self.on_job:
-                await self.on_job(job)
+            result = await self.on_job(job) if self.on_job else None
+            if isinstance(result, CronJobExecutionResult):
+                run_id = result.run_id
+                session_key = result.session_key
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -597,6 +606,8 @@ class CronService:
             status=job.state.last_status,
             duration_ms=end_ms - start_ms,
             error=job.state.last_error,
+            run_id=run_id,
+            session_key=session_key,
         ))
         job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 
