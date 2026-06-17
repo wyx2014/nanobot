@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import re
 import mimetypes
 import platform
 from pathlib import Path
@@ -13,6 +14,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
 from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.webui.interactive_prompt import interactive_prompt_answer_session_extra
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
@@ -22,9 +24,33 @@ from nanobot.utils.helpers import (
 from nanobot.utils.prompt_templates import render_template
 
 
+_EXPLICIT_INTERACTIVE_INTAKE_PATTERNS = (
+    re.compile(r"\bask me (?:one|1|two|2)?\s*(?:or|-)?\s*(?:two|2)?\s*key questions\b", re.IGNORECASE),
+    re.compile(r"\bask (?:one|1|two|2)?\s*(?:or|-)?\s*(?:two|2)?\s*key questions\b", re.IGNORECASE),
+    re.compile(r"\bif you need more information\b", re.IGNORECASE),
+    re.compile(r"\bif you need more context\b", re.IGNORECASE),
+    re.compile(r"\bclarifying questions?\b", re.IGNORECASE),
+    re.compile(r"如果你需要.*信息.*问我.*关键问题"),
+    re.compile(r"如果你觉得.*更多背景.*告诉我"),
+    re.compile(r"先问我.*关键问题"),
+    re.compile(r"一两个关键问题"),
+)
+
+
+def _explicitly_invites_interactive_intake(current_message: str) -> bool:
+    text = (current_message or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _EXPLICIT_INTERACTIVE_INTAKE_PATTERNS)
+
+
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return persisted kwargs for turn-attached capabilities."""
-    return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
+    return (
+        cli_app_utils.session_extra(metadata)
+        | mcp_tools.session_extra(metadata)
+        | interactive_prompt_answer_session_extra(dict(metadata) if metadata else None)
+    )
 
 
 def runtime_lines(state: Any, msg: Any, workspace: Path, *, skip: bool = False) -> list[str]:
@@ -214,6 +240,14 @@ class ContextBuilder:
             extra.extend(runtime_lines(runtime_state, inbound_message, root, skip=skip_runtime_lines))
         if current_runtime_lines:
             extra.extend(line for line in current_runtime_lines if line)
+        if channel == "websocket" and _explicitly_invites_interactive_intake(current_message):
+            extra.append(
+                "Interactive Intake Preference: The user explicitly invited one or two key clarification questions "
+                "before work begins. If required information is missing and a short structured choice fits, use "
+                "request_user_input now instead of a plain-text follow-up question or a partial answer. First evaluate "
+                "all missing required information; if there are two independent key questions, put both in one "
+                "request_user_input.questions card. Do not split independent initial questions into consecutive cards."
+            )
         runtime_ctx = self._build_runtime_context(
             channel,
             chat_id,

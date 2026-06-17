@@ -46,6 +46,12 @@ from nanobot.webui.http_utils import (
     query_first as _query_first,
 )
 from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
+from nanobot.webui.interactive_prompt import (
+    INBOUND_META_INTERACTIVE_PROMPT_ANSWER,
+    OUTBOUND_META_INTERACTIVE_PROMPT,
+    normalize_interactive_prompt,
+    normalize_interactive_prompt_answer,
+)
 from nanobot.webui.transcription_ws import webui_transcription_event
 from nanobot.webui.websocket_logging import websockets_server_logger
 
@@ -178,6 +184,28 @@ def _parse_inbound_payload(raw: str) -> str | None:
             return None
         return None
     return text
+
+
+def _interactive_prompt_answer_content(answer: dict[str, Any]) -> str:
+    """Build a fallback user-visible answer text from a structured prompt answer."""
+    answer_type = answer.get("answerType")
+    if answer_type == "group":
+        rows: list[str] = []
+        for item in answer.get("answers", []):
+            if not isinstance(item, dict):
+                continue
+            question_id = item.get("questionId")
+            text = item.get("text")
+            if isinstance(question_id, str) and isinstance(text, str) and text.strip():
+                rows.append(f"Q: {question_id} A: {text.strip()}")
+        return "\n\n".join(rows)
+    if answer_type == "option":
+        option_id = answer.get("optionId")
+        if isinstance(option_id, str) and option_id.strip():
+            return f"Selected option: {option_id.strip()}"
+    if answer_type == "skip":
+        return "Skipped interactive prompt."
+    return ""
 
 
 # Accept UUIDs and short scoped keys like "unified:default". Keeps the capability
@@ -714,12 +742,17 @@ class WebSocketChannel(BaseChannel):
         if t == "message":
             cid = envelope.get("chat_id")
             content = envelope.get("content")
+            interactive_prompt_answer = normalize_interactive_prompt_answer(
+                envelope.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
+            )
             if not _is_valid_chat_id(cid):
                 await self._send_event(connection, "error", detail="invalid chat_id")
                 return
-            if not isinstance(content, str):
+            if not isinstance(content, str) and interactive_prompt_answer is None:
                 await self._send_event(connection, "error", detail="missing content")
                 return
+            if not isinstance(content, str):
+                content = ""
 
             raw_media = envelope.get("media")
             media_paths: list[str] = []
@@ -739,7 +772,9 @@ class WebSocketChannel(BaseChannel):
                     return
 
             # Allow image-only turns (content may be empty when media is attached).
-            if not content.strip() and not media_paths:
+            if not content.strip() and interactive_prompt_answer is not None:
+                content = _interactive_prompt_answer_content(interactive_prompt_answer)
+            if not content.strip() and not media_paths and interactive_prompt_answer is None:
                 await self._send_event(connection, "error", detail="missing content")
                 return
             scope = await self._workspace_scope_or_error(
@@ -768,6 +803,8 @@ class WebSocketChannel(BaseChannel):
             mcp_presets = normalize_mcp_preset_mentions(envelope.get("mcp_presets"))
             if mcp_presets:
                 metadata["mcp_presets"] = mcp_presets
+            if interactive_prompt_answer:
+                metadata[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = interactive_prompt_answer
             metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
             self._workspaces.persist_scope(cid, scope)
             image_generation = envelope.get("image_generation")
@@ -857,7 +894,6 @@ class WebSocketChannel(BaseChannel):
                 model_preset=msg.metadata.get("model_preset"),
             )
             return
-
         # Snapshot the subscriber set so ConnectionClosed cleanups mid-iteration are safe.
         conns = list(self._subs.get(msg.chat_id, ()))
         if not conns:
@@ -918,7 +954,25 @@ class WebSocketChannel(BaseChannel):
                 msg.metadata,
             )
             return
-        text = msg.content
+        interactive_prompt = normalize_interactive_prompt(msg.metadata.get(OUTBOUND_META_INTERACTIVE_PROMPT))
+        agent_ui = msg.metadata.get(OUTBOUND_META_AGENT_UI)
+        has_structured_payload = (
+            bool(msg.media)
+            or bool(msg.metadata.get("_tool_events"))
+            or bool(msg.metadata.get("_tool_hint"))
+            or bool(msg.metadata.get("_progress"))
+            or interactive_prompt is not None
+            or agent_ui is not None
+        )
+        text = msg.content if isinstance(msg.content, str) else ""
+        if not text.strip() and not has_structured_payload:
+            self.logger.info(
+                "suppressing empty websocket outbound chat_id={} metadata_keys={}",
+                msg.chat_id,
+                sorted(str(key) for key in msg.metadata.keys()),
+            )
+            return
+
         wire_text = self._media.rewrite_local_markdown_images(text)
         payload: dict[str, Any] = {
             "event": "message",
@@ -941,7 +995,8 @@ class WebSocketChannel(BaseChannel):
             payload["latency_ms"] = int(lat)
         if msg.metadata.get("_tool_events"):
             payload["tool_events"] = msg.metadata["_tool_events"]
-        agent_ui = msg.metadata.get(OUTBOUND_META_AGENT_UI)
+        if interactive_prompt is not None:
+            payload["interactive_prompt"] = interactive_prompt
         if agent_ui is not None:
             payload["agent_ui"] = agent_ui
         # Mark intermediate agent breadcrumbs (tool-call hints, generic

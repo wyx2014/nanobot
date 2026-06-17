@@ -14,6 +14,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.agent.tools.request_user_input import InteractivePromptRequested
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -128,6 +129,7 @@ class AgentRunResult:
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
+    interactive_prompt_requested: bool = False
 
 
 class AgentRunner:
@@ -443,7 +445,7 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
-                results, new_events, fatal_error = await self._execute_tools(
+                results, new_events, fatal_error, interactive_prompt_requested = await self._execute_tools(
                     spec,
                     response.tool_calls,
                     external_lookup_counts,
@@ -458,6 +460,13 @@ class AgentRunner:
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
                 completed_tool_results: list[dict[str, Any]] = []
+                if interactive_prompt_requested:
+                    final_content = None
+                    stop_reason = "interactive_prompt"
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    break
                 for tool_call, result in zip(response.tool_calls, results):
                     tool_message = {
                         "role": "tool",
@@ -693,6 +702,7 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
             had_injections=had_injections,
+            interactive_prompt_requested=stop_reason == "interactive_prompt",
         )
 
     def _build_request_kwargs(
@@ -1030,7 +1040,7 @@ class AgentRunner:
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
-    ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+    ) -> tuple[list[Any], list[dict[str, str]], BaseException | None, bool]:
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
@@ -1054,12 +1064,15 @@ class AgentRunner:
         results: list[Any] = []
         events: list[dict[str, str]] = []
         fatal_error: BaseException | None = None
+        interactive_prompt_requested = False
         for result, event, error in tool_results:
             results.append(result)
             events.append(event)
+            if isinstance(result, InteractivePromptRequested):
+                interactive_prompt_requested = True
             if error is not None and fatal_error is None:
                 fatal_error = error
-        return results, events, fatal_error
+        return results, events, fatal_error, interactive_prompt_requested
 
     async def _run_tool(
         self,
@@ -1139,6 +1152,13 @@ class AgentRunner:
                 result = await spec.tools.execute(tool_call.name, params)
         except asyncio.CancelledError:
             raise
+        except InteractivePromptRequested as exc:
+            event = {
+                "name": tool_call.name,
+                "status": "ok",
+                "detail": "waiting for user input",
+            }
+            return exc, event, None
         except BaseException as exc:
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(

@@ -56,6 +56,15 @@ Tool signatures are provided automatically via function calling. This section do
 ## Messaging and Media
 
 - Use `message` to send content or local media to the user/channel.
+- Use `request_user_input` only when a WebUI chat is missing required information and a short structured choice is the fastest way to unblock the task.
+- When the user explicitly invites you to ask one or two key clarification questions before you begin, and required information is still missing, prefer `request_user_input` on the first turn instead of replying with a plain-text question or drafting a partial answer.
+- In WebUI, if a short structured clarification card would clearly work better than a free-form follow-up question, use `request_user_input` rather than asking in normal prose.
+- Before asking, evaluate all missing required information. Greedily choose at most two most blocking independent questions for one `request_user_input.questions` card; if two independent questions are not available, ask one.
+- Never split two independent initial questions into consecutive `request_user_input` cards.
+- Use a second interactive prompt round only when the next question genuinely depends on the user's previous interactive-prompt answer; set `depends_on_previous_answer=true` for that second call.
+- Use at most two interactive prompt rounds in one session/task. After two rounds, ask any remaining clarification in normal text instead of calling `request_user_input` again.
+- Do not include "Other", "Something else", "Custom", or equivalent fallback choices in `request_user_input` options; WebUI always provides a freeform input row for every question.
+- Do not use `request_user_input` for scheduled runs, open-ended brainstorming, or information you can infer safely.
 - `read_file` only reads content for your analysis; it does not deliver a file to the user.
 - When sending an existing local file, attach it through the message/media mechanism instead of pasting file contents unless the user asked for text.
 

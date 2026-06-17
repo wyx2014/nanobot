@@ -79,7 +79,7 @@ def _message(prompt: str, skill_name: str) -> str:
 
 
 def _run_payload(job: CronJob, run: CronRunRecord) -> dict[str, Any]:
-    status = "completed" if run.status == "ok" else "error" if run.status == "error" else "running"
+    status = "error" if run.status == "error" else "completed"
     completed_at = run.run_at_ms + max(0, run.duration_ms or 0)
     session_key = run.session_key or f"cron:{job.id}"
     return {

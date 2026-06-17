@@ -19,6 +19,11 @@ from loguru import logger
 from nanobot.config.paths import get_webui_dir
 from nanobot.cron.session_turns import CRON_HISTORY_META
 from nanobot.session.manager import SessionManager
+from nanobot.webui.interactive_prompt import (
+    INBOUND_META_INTERACTIVE_PROMPT_ANSWER,
+    normalize_interactive_prompt,
+    normalize_interactive_prompt_answer,
+)
 from nanobot.webui.metadata import WEBUI_MESSAGE_SOURCE_METADATA_KEY, WEBUI_TURN_METADATA_KEY
 
 WEBUI_TRANSCRIPT_SCHEMA_VERSION = 3
@@ -671,12 +676,16 @@ class WebUITranscriptRecorder:
     ) -> None:
         if text.strip() == "/stop" and not media_paths:
             return
+        interactive_prompt_answer = normalize_interactive_prompt_answer(
+            metadata.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
+        )
         payload = build_user_transcript_event(
             chat_id,
             text,
             media_paths=media_paths,
             cli_apps=cli_apps,
             mcp_presets=mcp_presets,
+            interactive_prompt_answer=interactive_prompt_answer,
         )
         if payload is None:
             return
@@ -804,8 +813,18 @@ def write_session_messages_as_transcript(
                 value = msg.get(key)
                 if isinstance(value, list) and value:
                     row[key] = json.loads(json.dumps(value, ensure_ascii=False))
-        elif role == "assistant" and text.strip():
+            interactive_prompt_answer = normalize_interactive_prompt_answer(
+                msg.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
+            )
+            if interactive_prompt_answer:
+                row[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = interactive_prompt_answer
+        elif role == "assistant":
+            interactive_prompt = normalize_interactive_prompt(msg.get("_interactive_prompt"))
+            if not text.strip() and interactive_prompt is None:
+                continue
             row = {"event": "message", "chat_id": target_chat_id, "text": text}
+            if interactive_prompt is not None:
+                row["interactive_prompt"] = interactive_prompt
             media = msg.get("media")
             if isinstance(media, list) and media:
                 row["media"] = [str(p) for p in media if isinstance(p, str) and p]
@@ -842,6 +861,7 @@ def build_user_transcript_event(
     media_paths: list[Any] | None = None,
     cli_apps: list[Any] | None = None,
     mcp_presets: list[Any] | None = None,
+    interactive_prompt_answer: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     paths = [str(path) for path in (media_paths or []) if path]
     if not text and not paths:
@@ -859,6 +879,8 @@ def build_user_transcript_event(
     presets = [dict(preset) for preset in (mcp_presets or []) if isinstance(preset, Mapping)]
     if presets:
         event["mcp_presets"] = presets
+    if interactive_prompt_answer:
+        event[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = interactive_prompt_answer
     return event
 
 
@@ -875,6 +897,9 @@ def _session_user_event(
     media = message.get("media")
     cli_apps = message.get("cli_apps")
     mcp_presets = message.get("mcp_presets")
+    interactive_prompt_answer = normalize_interactive_prompt_answer(
+        message.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
+    )
     chat_id = session_key.split(":", 1)[1] if ":" in session_key else session_key
     return build_user_transcript_event(
         chat_id,
@@ -882,6 +907,7 @@ def _session_user_event(
         media_paths=media if isinstance(media, list) else None,
         cli_apps=cli_apps if isinstance(cli_apps, list) else None,
         mcp_presets=mcp_presets if isinstance(mcp_presets, list) else None,
+        interactive_prompt_answer=interactive_prompt_answer,
     )
 
 
@@ -1240,6 +1266,7 @@ def replay_transcript_to_ui_messages(
     a gateway restart instead of reusing stale process-local signed URLs.
     """
     messages: list[dict[str, Any]] = []
+    prompt_message_index_by_id: dict[str, int] = {}
     buffer_message_id: str | None = None
     buffer_parts: list[str] = []
     suppress_until_turn_end = False
@@ -1460,6 +1487,67 @@ def replay_transcript_to_ui_messages(
                 }
                 return
 
+    def record_prompt_index(prompt: dict[str, Any] | None) -> None:
+        if not isinstance(prompt, dict):
+            return
+        prompt_id = prompt.get("promptId")
+        if isinstance(prompt_id, str) and prompt_id:
+            prompt_message_index_by_id[prompt_id] = len(messages) - 1
+
+    def resolve_prompt_from_answer(answer: dict[str, Any], text: str) -> None:
+        prompt_id = answer.get("promptId")
+        if not isinstance(prompt_id, str) or not prompt_id:
+            return
+        message_index = prompt_message_index_by_id.get(prompt_id)
+        if message_index is None or not (0 <= message_index < len(messages)):
+            return
+        target = messages[message_index]
+        prompt = normalize_interactive_prompt(target.get("interactivePrompt"))
+        if prompt is None:
+            return
+        answer_type = answer.get("answerType")
+        if answer_type == "skip":
+            prompt["status"] = "skipped"
+        elif answer_type == "group":
+            prompt["status"] = "answered"
+            answers = answer.get("answers")
+            if isinstance(answers, list):
+                answers_by_question_id = {
+                    item.get("questionId"): item
+                    for item in answers
+                    if isinstance(item, dict) and isinstance(item.get("questionId"), str)
+                }
+                questions = prompt.get("questions")
+                if isinstance(questions, list):
+                    next_questions: list[dict[str, Any]] = []
+                    for question in questions:
+                        if not isinstance(question, dict):
+                            continue
+                        next_question = dict(question)
+                        item = answers_by_question_id.get(question.get("id"))
+                        if isinstance(item, dict):
+                            option_id = item.get("optionId")
+                            item_text = item.get("text")
+                            if isinstance(option_id, str) and option_id:
+                                next_question["answeredOptionId"] = option_id
+                            if isinstance(item_text, str):
+                                next_question["answeredText"] = item_text
+                        next_questions.append(next_question)
+                    prompt["questions"] = next_questions
+            if text:
+                prompt["answeredText"] = text
+        else:
+            prompt["status"] = "answered"
+            option_id = answer.get("optionId")
+            if isinstance(option_id, str) and option_id:
+                prompt["answeredOptionId"] = option_id
+            if text:
+                prompt["answeredText"] = text
+        messages[message_index] = {
+            **target,
+            "interactivePrompt": prompt,
+        }
+
     def absorb_complete(extra: dict[str, Any], idx: int) -> None:
         nonlocal active_activity_segment_id, active_file_edit_segment_id
         last = messages[-1] if messages else None
@@ -1637,7 +1725,14 @@ def replay_transcript_to_ui_messages(
                 row["mcpPresets"] = [
                     dict(preset) for preset in mcp_presets if isinstance(preset, dict)
                 ]
+            interactive_prompt_answer = normalize_interactive_prompt_answer(
+                rec.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
+            )
+            if interactive_prompt_answer:
+                row["interactivePromptAnswer"] = interactive_prompt_answer
             messages.append(row)
+            if interactive_prompt_answer:
+                resolve_prompt_from_answer(interactive_prompt_answer, text_s)
             continue
 
         if ev == "file_edit":
@@ -1825,12 +1920,17 @@ def replay_transcript_to_ui_messages(
             extra: dict[str, Any] = {"content": content_s}
             if media:
                 extra["media"] = media
+            interactive_prompt = normalize_interactive_prompt(rec.get("interactive_prompt"))
+            if interactive_prompt is not None:
+                extra["interactivePrompt"] = interactive_prompt
             lat = rec.get("latency_ms")
             if isinstance(lat, (int, float)) and lat >= 0:
                 extra["latencyMs"] = int(lat)
             extra.update(_turn_fields(rec, "answer"))
             extra.update(_source_fields(rec))
             absorb_complete(extra, idx)
+            if interactive_prompt is not None:
+                record_prompt_index(interactive_prompt)
             if media:
                 suppress_until_turn_end = True
             continue
@@ -1911,6 +2011,47 @@ def backfill_missing_user_events(
     return inject_missing_user_events_from_session(session_key, lines, session_messages)
 
 
+def apply_session_interactive_prompt_states(
+    messages: list[dict[str, Any]],
+    session_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Overlay answered/skipped prompt state from session history onto WebUI replay.
+
+    Older WebUI transcript rows may have persisted the user answer without the
+    structured ``interactive_prompt_answer`` metadata. In those cases replay
+    cannot resolve the prompt from transcript alone, but the canonical session
+    message may already contain the updated ``_interactive_prompt`` status.
+    """
+    if not messages or not session_messages:
+        return messages
+    prompt_by_id: dict[str, dict[str, Any]] = {}
+    for message in session_messages:
+        if message.get("role") != "assistant":
+            continue
+        prompt = normalize_interactive_prompt(message.get("_interactive_prompt"))
+        if prompt is None:
+            continue
+        prompt_id = prompt.get("promptId")
+        status = prompt.get("status")
+        if isinstance(prompt_id, str) and status in {"answered", "skipped", "expired"}:
+            prompt_by_id[prompt_id] = prompt
+    if not prompt_by_id:
+        return messages
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        prompt = normalize_interactive_prompt(message.get("interactivePrompt"))
+        if prompt is None:
+            out.append(message)
+            continue
+        prompt_id = prompt.get("promptId")
+        overlay = prompt_by_id.get(prompt_id) if isinstance(prompt_id, str) else None
+        if overlay is None:
+            out.append(message)
+            continue
+        out.append({**message, "interactivePrompt": overlay})
+    return out
+
+
 def build_webui_thread_response(
     session_key: str,
     *,
@@ -1939,6 +2080,7 @@ def build_webui_thread_response(
         augment_assistant_media=augment_assistant_media,
         augment_assistant_text=augment_assistant_text,
     )
+    msgs = apply_session_interactive_prompt_states(msgs, session_messages)
     payload = {
         "schemaVersion": WEBUI_TRANSCRIPT_SCHEMA_VERSION,
         "sessionKey": session_key,

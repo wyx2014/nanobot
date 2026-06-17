@@ -26,6 +26,203 @@ def test_append_and_read_roundtrip(tmp_path, monkeypatch) -> None:
     assert lines[0]["text"] == "hello"
 
 
+def test_interactive_prompt_replay_resolves_answer_state(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:prompt-replay"
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": "prompt-replay",
+            "text": "",
+            "interactive_prompt": {
+                "promptId": "prompt:1",
+                "question": "How much time can you spend each day?",
+                "options": [{"id": "30m", "label": "30-60 min"}],
+                "status": "pending",
+            },
+        },
+    )
+    append_transcript_object(
+        key,
+        {
+            "event": "user",
+            "chat_id": "prompt-replay",
+            "text": "30-60 min",
+            "interactive_prompt_answer": {
+                "promptId": "prompt:1",
+                "answerType": "option",
+                "optionId": "30m",
+            },
+        },
+    )
+
+    out = build_webui_thread_response(key)
+
+    assert out is not None
+    assistant = out["messages"][0]
+    assert assistant["content"] == ""
+    prompt = assistant["interactivePrompt"]
+    assert prompt["status"] == "answered"
+    assert prompt["answeredOptionId"] == "30m"
+    assert prompt["answeredText"] == "30-60 min"
+    assert out["messages"][1]["interactivePromptAnswer"]["promptId"] == "prompt:1"
+
+
+def test_grouped_interactive_prompt_replay_resolves_answers(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:prompt-group-replay"
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": "prompt-group-replay",
+            "text": "",
+            "interactive_prompt": {
+                "promptId": "prompt:g1",
+                "question": "A couple of quick questions",
+                "options": [],
+                "questions": [
+                    {
+                        "id": "topic",
+                        "question": "What are you learning?",
+                        "options": [{"id": "language", "label": "A spoken language"}],
+                    },
+                    {
+                        "id": "time",
+                        "question": "How much time can you dedicate per day?",
+                        "options": [{"id": "30m", "label": "30-60 min"}],
+                    },
+                ],
+                "status": "pending",
+            },
+        },
+    )
+    append_transcript_object(
+        key,
+        {
+            "event": "user",
+            "chat_id": "prompt-group-replay",
+            "text": "Q: What are you learning? A: A spoken language\n\nQ: How much time can you dedicate per day? A: 30-60 min",
+            "interactive_prompt_answer": {
+                "promptId": "prompt:g1",
+                "answerType": "group",
+                "answers": [
+                    {
+                        "questionId": "topic",
+                        "answerType": "option",
+                        "optionId": "language",
+                        "text": "A spoken language",
+                    },
+                    {
+                        "questionId": "time",
+                        "answerType": "option",
+                        "optionId": "30m",
+                        "text": "30-60 min",
+                    },
+                ],
+            },
+        },
+    )
+
+    out = build_webui_thread_response(key)
+
+    assert out is not None
+    prompt = out["messages"][0]["interactivePrompt"]
+    assert prompt["status"] == "answered"
+    assert prompt["questions"][0]["answeredOptionId"] == "language"
+    assert prompt["questions"][0]["answeredText"] == "A spoken language"
+    assert prompt["questions"][1]["answeredOptionId"] == "30m"
+    assert prompt["questions"][1]["answeredText"] == "30-60 min"
+
+
+def test_append_user_message_persists_interactive_prompt_answer(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:prompt-live-answer"
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": "prompt-live-answer",
+            "text": "",
+            "interactive_prompt": {
+                "promptId": "prompt:live",
+                "question": "Pick one",
+                "options": [{"id": "a", "label": "A"}],
+                "status": "pending",
+            },
+        },
+    )
+    recorder = WebUITranscriptRecorder()
+    recorder.append_user_message(
+        "prompt-live-answer",
+        "A",
+        metadata={
+            "interactive_prompt_answer": {
+                "promptId": "prompt:live",
+                "answerType": "option",
+                "optionId": "a",
+            },
+        },
+    )
+
+    out = build_webui_thread_response(key)
+
+    assert out is not None
+    prompt = out["messages"][0]["interactivePrompt"]
+    assert prompt["status"] == "answered"
+    assert prompt["answeredOptionId"] == "a"
+    assert out["messages"][1]["interactivePromptAnswer"]["promptId"] == "prompt:live"
+
+
+def test_thread_response_overlays_session_answered_prompt_for_legacy_transcript(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:legacy-prompt"
+    pending_prompt = {
+        "promptId": "prompt:legacy",
+        "question": "Pick one",
+        "options": [{"id": "a", "label": "A"}],
+        "status": "pending",
+    }
+    append_transcript_object(
+        key,
+        {
+            "event": "message",
+            "chat_id": "legacy-prompt",
+            "text": "",
+            "interactive_prompt": pending_prompt,
+        },
+    )
+    append_transcript_object(
+        key,
+        {
+            "event": "user",
+            "chat_id": "legacy-prompt",
+            "text": "A",
+        },
+    )
+    answered_prompt = {
+        **pending_prompt,
+        "status": "answered",
+        "answeredOptionId": "a",
+        "answeredText": "A",
+    }
+
+    out = build_webui_thread_response(
+        key,
+        session_messages=[
+            {"role": "assistant", "content": "", "_interactive_prompt": answered_prompt},
+            {"role": "user", "content": "A"},
+        ],
+    )
+
+    assert out is not None
+    prompt = out["messages"][0]["interactivePrompt"]
+    assert prompt["status"] == "answered"
+    assert prompt["answeredOptionId"] == "a"
+    assert prompt["answeredText"] == "A"
+
+
 def test_recorder_can_write_to_explicit_session_key(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
     recorder = WebUITranscriptRecorder()

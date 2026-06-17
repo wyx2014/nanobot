@@ -42,6 +42,7 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.cron.session_turns import (
     cron_history_overrides,
+    is_cron_turn,
 )
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -65,6 +66,15 @@ from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
+)
+from nanobot.webui.interactive_prompt import (
+    INBOUND_META_INTERACTIVE_PROMPT_ANSWER,
+    SESSION_META_PENDING_INTERACTIVE_PROMPT,
+    interactive_prompt_requested_in_turn,
+    normalize_interactive_prompt,
+    normalize_interactive_prompt_answer,
+    reset_interactive_prompt_requested,
+    set_interactive_prompt_requested,
 )
 
 if TYPE_CHECKING:
@@ -1402,8 +1412,149 @@ class AgentLoop:
             self.sessions.save(ctx.session)
         if self._restore_pending_user_turn(ctx.session):
             self.sessions.save(ctx.session)
+        self._consume_pending_interactive_prompt_answer(ctx)
 
         return "ok"
+
+    def _consume_pending_interactive_prompt_answer(self, ctx: TurnContext) -> None:
+        pending = normalize_interactive_prompt(
+            ctx.session.metadata.get(SESSION_META_PENDING_INTERACTIVE_PROMPT)
+        )
+        if pending is None or pending.get("status") != "pending":
+            return
+        if ctx.msg.channel != "websocket":
+            return
+        if ctx.msg.metadata.get("webui") is not True:
+            return
+        if is_cron_turn(ctx.msg.metadata):
+            return
+
+        answer = normalize_interactive_prompt_answer(
+            ctx.msg.metadata.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
+        )
+        text = ctx.msg.content.strip() if isinstance(ctx.msg.content, str) else ""
+        if answer is None and text and pending.get("allowFreeform") is True:
+            answer = {
+                "promptId": pending["promptId"],
+                "answerType": "freeform",
+            }
+        if answer is None:
+            return
+        if answer.get("promptId") != pending["promptId"]:
+            return
+
+        answer_type = answer.get("answerType")
+        option_id = answer.get("optionId")
+        group_answers = answer.get("answers")
+        option_ids = {
+            option.get("id")
+            for option in pending.get("options", [])
+            if isinstance(option, dict) and isinstance(option.get("id"), str)
+        }
+        if answer_type == "option":
+            if not isinstance(option_id, str) or option_id not in option_ids:
+                return
+        elif answer_type == "freeform":
+            if pending.get("allowFreeform") is not True or not text:
+                return
+        elif answer_type == "skip":
+            if pending.get("allowSkip") is not True:
+                return
+        elif answer_type == "group":
+            if not isinstance(group_answers, list):
+                return
+            pending_questions = pending.get("questions")
+            if not isinstance(pending_questions, list) or not pending_questions:
+                return
+            question_by_id = {
+                question.get("id"): question
+                for question in pending_questions
+                if isinstance(question, dict) and isinstance(question.get("id"), str)
+            }
+            if len(group_answers) != len(question_by_id):
+                return
+            seen_question_ids: set[str] = set()
+            for item in group_answers:
+                if not isinstance(item, dict):
+                    return
+                question_id = item.get("questionId")
+                if not isinstance(question_id, str) or question_id in seen_question_ids:
+                    return
+                question = question_by_id.get(question_id)
+                if not isinstance(question, dict):
+                    return
+                seen_question_ids.add(question_id)
+                item_type = item.get("answerType")
+                item_text = item.get("text")
+                if not isinstance(item_text, str) or not item_text.strip():
+                    return
+                if item_type == "option":
+                    item_option_id = item.get("optionId")
+                    question_option_ids = {
+                        option.get("id")
+                        for option in question.get("options", [])
+                        if isinstance(option, dict) and isinstance(option.get("id"), str)
+                    }
+                    if not isinstance(item_option_id, str) or item_option_id not in question_option_ids:
+                        return
+                elif item_type == "freeform":
+                    if question.get("allowFreeform") is not True:
+                        return
+                else:
+                    return
+        else:
+            return
+
+        answered_prompt = dict(pending)
+        answered_prompt["status"] = "skipped" if answer_type == "skip" else "answered"
+        if isinstance(option_id, str) and option_id:
+            answered_prompt["answeredOptionId"] = option_id
+        if text:
+            answered_prompt["answeredText"] = text
+        if answer_type == "group" and isinstance(group_answers, list):
+            answered_questions: list[dict[str, Any]] = []
+            answers_by_question_id = {
+                item.get("questionId"): item
+                for item in group_answers
+                if isinstance(item, dict) and isinstance(item.get("questionId"), str)
+            }
+            for question in answered_prompt.get("questions", []):
+                if not isinstance(question, dict):
+                    continue
+                item = answers_by_question_id.get(question.get("id"))
+                answered_question = dict(question)
+                if isinstance(item, dict):
+                    item_option_id = item.get("optionId")
+                    item_text = item.get("text")
+                    if isinstance(item_option_id, str) and item_option_id:
+                        answered_question["answeredOptionId"] = item_option_id
+                    if isinstance(item_text, str):
+                        answered_question["answeredText"] = item_text
+                answered_questions.append(answered_question)
+            answered_prompt["questions"] = answered_questions
+        self._update_session_prompt_message(ctx.session, answered_prompt)
+        ctx.session.metadata.pop(SESSION_META_PENDING_INTERACTIVE_PROMPT, None)
+        metadata = dict(ctx.msg.metadata or {})
+        metadata[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = answer
+        ctx.msg = dataclasses.replace(ctx.msg, metadata=metadata)
+        self.sessions.save(ctx.session)
+
+    @staticmethod
+    def _update_session_prompt_message(session: Session, prompt: dict[str, Any]) -> None:
+        prompt_id = prompt.get("promptId")
+        if not isinstance(prompt_id, str) or not prompt_id:
+            return
+        for index in range(len(session.messages) - 1, -1, -1):
+            message = session.messages[index]
+            if message.get("role") != "assistant":
+                continue
+            candidate = normalize_interactive_prompt(message.get("_interactive_prompt"))
+            if candidate is None or candidate.get("promptId") != prompt_id:
+                continue
+            updated = dict(message)
+            updated["_interactive_prompt"] = dict(prompt)
+            session.messages[index] = updated
+            return
 
     def _prepare_message_media(self, content: str, media: list[str]) -> tuple[str, list[str]]:
         if self._should_extract_document_text():
@@ -1493,38 +1644,45 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
-        if ctx.visible_run_started_at is None:
-            ctx.visible_run_started_at = time.time()
-        await self._runtime_events().run_status_changed(
-            ctx.msg,
-            ctx.session_key,
-            "running",
-            started_at=ctx.visible_run_started_at,
-        )
-        result = await self._run_agent_loop(
-            ctx.initial_messages,
-            on_progress=ctx.on_progress,
-            on_stream=ctx.on_stream,
-            on_stream_end=ctx.on_stream_end,
-            on_retry_wait=ctx.on_retry_wait,
-            session=ctx.session,
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            message_id=ctx.msg.metadata.get("message_id"),
-            metadata=ctx.msg.metadata,
-            session_key=ctx.session_key,
-            pending_queue=ctx.pending_queue,
-            ephemeral=ctx.ephemeral,
-            run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
-            hooks=ctx.hooks,
-            tools=ctx.tools,
-        )
+        prompt_token = set_interactive_prompt_requested(False)
+        try:
+            if ctx.visible_run_started_at is None:
+                ctx.visible_run_started_at = time.time()
+            await self._runtime_events().run_status_changed(
+                ctx.msg,
+                ctx.session_key,
+                "running",
+                started_at=ctx.visible_run_started_at,
+            )
+            result = await self._run_agent_loop(
+                ctx.initial_messages,
+                on_progress=ctx.on_progress,
+                on_stream=ctx.on_stream,
+                on_stream_end=ctx.on_stream_end,
+                on_retry_wait=ctx.on_retry_wait,
+                session=ctx.session,
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                message_id=ctx.msg.metadata.get("message_id"),
+                metadata=ctx.msg.metadata,
+                session_key=ctx.session_key,
+                pending_queue=ctx.pending_queue,
+                ephemeral=ctx.ephemeral,
+                run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
+                hooks=ctx.hooks,
+                tools=ctx.tools,
+            )
+        finally:
+            prompt_requested = interactive_prompt_requested_in_turn()
+            reset_interactive_prompt_requested(prompt_token)
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
         ctx.tools_used = tools_used
         ctx.all_messages = all_msgs
         ctx.stop_reason = stop_reason
         ctx.had_injections = had_injections
+        if stop_reason == "interactive_prompt" or prompt_requested:
+            ctx.suppress_response = True
         await turn_continuation.maybe_continue_turn(ctx)
         return "ok"
 
