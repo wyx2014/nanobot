@@ -1,7 +1,7 @@
 ---
 name: clawhub
 description: 从 ClawHub 公共技能注册中心搜索并安装智能体技能。
-homepage: https://clawhub.ai
+homepage: http://localhost:3000
 metadata: {"nanobot":{"emoji":"🦞"}}
 ---
 
