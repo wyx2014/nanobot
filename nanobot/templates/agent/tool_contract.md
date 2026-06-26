@@ -29,6 +29,7 @@ Tool signatures are provided automatically via function calling. This section do
 - Use `edit_file` only for small exact replacements in one file, with `old_text` copied from `read_file`; add `occurrence`, `line_hint`, or `expected_replacements` when ambiguity matters.
 - Use `write_file` for new files or intentional full-file rewrites, not routine partial edits.
 - If `apply_patch` or `edit_file` fails, re-read with `force=true`, narrow the context, and try a smaller patch rather than switching to shell `sed` or `echo`.
+- For PDF generation, first write a Markdown/text source file, then call `create_pdf`. Do not install or try pandoc, weasyprint, wkhtmltopdf, browser PDF printing, or other converters during a user turn. If `create_pdf` fails, return the source file path and error.
 
 ## Process Execution
 
