@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.skills import SkillsLoader
+from nanobot.bus.events import InboundMessage
 from nanobot.session.goal_state import GOAL_STATE_KEY
 
 # ---------------------------------------------------------------------------
@@ -13,6 +15,15 @@ from nanobot.session.goal_state import GOAL_STATE_KEY
 
 def _builder(tmp_path: Path, **kw) -> ContextBuilder:
     return ContextBuilder(workspace=tmp_path, **kw)
+
+
+def _write_skill(base: Path, name: str, description: str) -> None:
+    skill_dir = base / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n",
+        encoding="utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +331,33 @@ class TestBuildMessages:
         user_msg = str(messages[-1]["content"])
         assert "[Runtime Context" in user_msg
         assert "hello" in user_msg
+
+    def test_skill_scope_filters_workspace_skills_in_system_prompt(self, tmp_path):
+        ws_skills = tmp_path / "skills"
+        ws_skills.mkdir()
+        _write_skill(ws_skills, "project-skill", "Project scoped skill")
+        _write_skill(ws_skills, "other-skill", "Other user skill")
+        builtin = tmp_path / "builtin"
+        _write_skill(builtin, "pdf", "Builtin pdf skill")
+        builder = _builder(tmp_path)
+        builder.skills = SkillsLoader(tmp_path, builtin_skills_dir=builtin)
+        msg = InboundMessage(
+            channel="websocket",
+            sender_id="u",
+            chat_id="c",
+            content="hello",
+            metadata={
+                "skill_scope": {
+                    "project_bound_user_skills": ["project-skill"],
+                    "explicit_skills": [],
+                },
+            },
+        )
+
+        system = builder.build_messages([], "hello", inbound_message=msg)[0]["content"]
+        assert "project-skill" in system
+        assert "pdf" in system
+        assert "other-skill" not in system
 
     def test_session_metadata_injects_active_goal_state(self, tmp_path):
         builder = _builder(tmp_path)

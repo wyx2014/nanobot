@@ -2,6 +2,7 @@
 
 import pytest
 
+from nanobot.agent.skill_scope import bind_allowed_workspace_skills, reset_allowed_workspace_skills
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -320,6 +321,38 @@ class TestWorkspaceRestriction:
         result = await tool.execute(path=str(skill_file))
         assert "Test Skill" in result
         assert "Error" not in result
+
+    @pytest.mark.asyncio
+    async def test_read_workspace_skill_blocked_when_not_in_skill_scope(self, tmp_path):
+        workspace = tmp_path / "ws"
+        skill_file = workspace / "skills" / "stock" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True)
+        skill_file.write_text("# Stock Skill\n", encoding="utf-8")
+
+        tool = ReadFileTool(workspace=workspace)
+        token = bind_allowed_workspace_skills({"project_bound_user_skills": [], "explicit_skills": []})
+        try:
+            result = await tool.execute(path=str(skill_file))
+        finally:
+            reset_allowed_workspace_skills(token)
+
+        assert "not enabled for this project" in result
+
+    @pytest.mark.asyncio
+    async def test_read_workspace_skill_allowed_when_in_skill_scope(self, tmp_path):
+        workspace = tmp_path / "ws"
+        skill_file = workspace / "skills" / "stock" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True)
+        skill_file.write_text("# Stock Skill\n", encoding="utf-8")
+
+        tool = ReadFileTool(workspace=workspace)
+        token = bind_allowed_workspace_skills({"project_bound_user_skills": ["stock"], "explicit_skills": []})
+        try:
+            result = await tool.execute(path=str(skill_file))
+        finally:
+            reset_allowed_workspace_skills(token)
+
+        assert "Stock Skill" in result
 
     @pytest.mark.asyncio
     async def test_read_allowed_in_media_dir(self, tmp_path, monkeypatch):

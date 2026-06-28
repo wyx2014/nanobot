@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.skill_scope import allowed_workspace_skills_from_scope
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
@@ -98,9 +99,11 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        skill_scope: Mapping[str, Any] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
+        allowed_workspace_skills = allowed_workspace_skills_from_scope(skill_scope)
         parts = [self._get_identity(channel=channel, workspace=root)]
 
         bootstrap = self._load_bootstrap_files(root)
@@ -113,13 +116,16 @@ class ContextBuilder:
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Memory\n\n{memory}")
 
-        always_skills = self.skills.get_always_skills()
+        always_skills = self.skills.get_always_skills(allowed_workspace_skills=allowed_workspace_skills)
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
-        skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
+        skills_summary = self.skills.build_skills_summary(
+            exclude=set(always_skills),
+            allowed_workspace_skills=allowed_workspace_skills,
+        )
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
@@ -233,6 +239,9 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
+        skill_scope = None
+        if isinstance(msg_metadata := getattr(inbound_message, "metadata", None), Mapping):
+            skill_scope = msg_metadata.get("skill_scope")
         extra = [
             *goal_state_runtime_lines(session_metadata),
         ]
@@ -276,6 +285,7 @@ class ContextBuilder:
                     include_memory_recent_history=include_memory_recent_history,
                     session_key=session_key,
                     unified_session=unified_session,
+                    skill_scope=skill_scope if isinstance(skill_scope, Mapping) else None,
                 ),
             },
             *history,

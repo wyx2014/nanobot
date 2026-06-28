@@ -16,6 +16,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.agent.skill_scope import current_allowed_workspace_skills
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
@@ -135,12 +136,31 @@ class _FsTool(Tool):
         )
 
     def _resolve_read(self, path: str) -> Path:
-        return self._resolve_with_extra(
+        resolved = self._resolve_with_extra(
             path,
             self._extra_read_allowed_dirs,
             None,
             include_media_dir=True,
         )
+        self._check_workspace_skill_allowed(resolved)
+        return resolved
+
+    def _check_workspace_skill_allowed(self, path: Path) -> None:
+        allowed = current_allowed_workspace_skills()
+        if allowed is None or self._workspace is None:
+            return
+        try:
+            skills_root = (Path(self._workspace) / "skills").expanduser().resolve(strict=False)
+            resolved = path.expanduser().resolve(strict=False)
+            rel = resolved.relative_to(skills_root)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return
+        parts = rel.parts
+        if not parts:
+            return
+        skill_name = parts[0]
+        if skill_name not in allowed:
+            raise ValueError(f"Skill {skill_name} is not enabled for this project")
 
     def _resolve_write(self, path: str) -> Path:
         return self._resolve_with_extra(

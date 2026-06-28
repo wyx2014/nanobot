@@ -48,7 +48,11 @@ class SkillsLoader:
             entries.append({"name": name, "path": str(skill_file), "source": source})
         return entries
 
-    def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
+    def list_skills(
+        self,
+        filter_unavailable: bool = True,
+        allowed_workspace_skills: set[str] | None = None,
+    ) -> list[dict[str, str]]:
         """
         List all available skills.
 
@@ -59,10 +63,12 @@ class SkillsLoader:
             List of skill info dicts with 'name', 'path', 'source'.
         """
         skills = self._skill_entries_from_dir(self.workspace_skills, "workspace")
-        workspace_names = {entry["name"] for entry in skills}
+        all_workspace_names = {entry["name"] for entry in skills}
+        if allowed_workspace_skills is not None:
+            skills = [skill for skill in skills if skill["name"] in allowed_workspace_skills]
         if self.builtin_skills and self.builtin_skills.exists():
             skills.extend(
-                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=workspace_names)
+                self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=all_workspace_names)
             )
 
         if self.disabled_skills:
@@ -108,7 +114,11 @@ class SkillsLoader:
         ]
         return "\n\n---\n\n".join(parts)
 
-    def build_skills_summary(self, exclude: set[str] | None = None) -> str:
+    def build_skills_summary(
+        self,
+        exclude: set[str] | None = None,
+        allowed_workspace_skills: set[str] | None = None,
+    ) -> str:
         """
         Build a summary of all skills (name, description, path, availability).
 
@@ -121,7 +131,10 @@ class SkillsLoader:
         Returns:
             Markdown-formatted skills summary.
         """
-        all_skills = self.list_skills(filter_unavailable=False)
+        all_skills = self.list_skills(
+            filter_unavailable=False,
+            allowed_workspace_skills=allowed_workspace_skills,
+        )
         if not all_skills:
             return ""
 
@@ -146,9 +159,16 @@ class SkillsLoader:
         requires = skill_meta.get("requires", {})
         required_bins = requires.get("bins", [])
         required_env_vars = requires.get("env", [])
+        required_files = requires.get("files", [])
+        skill_dir = Path(skill_meta.get("_skill_dir", ""))
         return ", ".join(
             [f"CLI: {command_name}" for command_name in required_bins if not shutil.which(command_name)]
             + [f"ENV: {env_name}" for env_name in required_env_vars if not os.environ.get(env_name)]
+            + [
+                f"FILE: {file_name}"
+                for file_name in required_files
+                if not (skill_dir / str(file_name)).exists()
+            ]
         )
 
     def get_skill_availability(self, name: str) -> tuple[bool, str]:
@@ -162,11 +182,15 @@ class SkillsLoader:
         requires = self._get_skill_meta(name).get("requires", {})
         bins = [str(value) for value in requires.get("bins", [])]
         env = [str(value) for value in requires.get("env", [])]
+        files = [str(value) for value in requires.get("files", [])]
+        skill_dir = Path(self._get_skill_meta(name).get("_skill_dir", ""))
         return {
             "bins": bins,
             "env": env,
+            "files": files,
             "missing_bins": [value for value in bins if not shutil.which(value)],
             "missing_env": [value for value in env if not os.environ.get(value)],
+            "missing_files": [value for value in files if not (skill_dir / value).exists()],
         }
 
     def _get_skill_description(self, name: str) -> str:
@@ -209,20 +233,30 @@ class SkillsLoader:
         requires = skill_meta.get("requires", {})
         required_bins = requires.get("bins", [])
         required_env_vars = requires.get("env", [])
+        required_files = requires.get("files", [])
+        skill_dir = Path(skill_meta.get("_skill_dir", ""))
         return all(shutil.which(cmd) for cmd in required_bins) and all(
             os.environ.get(var) for var in required_env_vars
-        )
+        ) and all((skill_dir / str(file_name)).exists() for file_name in required_files)
 
     def _get_skill_meta(self, name: str) -> dict:
         """Get nanobot metadata for a skill (cached in frontmatter)."""
         raw_meta = self.get_skill_metadata(name) or {}
-        return self._parse_nanobot_metadata(raw_meta.get("metadata"))
+        meta = self._parse_nanobot_metadata(raw_meta.get("metadata"))
+        for root in [self.workspace_skills, self.builtin_skills]:
+            if root and (root / name / "SKILL.md").exists():
+                meta["_skill_dir"] = str(root / name)
+                break
+        return meta
 
-    def get_always_skills(self) -> list[str]:
+    def get_always_skills(self, allowed_workspace_skills: set[str] | None = None) -> list[str]:
         """Get skills marked as always=true that meet requirements."""
         return [
             entry["name"]
-            for entry in self.list_skills(filter_unavailable=True)
+            for entry in self.list_skills(
+                filter_unavailable=True,
+                allowed_workspace_skills=allowed_workspace_skills,
+            )
             if (meta := self.get_skill_metadata(entry["name"]) or {})
             and (
                 self._parse_nanobot_metadata(meta.get("metadata")).get("always")

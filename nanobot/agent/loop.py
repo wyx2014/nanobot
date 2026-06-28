@@ -24,6 +24,10 @@ from nanobot.agent.hook import AgentHook, CompositeHook
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.skill_scope import (
+    bind_allowed_workspace_skills,
+    reset_allowed_workspace_skills,
+)
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
@@ -809,6 +813,9 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+        skill_scope_token = bind_allowed_workspace_skills(
+            metadata.get("skill_scope") if isinstance(metadata, dict) else None
+        )
         # Compute lazily because long_task may create goal metadata during this run.
         def _goal_continue() -> str | None:
             _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
@@ -859,6 +866,7 @@ class AgentLoop:
                 ),
             ))
         finally:
+            reset_allowed_workspace_skills(skill_scope_token)
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)

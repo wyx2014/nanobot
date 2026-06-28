@@ -56,6 +56,28 @@ from nanobot.webui.transcription_ws import webui_transcription_event
 from nanobot.webui.websocket_logging import websockets_server_logger
 
 
+def normalize_skill_scope(raw: Any) -> dict[str, list[str]]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, list[str]] = {}
+    for key in ("project_bound_user_skills", "explicit_skills"):
+        value = raw.get(key)
+        if not isinstance(value, list):
+            continue
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            name = item.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        normalized[key] = names
+    return normalized
+
+
 class WebSocketConfig(Base):
     """WebSocket server channel configuration.
 
@@ -803,6 +825,9 @@ class WebSocketChannel(BaseChannel):
             mcp_presets = normalize_mcp_preset_mentions(envelope.get("mcp_presets"))
             if mcp_presets:
                 metadata["mcp_presets"] = mcp_presets
+            skill_scope = normalize_skill_scope(envelope.get("skill_scope"))
+            if skill_scope:
+                metadata["skill_scope"] = skill_scope
             if interactive_prompt_answer:
                 metadata[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = interactive_prompt_answer
             metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()

@@ -200,6 +200,42 @@ def test_list_skills_filter_unavailable_false_keeps_unmet_requirements(
     ]
 
 
+def test_list_skills_filter_unavailable_excludes_missing_file_requirement(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    skills_root.mkdir(parents=True)
+    _write_skill(
+        skills_root,
+        "needs_file",
+        metadata_json={"requires": {"files": ["call-node.js"]}},
+    )
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    assert loader.list_skills(filter_unavailable=True) == []
+    assert loader.get_skill_requirements("needs_file")["missing_files"] == ["call-node.js"]
+
+
+def test_list_skills_filter_unavailable_includes_existing_file_requirement(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    skills_root.mkdir(parents=True)
+    skill_path = _write_skill(
+        skills_root,
+        "has_file",
+        metadata_json={"requires": {"files": ["call-node.js"]}},
+    )
+    (skills_root / "has_file" / "call-node.js").write_text("", encoding="utf-8")
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    assert loader.list_skills(filter_unavailable=True) == [
+        {"name": "has_file", "path": str(skill_path), "source": "workspace"},
+    ]
+
+
 def test_list_skills_filter_unavailable_excludes_unmet_env_requirement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -295,6 +331,43 @@ def test_disabled_skills_excluded_from_build_skills_summary(tmp_path: Path) -> N
     summary = loader.build_skills_summary()
     assert "alpha" not in summary
     assert "beta" in summary
+
+
+def test_build_skills_summary_filters_workspace_skills_but_keeps_builtin(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    ws_skills = workspace / "skills"
+    ws_skills.mkdir(parents=True)
+    _write_skill(ws_skills, "project-only", body="# Project")
+    _write_skill(ws_skills, "other-user", body="# Other")
+    builtin = tmp_path / "builtin"
+    _write_skill(builtin, "pdf", body="# Pdf")
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    summary = loader.build_skills_summary(allowed_workspace_skills={"project-only"})
+    assert "project-only" in summary
+    assert "pdf" in summary
+    assert "other-user" not in summary
+
+    builtin_only = loader.build_skills_summary(allowed_workspace_skills=set())
+    assert "pdf" in builtin_only
+    assert "project-only" not in builtin_only
+    assert "other-user" not in builtin_only
+
+
+def test_workspace_skill_filter_does_not_fall_back_to_builtin_same_name(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    ws_skills = workspace / "skills"
+    ws_skills.mkdir(parents=True)
+    _write_skill(ws_skills, "ifind-finance-data", body="# Workspace iFind")
+    builtin = tmp_path / "builtin"
+    _write_skill(builtin, "ifind-finance-data", body="# Builtin iFind")
+    _write_skill(builtin, "pdf", body="# Builtin PDF")
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    summary = loader.build_skills_summary(allowed_workspace_skills=set())
+
+    assert "ifind-finance-data" not in summary
+    assert "pdf" in summary
 
 
 def test_disabled_skills_excluded_from_get_always_skills(tmp_path: Path) -> None:
