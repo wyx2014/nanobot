@@ -1848,6 +1848,7 @@ def replay_transcript_to_ui_messages(
                 close_reasoning(messages)
                 continue
             if kind in ("tool_hint", "progress"):
+                agent_ui = rec.get("agent_ui")
                 structured_events = _normalize_tool_events(rec.get("tool_events"))
                 visible_structured_events = _filter_covered_file_edit_tool_events(messages, structured_events)
                 structured = tool_trace_lines_from_events(visible_structured_events)
@@ -1858,6 +1859,8 @@ def replay_transcript_to_ui_messages(
                     trace_lines = []
                 elif isinstance(text, str) and text:
                     trace_lines = [text]
+                elif isinstance(agent_ui, dict):
+                    trace_lines = [str(agent_ui.get("kind") or "progress")]
                 else:
                     trace_lines = []
                 if not trace_lines:
@@ -1885,6 +1888,7 @@ def replay_transcript_to_ui_messages(
                         "toolEvents": _merge_tool_events(last.get("toolEvents"), visible_structured_events)
                         if visible_structured_events
                         else last.get("toolEvents"),
+                        **({"agentUI": agent_ui} if isinstance(agent_ui, dict) else {}),
                         "activitySegmentId": last.get("activitySegmentId") or segment,
                         **_turn_fields(rec, "activity"),
                     }
@@ -1898,6 +1902,7 @@ def replay_transcript_to_ui_messages(
                             "content": trace_lines[-1],
                             "traces": trace_lines,
                             **({"toolEvents": visible_structured_events} if visible_structured_events else {}),
+                            **({"agentUI": agent_ui} if isinstance(agent_ui, dict) else {}),
                             "activitySegmentId": segment,
                             **_turn_fields(rec, "activity"),
                             "createdAt": _ts_base + idx,
