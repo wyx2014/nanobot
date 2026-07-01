@@ -25,6 +25,10 @@ from nanobot.cron.types import (
     CronStore,
 )
 
+_STALE_RUNNING_RUN_MS = 24 * 60 * 60 * 1000
+_STALE_RUNNING_ERROR = "run interrupted before completion"
+_AUDIT_REPAIR_WINDOW_MS = 60 * 1000
+
 
 class CronJobSkippedError(Exception):
     """Raised by cron callbacks when a job was intentionally skipped."""
@@ -32,6 +36,25 @@ class CronJobSkippedError(Exception):
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _mark_stale_running_records(job: CronJob, now_ms: int) -> bool:
+    changed = False
+    for record in job.state.run_history:
+        if record.status != "running" or now_ms - record.run_at_ms <= _STALE_RUNNING_RUN_MS:
+            continue
+        record.status = "error"
+        record.duration_ms = max(0, now_ms - record.run_at_ms)
+        record.error = record.error or _STALE_RUNNING_ERROR
+        changed = True
+    if job.state.last_status == "running" and job.state.run_history:
+        latest = job.state.run_history[-1]
+        if latest.status == "error":
+            job.state.last_status = "error"
+            job.state.last_error = latest.error
+            job.updated_at_ms = max(job.updated_at_ms, now_ms)
+            changed = True
+    return changed
 
 
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
@@ -157,6 +180,7 @@ class CronService:
         self._timer_task: asyncio.Task | None = None
         self._running = False
         self._timer_active = False
+        self._executing_jobs = 0
         self.max_sleep_ms = max_sleep_ms
 
     def _is_unbound_agent_job(self, job: CronJob) -> bool:
@@ -213,8 +237,10 @@ class CronService:
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                now_ms = _now_ms()
                 jobs = []
                 version = data.get("version", 1)
+                repaired = False
                 for j in data.get("jobs", []):
                     job = CronJob(
                         id=j["id"],
@@ -275,7 +301,12 @@ class CronService:
                         delete_after_run=j.get("deleteAfterRun", False),
                     )
                     _normalize_agent_turn_job(job)
+                    repaired = _mark_stale_running_records(job, now_ms) or repaired
                     jobs.append(job)
+                repaired = self._repair_running_records_from_audit(jobs) or repaired
+                if repaired:
+                    self._store = CronStore(version=version, jobs=jobs)
+                    self._save_store()
             except Exception:
                 # Preserve the corrupt file for forensic recovery instead of
                 # letting the next save overwrite it with an empty job list.
@@ -293,6 +324,61 @@ class CronService:
                 )
                 return None
         return jobs, version
+
+    def _repair_running_records_from_audit(self, jobs: list[CronJob]) -> bool:
+        if not self._run_records_dir.is_dir():
+            return False
+        audit_by_job: dict[str, list[dict[str, Any]]] = {}
+        for path in self._run_records_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("status") not in {"ok", "error", "skipped"}:
+                continue
+            job_id = data.get("job_id")
+            run_id = data.get("run_id")
+            if not isinstance(job_id, str) or not isinstance(run_id, str):
+                continue
+            try:
+                run_at_ms = int(run_id.split(":", 1)[0])
+            except ValueError:
+                continue
+            data["_run_at_ms"] = run_at_ms
+            audit_by_job.setdefault(job_id, []).append(data)
+
+        changed = False
+        for records in audit_by_job.values():
+            records.sort(key=lambda item: item["_run_at_ms"])
+        for job in jobs:
+            audits = audit_by_job.get(job.id, [])
+            if not audits:
+                continue
+            for record in job.state.run_history:
+                if record.status != "running":
+                    continue
+                match = min(
+                    audits,
+                    key=lambda item: abs(int(item["_run_at_ms"]) - record.run_at_ms),
+                    default=None,
+                )
+                if match is None or abs(int(match["_run_at_ms"]) - record.run_at_ms) > _AUDIT_REPAIR_WINDOW_MS:
+                    continue
+                record.status = "ok" if match.get("status") == "ok" else "error"
+                record.error = match.get("error") if isinstance(match.get("error"), str) else None
+                record.run_id = match.get("run_id") if isinstance(match.get("run_id"), str) else record.run_id
+                record.session_key = match.get("session_key") if isinstance(match.get("session_key"), str) else record.session_key
+                updated_at = match.get("updated_at_ms")
+                if isinstance(updated_at, int):
+                    record.duration_ms = max(0, updated_at - record.run_at_ms)
+                changed = True
+            if job.state.last_status == "running" and job.state.run_history and job.state.run_history[-1].status != "running":
+                latest = job.state.run_history[-1]
+                job.state.last_status = latest.status
+                job.state.last_error = latest.error
+                job.updated_at_ms = max(job.updated_at_ms, _now_ms())
+                changed = True
+        return changed
 
     def _merge_action(self):
         if not self._action_path.exists():
@@ -342,7 +428,7 @@ class CronService:
           load (during ``start``) can return ``None`` to signal an unrecoverable
           state to the caller.
         """
-        if self._timer_active and self._store:
+        if (self._timer_active or self._executing_jobs > 0) and self._store:
             return self._store
         loaded = self._load_jobs()
         if loaded is None:
@@ -566,61 +652,76 @@ class CronService:
 
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
+        self._executing_jobs += 1
         start_ms = _now_ms()
-        run_id: str | None = None
-        session_key: str | None = None
-        logger.info("Cron: executing job '{}' ({})", job.name, job.id)
+        record = CronRunRecord(
+            run_at_ms=start_ms,
+            status="running",
+            run_id=f"{job.id}:{start_ms}",
+        )
+        job.state.run_history.append(record)
+        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+        job.state.last_run_at_ms = start_ms
+        job.state.last_status = "running"
+        job.state.last_error = None
+        job.updated_at_ms = start_ms
+        self._save_store()
 
         try:
-            result = await self.on_job(job) if self.on_job else None
-            if isinstance(result, CronJobExecutionResult):
-                run_id = result.run_id
-                session_key = result.session_key
+            run_id: str | None = None
+            session_key: str | None = None
+            logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
-            job.state.last_status = "ok"
-            job.state.last_error = None
-            logger.info("Cron: job '{}' completed", job.name)
+            try:
+                result = await self.on_job(job) if self.on_job else None
+                if isinstance(result, CronJobExecutionResult):
+                    run_id = result.run_id
+                    session_key = result.session_key
 
-        except CronJobSkippedError as e:
-            job.state.last_status = "skipped"
-            job.state.last_error = str(e) or None
-            logger.warning("Cron: job '{}' skipped: {}", job.name, job.state.last_error or "")
-        except asyncio.CancelledError as e:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                raise
-            job.state.last_status = "error"
-            job.state.last_error = str(e) or e.__class__.__name__
-            logger.exception("Cron: job '{}' was cancelled", job.name)
-        except Exception as e:
-            job.state.last_status = "error"
-            job.state.last_error = str(e)
-            logger.exception("Cron: job '{}' failed", job.name)
+                job.state.last_status = "ok"
+                job.state.last_error = None
+                logger.info("Cron: job '{}' completed", job.name)
 
-        end_ms = _now_ms()
-        job.state.last_run_at_ms = start_ms
-        job.updated_at_ms = end_ms
+            except CronJobSkippedError as e:
+                job.state.last_status = "skipped"
+                job.state.last_error = str(e) or None
+                logger.warning("Cron: job '{}' skipped: {}", job.name, job.state.last_error or "")
+            except asyncio.CancelledError as e:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                job.state.last_status = "error"
+                job.state.last_error = str(e) or e.__class__.__name__
+                logger.exception("Cron: job '{}' was cancelled", job.name)
+            except Exception as e:
+                job.state.last_status = "error"
+                job.state.last_error = str(e)
+                logger.exception("Cron: job '{}' failed", job.name)
 
-        job.state.run_history.append(CronRunRecord(
-            run_at_ms=start_ms,
-            status=job.state.last_status,
-            duration_ms=end_ms - start_ms,
-            error=job.state.last_error,
-            run_id=run_id,
-            session_key=session_key,
-        ))
-        job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+            end_ms = _now_ms()
+            job.state.last_run_at_ms = start_ms
+            job.updated_at_ms = end_ms
 
-        # Handle one-shot jobs
-        if job.schedule.kind == "at":
-            if job.delete_after_run:
-                self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
+            record.status = job.state.last_status
+            record.duration_ms = end_ms - start_ms
+            record.error = job.state.last_error
+            record.run_id = run_id or record.run_id
+            record.session_key = session_key
+            job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
+
+            # Handle one-shot jobs
+            if job.schedule.kind == "at":
+                if job.delete_after_run:
+                    self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
+                else:
+                    job.enabled = False
+                    job.state.next_run_at_ms = None
             else:
-                job.enabled = False
-                job.state.next_run_at_ms = None
-        else:
-            # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+                # Compute next run
+                job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            self._save_store()
+        finally:
+            self._executing_jobs = max(0, self._executing_jobs - 1)
 
     def _append_action(self, action: Literal["add", "del", "update"], params: dict):
         self.store_path.parent.mkdir(parents=True, exist_ok=True)

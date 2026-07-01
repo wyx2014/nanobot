@@ -347,6 +347,130 @@ async def test_execute_job_records_run_history(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_job_persists_running_record_before_completion(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    release = asyncio.Event()
+
+    async def run(_):
+        await release.wait()
+
+    service = CronService(store_path, on_job=run)
+    job = service.add_job(
+        name="hist",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        **_bound_chat(),
+    )
+
+    task = asyncio.create_task(service.run_job(job.id))
+    await _wait_until(lambda: CronService(store_path).get_job(job.id).state.run_history)
+
+    running_job = CronService(store_path).get_job(job.id)
+    assert running_job is not None
+    assert len(running_job.state.run_history) == 1
+    assert running_job.state.run_history[0].status == "running"
+    assert service.list_jobs(include_disabled=True)[0].state.run_history[0].status == "running"
+
+    release.set()
+    await task
+
+    loaded = CronService(store_path).get_job(job.id)
+    assert loaded is not None
+    assert len(loaded.state.run_history) == 1
+    assert loaded.state.run_history[0].status == "ok"
+
+
+def test_stale_running_run_history_is_marked_error_on_load(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    old_ms = int(time.time() * 1000) - 2 * 24 * 60 * 60 * 1000
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text(json.dumps({
+        "version": 1,
+        "jobs": [{
+            "id": "daily-news",
+            "name": "每日新闻",
+            "enabled": True,
+            "schedule": {"kind": "every", "everyMs": 60_000},
+            "payload": {
+                "kind": "agent_turn",
+                "message": "news",
+                "sessionKey": "websocket:chat-1",
+                "originChannel": "websocket",
+                "originChatId": "chat-1",
+            },
+            "state": {
+                "lastRunAtMs": old_ms,
+                "lastStatus": "running",
+                "runHistory": [{
+                    "runAtMs": old_ms,
+                    "status": "running",
+                    "durationMs": 0,
+                    "runId": "daily-news:old",
+                }],
+            },
+            "createdAtMs": old_ms,
+            "updatedAtMs": old_ms,
+        }],
+    }), encoding="utf-8")
+
+    job = CronService(store_path).get_job("daily-news")
+    assert job is not None
+    assert job.state.last_status == "error"
+    assert job.state.run_history[0].status == "error"
+    assert job.state.run_history[0].error == "run interrupted before completion"
+
+
+def test_running_run_history_is_repaired_from_audit_record(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    run_at_ms = int(time.time() * 1000)
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text(json.dumps({
+        "version": 1,
+        "jobs": [{
+            "id": "daily-news",
+            "name": "每日新闻",
+            "enabled": True,
+            "schedule": {"kind": "every", "everyMs": 60_000},
+            "payload": {
+                "kind": "agent_turn",
+                "message": "news",
+                "sessionKey": "websocket:chat-1",
+                "originChannel": "websocket",
+                "originChatId": "chat-1",
+            },
+            "state": {
+                "lastRunAtMs": run_at_ms,
+                "lastStatus": "running",
+                "runHistory": [{
+                    "runAtMs": run_at_ms,
+                    "status": "running",
+                    "durationMs": 0,
+                    "runId": f"daily-news:{run_at_ms}",
+                }],
+            },
+            "createdAtMs": run_at_ms,
+            "updatedAtMs": run_at_ms,
+        }],
+    }), encoding="utf-8")
+    runs_dir = store_path.parent / "runs"
+    runs_dir.mkdir()
+    runs_dir.joinpath("audit.json").write_text(json.dumps({
+        "job_id": "daily-news",
+        "status": "ok",
+        "run_id": f"{run_at_ms + 7}:abcd1234",
+        "session_key": f"cron:daily-news:{run_at_ms + 7}:abcd1234",
+        "updated_at_ms": run_at_ms + 5000,
+    }), encoding="utf-8")
+
+    job = CronService(store_path).get_job("daily-news")
+    assert job is not None
+    assert job.state.last_status == "ok"
+    assert job.state.run_history[0].status == "ok"
+    assert job.state.run_history[0].run_id == f"{run_at_ms + 7}:abcd1234"
+    assert job.state.run_history[0].session_key == f"cron:daily-news:{run_at_ms + 7}:abcd1234"
+
+
+@pytest.mark.asyncio
 async def test_execute_job_records_run_session_metadata(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
 
@@ -362,6 +486,7 @@ async def test_execute_job_records_run_session_metadata(tmp_path) -> None:
         name="hist",
         schedule=CronSchedule(kind="every", every_ms=60_000),
         message="hello",
+        **_bound_chat(),
     )
     await service.run_job(job.id)
 

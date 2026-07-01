@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -79,9 +80,9 @@ def _message(prompt: str, skill_name: str) -> str:
 
 
 def _run_payload(job: CronJob, run: CronRunRecord) -> dict[str, Any]:
-    status = "error" if run.status == "error" else "completed"
+    status = "running" if run.status == "running" else "error" if run.status == "error" else "completed"
     completed_at = run.run_at_ms + max(0, run.duration_ms or 0)
-    session_key = run.session_key or f"cron:{job.id}"
+    session_key = run.session_key or ("" if status == "running" else f"cron:{job.id}")
     return {
         "id": run.run_id or f"{job.id}:{run.run_at_ms}",
         "scheduledTaskId": job.id,
@@ -267,7 +268,17 @@ class WebUIScheduleRouter:
         job_id = _first(self._query(request), "id").strip()
         if not job_id:
             return self._error_response(400, "id is required")
-        ok = await self.cron.run_job(job_id, force=True)
-        if not ok:
+        if self.cron.get_job(job_id) is None:
             return self._error_response(404, "task not found")
+        task = asyncio.create_task(self.cron.run_job(job_id, force=True))
+
+        def _log_failure(done: asyncio.Task[bool]) -> None:
+            if done.cancelled():
+                return
+            exc = done.exception()
+            if exc is not None:
+                self.logger.opt(exception=exc).error("schedule task run failed")
+
+        task.add_done_callback(_log_failure)
+        await asyncio.sleep(0)
         return self._json_response(_payload(self.cron))
