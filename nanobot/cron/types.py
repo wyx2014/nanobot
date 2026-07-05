@@ -43,6 +43,7 @@ class CronRunRecord:
     error: str | None = None
     run_id: str | None = None
     session_key: str | None = None
+    viewed_at_ms: int | None = None
 
 
 @dataclass

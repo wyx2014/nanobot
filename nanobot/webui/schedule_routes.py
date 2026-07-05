@@ -93,6 +93,7 @@ def _run_payload(job: CronJob, run: CronRunRecord) -> dict[str, Any]:
         "completedAt": completed_at,
         "status": status,
         "error": run.error,
+        "viewedAt": run.viewed_at_ms,
     }
 
 
@@ -176,6 +177,8 @@ class WebUIScheduleRouter:
             return self._enable(request, True)
         if path == "/api/schedule/tasks/run":
             return await self._run(request)
+        if path == "/api/schedule/runs/viewed":
+            return self._mark_run_viewed(request)
         return self._error_response(404, "schedule route not found")
 
     def _query(self, request: WsRequest) -> QueryParams:
@@ -281,4 +284,14 @@ class WebUIScheduleRouter:
 
         task.add_done_callback(_log_failure)
         await asyncio.sleep(0)
+        return self._json_response(_payload(self.cron))
+
+    def _mark_run_viewed(self, request: WsRequest) -> Response:
+        query = self._query(request)
+        job_id = _first(query, "task_id").strip() or _first(query, "id").strip()
+        run_id = _first(query, "run_id").strip()
+        if not job_id or not run_id:
+            return self._error_response(400, "task_id and run_id are required")
+        if not self.cron.mark_run_viewed(job_id, run_id):
+            return self._error_response(404, "run not found")
         return self._json_response(_payload(self.cron))

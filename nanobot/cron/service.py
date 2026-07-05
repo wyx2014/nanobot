@@ -292,6 +292,7 @@ class CronService:
                                     error=r.get("error"),
                                     run_id=r.get("runId") or r.get("run_id"),
                                     session_key=r.get("sessionKey") or r.get("session_key"),
+                                    viewed_at_ms=r.get("viewedAtMs") or r.get("viewed_at_ms"),
                                 )
                                 for r in j.get("state", {}).get("runHistory", [])
                             ],
@@ -492,6 +493,7 @@ class CronService:
                                 "error": r.error,
                                 "runId": r.run_id,
                                 "sessionKey": r.session_key,
+                                "viewedAtMs": r.viewed_at_ms,
                             }
                             for r in j.state.run_history
                         ],
@@ -955,6 +957,25 @@ class CronService:
         """Get a job by ID."""
         store = self._load_store()
         return next((j for j in store.jobs if j.id == job_id), None)
+
+    def mark_run_viewed(self, job_id: str, run_id: str) -> bool:
+        """Mark one cron run as viewed by the GUI."""
+        store = self._load_store()
+        job = next((j for j in store.jobs if j.id == job_id), None)
+        if job is None:
+            return False
+        for record in job.state.run_history:
+            fallback_id = f"{job.id}:{record.run_at_ms}"
+            if run_id not in {record.run_id, fallback_id}:
+                continue
+            record.viewed_at_ms = record.viewed_at_ms or _now_ms()
+            job.updated_at_ms = max(job.updated_at_ms, record.viewed_at_ms)
+            if self._running:
+                self._save_store()
+            else:
+                self._append_action("update", asdict(job))
+            return True
+        return False
 
     def status(self) -> dict:
         """Get service status."""

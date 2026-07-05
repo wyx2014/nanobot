@@ -5,7 +5,7 @@ import time
 import pytest
 
 from nanobot.cron.service import CronJobSkippedError, CronService
-from nanobot.cron.types import CronJob, CronJobExecutionResult, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronJobExecutionResult, CronPayload, CronRunRecord, CronSchedule
 
 
 async def _wait_until(predicate, *, timeout: float = 1.0, interval: float = 0.01) -> None:
@@ -616,6 +616,35 @@ async def test_run_history_persisted_to_disk(tmp_path) -> None:
     loaded = fresh.get_job(job.id)
     assert len(loaded.state.run_history) == 1
     assert loaded.state.run_history[0].status == "ok"
+
+
+def test_mark_run_viewed_persists_to_disk(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    created = service.add_job(
+        name="viewed",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        **_bound_chat(),
+    )
+    service._running = True
+    store = service._load_store()
+    job = next(j for j in store.jobs if j.id == created.id)
+    job.state.run_history.append(
+        CronRunRecord(
+            run_at_ms=123,
+            status="ok",
+            duration_ms=10,
+            run_id="run-1",
+            session_key="cron:viewed:run-1",
+        )
+    )
+    service._save_store()
+
+    assert service.mark_run_viewed(job.id, "run-1") is True
+
+    loaded = CronService(store_path).get_job(job.id)
+    assert loaded.state.run_history[0].viewed_at_ms is not None
 
 
 @pytest.mark.asyncio
