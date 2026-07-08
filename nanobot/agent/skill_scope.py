@@ -15,11 +15,10 @@ def allowed_workspace_skills_from_scope(scope: Mapping[str, Any] | None) -> set[
     if not isinstance(scope, Mapping):
         return None
     names: set[str] = set()
-    for key in ("project_bound_user_skills", "explicit_skills"):
-        raw = scope.get(key)
-        if not isinstance(raw, list):
-            continue
-        names.update(str(item).strip() for item in raw if str(item).strip())
+    raw = scope.get("project_bound_user_skills")
+    if not isinstance(raw, list):
+        return names
+    names.update(str(item).strip() for item in raw if str(item).strip())
     return names
 
 

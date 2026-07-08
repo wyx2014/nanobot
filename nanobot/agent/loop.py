@@ -68,6 +68,7 @@ from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.webui.project_skills_api import project_skill_grants
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
@@ -629,6 +630,9 @@ class AgentLoop:
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
         scope = self.workspace_scopes.for_message(msg, session.metadata)
+        msg.metadata["skill_scope"] = {
+            "project_bound_user_skills": project_skill_grants(self.workspace, scope.project_path),
+        }
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -813,9 +817,9 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
-        skill_scope_token = bind_allowed_workspace_skills(
-            metadata.get("skill_scope") if isinstance(metadata, dict) else None
-        )
+        skill_scope_token = bind_allowed_workspace_skills({
+            "project_bound_user_skills": project_skill_grants(self.workspace, effective_scope.project_path),
+        })
         # Compute lazily because long_task may create goal metadata during this run.
         def _goal_continue() -> str | None:
             _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
@@ -1203,6 +1207,9 @@ class AgentLoop:
         }
         history = session.get_history(**_hist_kwargs)
         workspace_scope = self.workspace_scopes.for_message(msg, session.metadata)
+        msg.metadata["skill_scope"] = {
+            "project_bound_user_skills": project_skill_grants(self.workspace, workspace_scope.project_path),
+        }
 
         messages = self.context.build_messages(
             history=history,

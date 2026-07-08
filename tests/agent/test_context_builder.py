@@ -359,6 +359,102 @@ class TestBuildMessages:
         assert "pdf" in system
         assert "other-skill" not in system
 
+    def test_explicit_skill_does_not_expand_project_skill_scope(self, tmp_path):
+        ws_skills = tmp_path / "skills"
+        ws_skills.mkdir()
+        _write_skill(ws_skills, "project-skill", "Project scoped skill")
+        _write_skill(ws_skills, "explicit-only", "Explicit but ungranted skill")
+        builder = _builder(tmp_path)
+        msg = InboundMessage(
+            channel="websocket",
+            sender_id="u",
+            chat_id="c",
+            content="hello",
+            metadata={
+                "skill_scope": {
+                    "project_bound_user_skills": ["project-skill"],
+                    "explicit_skills": ["explicit-only"],
+                },
+            },
+        )
+
+        system = builder.build_messages([], "hello", inbound_message=msg)[0]["content"]
+        assert "project-skill" in system
+        assert "explicit-only" not in system
+
+    def test_skill_scope_filters_disallowed_skill_from_replayed_tool_history(self, tmp_path):
+        ws_skills = tmp_path / "skills"
+        ws_skills.mkdir()
+        _write_skill(ws_skills, "allowed-skill", "Allowed skill")
+        _write_skill(ws_skills, "ifind-finance-data", "Finance skill")
+        builder = _builder(tmp_path)
+        msg = InboundMessage(
+            channel="websocket",
+            sender_id="u",
+            chat_id="c",
+            content="current question",
+            metadata={"skill_scope": {"project_bound_user_skills": ["allowed-skill"]}},
+        )
+        history = [
+            {"role": "user", "content": "/ifind-finance-data\nold stock question"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": "{\"command\":\"cd /workspace/skills/ifind-finance-data && node call-node.js\"}",
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "name": "exec", "content": "ok"},
+            {"role": "assistant", "content": "used ifind-finance-data successfully"},
+            {"role": "user", "content": "safe follow-up"},
+        ]
+
+        messages = builder.build_messages(history, "current question", inbound_message=msg)
+        replay = "\n".join(str(message) for message in messages[1:])
+
+        assert "ifind-finance-data" not in replay
+        assert "call-1" not in replay
+        assert "safe follow-up" in replay
+        assert "current question" in replay
+
+    def test_skill_scope_filters_disallowed_skill_from_memory_and_recent_history(self, tmp_path):
+        ws_skills = tmp_path / "skills"
+        ws_skills.mkdir()
+        _write_skill(ws_skills, "allowed-skill", "Allowed skill")
+        _write_skill(ws_skills, "ifind-finance-data", "Finance skill")
+        builder = _builder(tmp_path)
+        builder.memory.write_memory(
+            "- allowed-skill is useful\n"
+            "- ifind-finance-data calls /workspace/skills/ifind-finance-data\n",
+        )
+        builder.memory.append_history(
+            "safe recent fact\nifind-finance-data used call-node.js",
+            session_key="websocket:c",
+        )
+        msg = InboundMessage(
+            channel="websocket",
+            sender_id="u",
+            chat_id="c",
+            content="hello",
+            metadata={"skill_scope": {"project_bound_user_skills": ["allowed-skill"]}},
+        )
+
+        system = builder.build_messages(
+            [],
+            "hello",
+            inbound_message=msg,
+            session_key="websocket:c",
+        )[0]["content"]
+
+        assert "allowed-skill is useful" in system
+        assert "safe recent fact" in system
+        assert "ifind-finance-data" not in system
+
     def test_session_metadata_injects_active_goal_state(self, tmp_path):
         builder = _builder(tmp_path)
         meta = {

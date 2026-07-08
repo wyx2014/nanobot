@@ -355,6 +355,22 @@ class TestWorkspaceRestriction:
         assert "Stock Skill" in result
 
     @pytest.mark.asyncio
+    async def test_read_workspace_skill_blocked_when_only_explicit(self, tmp_path):
+        workspace = tmp_path / "ws"
+        skill_file = workspace / "skills" / "stock" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True)
+        skill_file.write_text("# Stock Skill\n", encoding="utf-8")
+
+        tool = ReadFileTool(workspace=workspace)
+        token = bind_allowed_workspace_skills({"project_bound_user_skills": [], "explicit_skills": ["stock"]})
+        try:
+            result = await tool.execute(path=str(skill_file))
+        finally:
+            reset_allowed_workspace_skills(token)
+
+        assert "not enabled for this project" in result
+
+    @pytest.mark.asyncio
     async def test_read_allowed_in_media_dir(self, tmp_path, monkeypatch):
         workspace = tmp_path / "ws"
         workspace.mkdir()

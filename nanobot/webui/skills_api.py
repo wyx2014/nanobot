@@ -9,6 +9,7 @@ from typing import Any
 
 from nanobot.agent.skills import SkillsLoader
 from nanobot.config.loader import load_config, save_config
+from nanobot.webui.project_skills_api import remove_project_skill_grant_everywhere
 
 QueryParams = dict[str, list[str]]
 
@@ -189,6 +190,7 @@ def skills_action(action: str, query: QueryParams) -> dict[str, Any]:
         if workspace_skills not in skill_path.parents:
             raise WebUISkillsError("refusing to delete skill outside workspace", status=400)
         shutil.rmtree(skill_path.parent)
+        remove_project_skill_grant_everywhere(config.workspace_path, name)
         disabled.discard(name)
         config.agents.defaults.disabled_skills = sorted(disabled)
         save_config(config)

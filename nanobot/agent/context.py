@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import json
 import re
 import mimetypes
 import platform
@@ -43,6 +44,67 @@ def _explicitly_invites_interactive_intake(current_message: str) -> bool:
     if not text:
         return False
     return any(pattern.search(text) for pattern in _EXPLICIT_INTERACTIVE_INTAKE_PATTERNS)
+
+
+def _contains_any_marker(value: Any, markers: tuple[str, ...]) -> bool:
+    if not markers:
+        return False
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    return any(marker in text for marker in markers)
+
+
+def _filter_disallowed_skill_text(text: str, markers: tuple[str, ...]) -> str:
+    if not markers:
+        return text
+    return "\n".join(
+        line for line in text.splitlines()
+        if not any(marker in line for marker in markers)
+    ).strip()
+
+
+def _filter_disallowed_skill_history(
+    history: list[dict[str, Any]],
+    markers: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    if not markers:
+        return history
+
+    blocked_tool_call_ids: set[str] = set()
+    for message in history:
+        if not _contains_any_marker(message, markers):
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+            if isinstance(call_id, str):
+                blocked_tool_call_ids.add(call_id)
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str):
+            blocked_tool_call_ids.add(tool_call_id)
+
+    filtered: list[dict[str, Any]] = []
+    for message in history:
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id in blocked_tool_call_ids:
+            continue
+        tool_calls = message.get("tool_calls") or []
+        if any(
+            isinstance(tool_call, dict)
+            and isinstance(tool_call.get("id"), str)
+            and tool_call["id"] in blocked_tool_call_ids
+            for tool_call in tool_calls
+        ):
+            continue
+        if _contains_any_marker(message, markers):
+            continue
+        filtered.append(message)
+
+    for index, message in enumerate(filtered):
+        if message.get("role") == "user":
+            return filtered[index:]
+    return filtered
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -104,6 +166,7 @@ class ContextBuilder:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
         allowed_workspace_skills = allowed_workspace_skills_from_scope(skill_scope)
+        disallowed_markers = self._disallowed_workspace_skill_markers(allowed_workspace_skills)
         parts = [self._get_identity(channel=channel, workspace=root)]
 
         bootstrap = self._load_bootstrap_files(root)
@@ -114,6 +177,8 @@ class ContextBuilder:
 
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+            memory = _filter_disallowed_skill_text(memory, disallowed_markers)
+        if memory:
             parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills(allowed_workspace_skills=allowed_workspace_skills)
@@ -137,16 +202,36 @@ class ContextBuilder:
             )
             if entries:
                 capped = entries[-self._MAX_RECENT_HISTORY:]
-                history_text = "\n".join(
-                    f"- [{e['timestamp']}] {e['content']}" for e in capped
-                )
-                history_text = truncate_text_to_tokens(history_text, self._MAX_HISTORY_TOKENS)
-                parts.append("# Recent History\n\n" + history_text)
+                capped = [
+                    {**entry, "content": content}
+                    for entry in capped
+                    if (content := _filter_disallowed_skill_text(str(entry.get("content", "")), disallowed_markers))
+                ]
+                if capped:
+                    history_text = "\n".join(
+                        f"- [{e['timestamp']}] {e['content']}" for e in capped
+                    )
+                    history_text = truncate_text_to_tokens(history_text, self._MAX_HISTORY_TOKENS)
+                    parts.append("# Recent History\n\n" + history_text)
 
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
         return "\n\n---\n\n".join(parts)
+
+    def _disallowed_workspace_skill_markers(self, allowed_workspace_skills: set[str] | None) -> tuple[str, ...]:
+        if allowed_workspace_skills is None:
+            return ()
+        workspace_skills = {
+            entry["name"]
+            for entry in self.skills.list_skills(filter_unavailable=False)
+            if entry.get("source") == "workspace"
+        }
+        disallowed = sorted(workspace_skills - allowed_workspace_skills)
+        markers: list[str] = []
+        for name in disallowed:
+            markers.extend((name, f"/skills/{name}", f"skills/{name}"))
+        return tuple(dict.fromkeys(markers))
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""
@@ -242,6 +327,11 @@ class ContextBuilder:
         skill_scope = None
         if isinstance(msg_metadata := getattr(inbound_message, "metadata", None), Mapping):
             skill_scope = msg_metadata.get("skill_scope")
+        allowed_workspace_skills = allowed_workspace_skills_from_scope(
+            skill_scope if isinstance(skill_scope, Mapping) else None
+        )
+        disallowed_markers = self._disallowed_workspace_skill_markers(allowed_workspace_skills)
+        history = _filter_disallowed_skill_history(history, disallowed_markers)
         extra = [
             *goal_state_runtime_lines(session_metadata),
         ]

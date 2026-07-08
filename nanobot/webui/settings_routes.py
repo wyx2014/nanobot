@@ -20,6 +20,11 @@ from nanobot.bus.queue import MessageBus
 from nanobot.webui.cli_apps_api import cli_apps_action, cli_apps_payload
 from nanobot.webui.http_utils import query_first as _query_first
 from nanobot.webui.mcp_presets_api import mcp_presets_settings_action
+from nanobot.webui.project_skills_api import (
+    WebUIProjectSkillsError,
+    project_skills_payload,
+    project_skills_save,
+)
 from nanobot.webui.settings_api import (
     WebUISettingsError,
     create_model_configuration,
@@ -47,6 +52,8 @@ _MCP_VALUES_HEADER = "X-Nanobot-MCP-Values"
 _MCP_VALUES_HEADER_MAX_BYTES = 64 * 1024
 _SKILL_VALUES_HEADER = "X-Nanobot-Skill-Values"
 _SKILL_VALUES_HEADER_MAX_BYTES = 512 * 1024
+_PROJECT_SKILL_VALUES_HEADER = "X-Nanobot-Project-Skill-Values"
+_PROJECT_SKILL_VALUES_HEADER_MAX_BYTES = 64 * 1024
 
 _MCP_PRESET_ACTIONS_BY_PATH = {
     "/api/settings/mcp-presets/enable": "enable",
@@ -135,6 +142,10 @@ class WebUISettingsRouter:
             return self._handle_settings_skills_action(request, "delete")
         if path == "/api/settings/skills/save":
             return self._handle_settings_skills_action(request, "save")
+        if path == "/api/settings/project-skills":
+            return self._handle_settings_project_skills(request)
+        if path == "/api/settings/project-skills/save":
+            return self._handle_settings_project_skills_save(request)
         if path == "/api/settings/mcp-presets":
             return await self._handle_settings_mcp_presets(request)
         if path == "/api/settings/version-check":
@@ -217,6 +228,30 @@ class WebUISettingsRouter:
         for key, value in payload.items():
             if not isinstance(key, str) or not key:
                 raise WebUISkillsError("skills payload contains an invalid key")
+            if value is None:
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            if text:
+                merged[key] = [text]
+        return merged
+
+    def _parse_project_skills_query(self, request: WsRequest) -> QueryParams:
+        query = self._query(request)
+        raw = request.headers.get(_PROJECT_SKILL_VALUES_HEADER)
+        if not raw:
+            return query
+        if len(raw.encode("utf-8")) > _PROJECT_SKILL_VALUES_HEADER_MAX_BYTES:
+            raise WebUIProjectSkillsError("project skills payload is too large")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise WebUIProjectSkillsError("invalid project skills payload") from exc
+        if not isinstance(payload, dict):
+            raise WebUIProjectSkillsError("project skills payload must be a JSON object")
+        merged = {key: list(values) for key, values in query.items()}
+        for key, value in payload.items():
+            if not isinstance(key, str) or not key:
+                raise WebUIProjectSkillsError("project skills payload contains an invalid key")
             if value is None:
                 continue
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
@@ -412,6 +447,30 @@ class WebUISettingsRouter:
             if status >= 500:
                 self.logger.exception("Skills action '{}' failed", action)
             return self._error_response(status, message)
+        return self._json_response(payload)
+
+    def _handle_settings_project_skills(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            payload = project_skills_payload(self._parse_project_skills_query(request))
+        except WebUIProjectSkillsError as e:
+            return self._error_response(e.status, e.message)
+        except Exception:
+            self.logger.exception("failed to load project skills payload")
+            return self._error_response(500, "failed to load project skills")
+        return self._json_response(payload)
+
+    def _handle_settings_project_skills_save(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            payload = project_skills_save(self._parse_project_skills_query(request))
+        except WebUIProjectSkillsError as e:
+            return self._error_response(e.status, e.message)
+        except Exception:
+            self.logger.exception("failed to save project skills")
+            return self._error_response(500, "failed to save project skills")
         return self._json_response(payload)
 
     async def _handle_settings_mcp_presets(
