@@ -1,13 +1,13 @@
 ---
 name: clawhub
-description: 从 ClawHub 公共技能注册中心搜索并安装智能体技能。
+description: 从如意Hub公共技能注册中心搜索并安装智能体技能。
 homepage: http://localhost:3000
 metadata: {"nanobot":{"emoji":"🦞"}}
 ---
 
-# ClawHub
+# 如意Hub
 
-Public skill registry for AI agents. Search by natural language (vector search).
+如意Hub公共技能注册中心，支持用自然语言搜索技能。
 
 ## When to use
 

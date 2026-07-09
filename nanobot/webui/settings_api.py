@@ -378,11 +378,13 @@ def _provider_settings_row(
     name: str,
     spec: Any,
     provider_config: ProviderConfig,
+    *,
+    custom: bool = False,
 ) -> dict[str, Any]:
     oauth_status = _oauth_provider_status(spec) if spec.is_oauth else None
     row = {
         "name": name,
-        "label": spec.label,
+        "label": provider_config.label or spec.label,
         "configured": (
             bool(oauth_status["configured"])
             if oauth_status is not None
@@ -394,6 +396,7 @@ def _provider_settings_row(
         "api_base": provider_config.api_base,
         "default_api_base": spec.default_api_base or None,
         "model_selectable": not spec.is_transcription_only,
+        "custom": custom,
     }
     if oauth_status is not None:
         row["oauth_account"] = oauth_status["account"]
@@ -492,14 +495,31 @@ def provider_models_payload(query: QueryParams) -> dict[str, Any]:
     changes runtime behavior.
     """
     provider_name = (_query_first(query, "provider") or "").strip()
+    probe_api_base = (_query_first_alias(query, "api_base", "apiBase") or "").strip()
+    probe_api_key_raw = _query_first_alias(query, "api_key", "apiKey")
+    probe_api_key = probe_api_key_raw.strip() if probe_api_key_raw is not None else None
+    probe_api_type = (_query_first(query, "api_type") or "").strip()
+    if not provider_name and probe_api_base:
+        provider_name = "custom"
     if not provider_name:
         raise WebUISettingsError("provider is required")
+    if probe_api_type and probe_api_type not in {"auto", "chat_completions", "responses"}:
+        raise WebUISettingsError("api_type must be auto, chat_completions, or responses")
 
     config = load_config()
     resolved_provider = _resolve_settings_provider(config, provider_name)
     if resolved_provider is None:
         raise WebUISettingsError("unknown provider")
     spec, provider_key, provider_config = resolved_provider
+    if probe_api_base or probe_api_key is not None or probe_api_type:
+        provider_config = ProviderConfig(
+            api_key=probe_api_key if probe_api_key is not None else provider_config.api_key,
+            api_base=probe_api_base or provider_config.api_base,
+            api_type=probe_api_type or provider_config.api_type,
+            extra_headers=provider_config.extra_headers,
+            extra_body=provider_config.extra_body,
+            extra_query=provider_config.extra_query,
+        )
 
     base_payload: dict[str, Any] = {
         "provider": provider_key,
@@ -752,6 +772,7 @@ def settings_payload(
                 provider_key,
                 create_dynamic_spec(provider_key),
                 provider_config,
+                custom=True,
             )
         )
 
@@ -1035,6 +1056,11 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
 
     name = _model_configuration_slug(raw_name or label)
     config = load_config()
+    for preset_name, preset in config.model_presets.items():
+        if preset.provider == provider and preset.model == model:
+            config.agents.defaults.model_preset = preset_name
+            save_config(config)
+            return settings_payload()
     if name in config.model_presets:
         raise WebUISettingsError("configuration already exists", status=409)
     _validate_configured_provider(config, provider)
@@ -1126,6 +1152,43 @@ def delete_model_configuration(query: QueryParams) -> dict[str, Any]:
     return settings_payload()
 
 
+def _custom_provider_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-_").lower()
+    if not slug:
+        slug = "custom-provider"
+    return slug
+
+
+def create_provider_settings(query: QueryParams) -> dict[str, Any]:
+    raw_name = (_query_first(query, "name") or _query_first(query, "displayName") or _query_first(query, "label") or "").strip()
+    api_base = (_query_first_alias(query, "api_base", "apiBase") or "").strip()
+    api_key = (_query_first_alias(query, "api_key", "apiKey") or "").strip() or None
+    api_type = (_query_first(query, "api_type") or "auto").strip()
+
+    provider_key = _custom_provider_slug(raw_name)
+    if not api_base:
+        raise WebUISettingsError("api_base is required")
+
+    config = load_config()
+    extra_providers = config.providers.model_extra
+    if find_by_name(provider_key):
+        provider_key = f"{provider_key}-custom"
+    base_provider_key = provider_key
+    suffix = 2
+    while provider_key in extra_providers:
+        provider_key = f"{base_provider_key}-{suffix}"
+        suffix += 1
+
+    extra_providers[provider_key] = ProviderConfig(
+        label=raw_name,
+        api_key=api_key,
+        api_base=api_base,
+        api_type=api_type,
+    )
+    save_config(config)
+    return settings_payload()
+
+
 def update_provider_settings(query: QueryParams) -> dict[str, Any]:
     provider_name = (_query_first(query, "provider") or "").strip()
     if not provider_name:
@@ -1140,6 +1203,14 @@ def update_provider_settings(query: QueryParams) -> dict[str, Any]:
         raise WebUISettingsError("unknown provider")
 
     changed = False
+    if "label" in query or "displayName" in query:
+        label = (_query_first_alias(query, "label", "displayName") or "").strip()
+        if not label:
+            raise WebUISettingsError("label is required")
+        if provider_config.label != label:
+            provider_config.label = label
+            changed = True
+
     if "api_key" in query or "apiKey" in query:
         api_key = _query_first_alias(query, "api_key", "apiKey")
         api_key = (api_key or "").strip() or None
@@ -1155,7 +1226,7 @@ def update_provider_settings(query: QueryParams) -> dict[str, Any]:
             changed = True
 
     if "api_type" in query:
-        if spec.name == "openai":
+        if spec.name == "openai" or provider_key in (config.providers.model_extra or {}):
             api_type = (_query_first(query, "api_type") or "").strip()
             try:
                 parsed_api_type = type(provider_config)(api_type=api_type).api_type

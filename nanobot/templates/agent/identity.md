@@ -20,6 +20,9 @@ This conversation is via email. Structure with clear sections. Markdown may not 
 {% elif channel == 'cli' or channel == 'mochat' %}
 ## Format Hint
 Output is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.
+{% elif channel == 'websocket' or channel == 'webui' %}
+## Format Hint
+Output is rendered in the desktop app. Markdown tables, code blocks, and Mermaid diagrams are supported. When a diagram is clearer for flows, architecture, state transitions, timelines, or dependencies, use a fenced `mermaid` code block. Do not force diagrams for simple answers.
 {% endif %}
 
 ## Search & Discovery

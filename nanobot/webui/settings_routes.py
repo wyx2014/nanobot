@@ -28,6 +28,7 @@ from nanobot.webui.project_skills_api import (
 from nanobot.webui.settings_api import (
     WebUISettingsError,
     create_model_configuration,
+    create_provider_settings,
     delete_model_configuration,
     decorate_settings_payload,
     login_oauth_provider,
@@ -104,6 +105,8 @@ class WebUISettingsRouter:
             return self._handle_settings_model_configuration_update(request)
         if path == "/api/settings/model-configurations/delete":
             return self._handle_settings_model_configuration_delete(request)
+        if path == "/api/settings/provider/create":
+            return self._handle_settings_provider_create(request)
         if path == "/api/settings/provider/update":
             return self._handle_settings_provider_update(request)
         if path == "/api/settings/provider-models":
@@ -308,6 +311,15 @@ class WebUISettingsRouter:
             return self._unauthorized()
         try:
             payload = delete_model_configuration(self._query(request))
+        except WebUISettingsError as e:
+            return self._error_response(e.status, e.message)
+        return self._json_response(self._with_restart_state(payload))
+
+    def _handle_settings_provider_create(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            payload = create_provider_settings(self._query(request))
         except WebUISettingsError as e:
             return self._error_response(e.status, e.message)
         return self._json_response(self._with_restart_state(payload))
