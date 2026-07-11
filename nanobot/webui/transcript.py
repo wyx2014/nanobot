@@ -1240,13 +1240,15 @@ def _media_from_signed_urls(value: Any) -> list[dict[str, Any]]:
     for m in urls:
         if isinstance(m, dict) and m.get("url"):
             name = str(m.get("name") or "")
-            media.append(
-                {
-                    "kind": _media_kind_from_name(name),
-                    "url": str(m["url"]),
-                    "name": name,
-                },
-            )
+            attachment: dict[str, Any] = {
+                "kind": str(m.get("kind") or _media_kind_from_name(name)),
+                "url": str(m["url"]),
+                "name": name,
+            }
+            for key in ("id", "download_url", "local_path", "mime_type", "size"):
+                if m.get(key) is not None:
+                    attachment[key] = m[key]
+            media.append(attachment)
     return media
 
 
@@ -1872,6 +1874,12 @@ def replay_transcript_to_ui_messages(
                     last
                     and last.get("kind") == "trace"
                     and not last.get("isStreaming")
+                    and not (
+                        isinstance(agent_ui, dict)
+                        and agent_ui.get("kind") == "task_progress"
+                        and isinstance(last.get("agentUI"), dict)
+                        and last["agentUI"].get("kind") == "task_progress"
+                    )
                     and (last.get("activitySegmentId") in (None, segment))
                 ):
                     prev_traces = list(last.get("traces") or [last.get("content")])

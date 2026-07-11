@@ -929,6 +929,9 @@ async def test_send_stages_external_media_as_signed_url(monkeypatch, tmp_path) -
     assert payload["media"] == [str(external)]
     assert payload["media_urls"][0]["name"] == "clip.mp4"
     assert payload["media_urls"][0]["url"].startswith("/api/media/")
+    assert payload["media_urls"][0]["download_url"].endswith("?download=1")
+    assert payload["media_urls"][0]["mime_type"] == "video/mp4"
+    assert payload["media_urls"][0]["size"] == len(b"video")
     assert any(p.name.endswith("-clip.mp4") for p in ws_media.iterdir())
 
 

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -323,12 +324,28 @@ class ChannelManager:
                     continue
 
                 if msg.metadata.get("_progress"):
-                    if msg.metadata.get("_tool_hint") and not self._should_send_progress(
+                    is_tool_hint = bool(msg.metadata.get("_tool_hint"))
+                    has_websocket_tool_events = (
+                        msg.channel == "websocket"
+                        and bool(msg.metadata.get("_tool_events"))
+                    )
+                    if is_tool_hint and not self._should_send_progress(
                         msg.channel, tool_hint=True,
                     ):
-                        continue
-                    if not msg.metadata.get("_tool_hint") and not self._should_send_progress(
-                        msg.channel, tool_hint=False,
+                        if not has_websocket_tool_events:
+                            continue
+                        # Rich WebSocket clients need the structured start
+                        # frame to render an in-flight task row even when the
+                        # optional human-readable tool hint is disabled. Keep
+                        # the UI payload, but do not leak the suppressed hint
+                        # text into the transcript or wire message.
+                        metadata = dict(msg.metadata)
+                        metadata.pop("_tool_hint", None)
+                        msg = replace(msg, content="", metadata=metadata)
+                    if (
+                        not is_tool_hint
+                        and not has_websocket_tool_events
+                        and not self._should_send_progress(msg.channel, tool_hint=False)
                     ):
                         continue
 

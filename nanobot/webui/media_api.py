@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote, urlparse
 
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
@@ -30,7 +31,7 @@ from nanobot.webui.http_utils import (
 )
 
 MediaDirProvider = Callable[[str | None], Path]
-SignedMediaPath = Callable[[Path], dict[str, str] | None]
+SignedMediaPath = Callable[[Path], dict[str, Any] | None]
 SignedMediaUrl = Callable[[Path], str | None]
 
 
@@ -62,6 +63,14 @@ _MEDIA_ALLOWED_MIMES: frozenset[str] = frozenset({
     "video/mp4",
     "video/webm",
     "video/quicktime",
+    "application/pdf",
+    "application/json",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/csv",
+    "text/markdown",
+    "text/plain",
 })
 _SVG_MEDIA_HEADERS: tuple[tuple[str, str], ...] = (
     (
@@ -121,11 +130,11 @@ def sign_or_stage_media_path(
     secret: bytes,
     media_dir: MediaDirProvider = _default_media_dir,
     logger: Any | None = None,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Sign an existing media-root path, or stage an arbitrary file before signing."""
     signed = sign_media_path(path, secret=secret, media_dir=media_dir)
     if signed is not None:
-        return {"url": signed, "name": path.name}
+        return _artifact_attachment(path, signed)
     try:
         if not path.is_file():
             return None
@@ -140,7 +149,29 @@ def sign_or_stage_media_path(
     signed = sign_media_path(staged, secret=secret, media_dir=media_dir)
     if signed is None:
         return None
-    return {"url": signed, "name": path.name}
+    return _artifact_attachment(path, signed, display_name=path.name)
+
+
+def _artifact_attachment(
+    path: Path,
+    signed_url: str,
+    *,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    name = display_name or path.name
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = None
+    return {
+        "url": signed_url,
+        "download_url": f"{signed_url}?download=1",
+        "name": name,
+        "kind": media_attachment_kind(name),
+        "mime_type": mime,
+        **({"size": size} if size is not None else {}),
+    }
 
 
 def media_attachment_kind(name: str) -> str:
@@ -168,8 +199,7 @@ def signed_media_attachments(
         url = att.get("url")
         if not url:
             continue
-        name = att.get("name") or path.name
-        out.append({"kind": media_attachment_kind(name), "url": url, "name": name})
+        out.append(att)
     return out
 
 
@@ -188,14 +218,14 @@ def attach_signed_media_urls(
         media = msg.get("media")
         if not isinstance(media, list) or not media:
             continue
-        urls: list[dict[str, str]] = []
+        urls: list[dict[str, Any]] = []
         for entry in media:
             if not isinstance(entry, str) or not entry:
                 continue
             signed = sign_path(Path(entry))
             if signed is None:
                 continue
-            urls.append({"url": signed, "name": Path(entry).name})
+            urls.append(_artifact_attachment(Path(entry), signed))
         if urls:
             msg["media_urls"] = urls
         msg.pop("media", None)
@@ -234,10 +264,14 @@ def serve_signed_media(
     mime, _ = mimetypes.guess_type(candidate.name)
     if mime not in _MEDIA_ALLOWED_MIMES:
         mime = "application/octet-stream"
+    request_query = parse_qs(urlparse(request.path).query) if request else {}
+    disposition = "attachment" if request_query.get("download") == ["1"] else "inline"
+    encoded_name = quote(candidate.name, safe="")
     common_headers = [
         ("Accept-Ranges", "bytes"),
         ("Cache-Control", "private, max-age=31536000, immutable"),
         ("X-Content-Type-Options", "nosniff"),
+        ("Content-Disposition", f"{disposition}; filename*=UTF-8''{encoded_name}"),
     ]
     if mime == "image/svg+xml":
         common_headers.extend(_SVG_MEDIA_HEADERS)

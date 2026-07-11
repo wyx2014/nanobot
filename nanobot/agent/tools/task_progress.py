@@ -17,7 +17,8 @@ _STATUSES = ("pending", "running", "completed", "error")
         description=(
             "Report user-facing task progress for multi-step work. Use this when a task has "
             "clear stages such as research, writing, verification, formatting, code changes, "
-            "or report generation. Keep labels short and non-technical."
+            "or report generation. Keep labels short and non-technical. When the stage changes, "
+            "include a brief public note explaining what is happening next."
         ),
         steps=ArraySchema(
             ObjectSchema(
@@ -30,6 +31,10 @@ _STATUSES = ("pending", "running", "completed", "error")
             min_items=1,
             max_items=8,
         ),
+        note=StringSchema(
+            "Optional short public progress note for the user. Do not include private reasoning."
+        ),
+        current_step_id=StringSchema("Stable id of the step currently being worked on"),
         required=["steps"],
     )
 )
@@ -63,14 +68,21 @@ class TaskProgressTool(Tool, ContextAware):
         return (
             "Update the visible task progress panel for the current conversation. "
             "Call early for multi-step tasks, then update statuses as work advances. "
-            "Use short stage names that users understand; do not expose tool names."
+            "Use short stage names that users understand; do not expose tool names. "
+            "Use note for a concise public transition update, never private reasoning."
         )
 
     @property
     def read_only(self) -> bool:
         return False
 
-    async def execute(self, steps: list[dict[str, Any]], **_: Any) -> str:
+    async def execute(
+        self,
+        steps: list[dict[str, Any]],
+        note: str = "",
+        current_step_id: str = "",
+        **_: Any,
+    ) -> str:
         normalized: list[dict[str, str]] = []
         for index, step in enumerate(steps[:8], start=1):
             if not isinstance(step, dict):
@@ -89,12 +101,21 @@ class TaskProgressTool(Tool, ContextAware):
         if not self._send_callback or not self._chat_id:
             return "Error: task progress is unavailable in this runtime"
 
+        public_note = " ".join(str(note or "").split()).strip()[:240]
+        current_id = str(current_step_id or "").strip()
+        valid_step_ids = {step["id"] for step in normalized}
+
         metadata = dict(self._metadata)
         metadata["_progress"] = True
-        metadata[OUTBOUND_META_AGENT_UI] = {
+        agent_ui: dict[str, Any] = {
             "kind": "task_progress",
             "steps": normalized,
         }
+        if public_note:
+            agent_ui["note"] = public_note
+        if current_id in valid_step_ids:
+            agent_ui["current_step_id"] = current_id
+        metadata[OUTBOUND_META_AGENT_UI] = agent_ui
         await self._send_callback(
             OutboundMessage(
                 channel=self._channel,

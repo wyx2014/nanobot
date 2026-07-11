@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
+import json
+import os
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.request import Request, urlopen
 
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.filesystem import FileToolsConfig, _FsTool
@@ -49,7 +54,8 @@ class CreatePdfTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Create a PDF artifact from a Markdown or text file using the built-in reportlab renderer. "
+            "Create a styled PDF artifact from a Markdown or text file using the desktop renderer "
+            "with a built-in reportlab fallback. "
             "Do not install pandoc, weasyprint, wkhtmltopdf, or browser dependencies during a user turn; "
             "if this tool fails, return the source file path and error."
         )
@@ -62,7 +68,7 @@ class CreatePdfTool(_FsTool):
         template: str | None = None,
         timeout_seconds: int | None = None,
         **kwargs: Any,
-    ) -> str:
+    ) -> str | dict[str, Any]:
         if not source_path:
             return self._error("render_failed", "source_path is required", "")
 
@@ -104,13 +110,22 @@ class CreatePdfTool(_FsTool):
         if not ok:
             return self._error("validation_failed", validation_error, str(source))
 
-        return (
-            "PDF created successfully\n"
-            f"source_path: {source}\n"
-            f"pdf_path: {output}\n"
-            f"page_count: {result['page_count']}\n"
-            f"file_size: {output.stat().st_size}"
-        )
+        size = output.stat().st_size
+        return {
+            "text": (
+                "PDF created successfully\n"
+                f"source_path: {source}\n"
+                f"pdf_path: {output}\n"
+                f"page_count: {result['page_count']}\n"
+                f"file_size: {size}"
+            ),
+            "files": [{
+                "path": str(output),
+                "name": output.name,
+                "mime_type": "application/pdf",
+                "size": size,
+            }],
+        }
 
     def _error(self, code: str, message: str, source_path: str) -> str:
         return f"Error: {code}: {message}\nsource_path: {source_path}"
@@ -139,11 +154,13 @@ def _markdown_blocks(content: str) -> list[tuple[str, Any]]:
     blocks: list[tuple[str, Any]] = []
     paragraph: list[str] = []
     table: list[list[str]] = []
+    fence_language: str | None = None
+    fenced_lines: list[str] = []
 
     def flush_paragraph() -> None:
         nonlocal paragraph
         if paragraph:
-            blocks.append(("paragraph", " ".join(_plain(line) for line in paragraph).strip()))
+            blocks.append(("paragraph", " ".join(line.strip() for line in paragraph).strip()))
             paragraph = []
 
     def flush_table() -> None:
@@ -153,7 +170,20 @@ def _markdown_blocks(content: str) -> list[tuple[str, Any]]:
             table = []
 
     for raw_line in content.splitlines():
+        if fence_language is not None:
+            if raw_line.strip().startswith("```"):
+                blocks.append(("mermaid" if fence_language in {"mermaid", "mmd"} else "code", "\n".join(fenced_lines)))
+                fence_language = None
+                fenced_lines = []
+            else:
+                fenced_lines.append(raw_line)
+            continue
         line = raw_line.strip()
+        if line.startswith("```"):
+            flush_paragraph()
+            flush_table()
+            fence_language = line[3:].strip().lower()
+            continue
         if not line:
             flush_paragraph()
             flush_table()
@@ -161,29 +191,96 @@ def _markdown_blocks(content: str) -> list[tuple[str, Any]]:
         if re.fullmatch(r"[-*_]{3,}", line):
             flush_paragraph()
             flush_table()
+            blocks.append(("hr", ""))
             continue
         if line.startswith("|") and line.endswith("|"):
             flush_paragraph()
-            cells = [_plain(cell) for cell in line.strip("|").split("|")]
-            if cells and not all(set(cell) <= {"-", ":", " "} for cell in cells):
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if cells and not all(set(_plain(cell)) <= {"-", ":", " "} for cell in cells):
                 table.append(cells)
             continue
         flush_table()
-        heading = re.match(r"^(#{1,3})\s+(.+)$", line)
+        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
         if heading:
             flush_paragraph()
-            blocks.append((f"h{len(heading.group(1))}", _plain(heading.group(2))))
+            blocks.append((f"h{len(heading.group(1))}", heading.group(2).strip()))
+        elif line.startswith(">"):
+            flush_paragraph()
+            blocks.append(("blockquote", line[1:].strip()))
         elif line.startswith(("- ", "* ")):
             flush_paragraph()
-            blocks.append(("bullet", _plain(line[2:])))
+            blocks.append(("bullet", line[2:].strip()))
+        elif numbered := re.match(r"^(\d+)[.)]\s+(.+)$", line):
+            flush_paragraph()
+            blocks.append(("numbered", (numbered.group(1), numbered.group(2).strip())))
         else:
             paragraph.append(line)
     flush_paragraph()
     flush_table()
+    if fence_language is not None:
+        blocks.append(("mermaid" if fence_language in {"mermaid", "mmd"} else "code", "\n".join(fenced_lines)))
     return blocks
 
 
+def _render_mermaid_png(code: str) -> tuple[bytes, float, float] | None:
+    """Ask the local Electron renderer for a PNG; CLI use keeps the source readable."""
+    url = os.environ.get("NANOBOT_MERMAID_RENDER_URL")
+    token = os.environ.get("NANOBOT_MERMAID_RENDER_TOKEN")
+    if not url or not token or not url.startswith("http://127.0.0.1:"):
+        return None
+    try:
+        request = Request(
+            url,
+            data=json.dumps({"code": code}).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=30) as response:  # noqa: S310 - loopback URL and random token above
+            image = json.load(response)
+        return base64.b64decode(image["png"]), float(image["width"]), float(image["height"])
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _render_pdf_with_desktop(
+    content: str,
+    output: Path,
+    title: str,
+    template: str,
+) -> dict[str, int] | None:
+    """Render through the authenticated Electron bridge when available."""
+    url = os.environ.get("NANOBOT_PDF_RENDER_URL")
+    token = os.environ.get("NANOBOT_PDF_RENDER_TOKEN")
+    if not url or not token or not url.startswith("http://127.0.0.1:"):
+        return None
+    try:
+        request = Request(
+            url,
+            data=json.dumps({
+                "markdown": content,
+                "title": title,
+                "template": template,
+            }).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=60) as response:  # noqa: S310 - authenticated loopback URL
+            payload = json.load(response)
+        pdf = base64.b64decode(payload["pdf"], validate=True)
+        if len(pdf) < _MIN_VALID_PDF_BYTES or not pdf.startswith(b"%PDF-"):
+            return None
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(pdf)
+        return {"page_count": _page_count(output)}
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[str, int]:
+    desktop_result = _render_pdf_with_desktop(content, output, title, template)
+    if desktop_result is not None:
+        return desktop_result
+
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet
@@ -194,6 +291,8 @@ def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[s
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.platypus import (
         Paragraph,
+        HRFlowable,
+        Image,
         SimpleDocTemplate,
         Spacer,
         Table,
@@ -223,13 +322,15 @@ def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[s
         story.append(Spacer(1, 2 * mm))
 
     for kind, value in _markdown_blocks(content):
+        if kind == "h1" and _plain(value) == _plain(title):
+            continue
         if kind == "h1":
             story.append(Paragraph(_rich_text(value), styles["Heading1"]))
             story.append(Spacer(1, 2 * mm))
         elif kind == "h2":
             story.append(Paragraph(_rich_text(value), styles["Heading2"]))
             story.append(Spacer(1, 1.5 * mm))
-        elif kind == "h3":
+        elif kind.startswith("h"):
             story.append(Paragraph(_rich_text(value), styles["Heading3"]))
             story.append(Spacer(1, 1 * mm))
         elif kind == "paragraph":
@@ -238,6 +339,58 @@ def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[s
         elif kind == "bullet":
             story.append(Paragraph(f"&bull;&nbsp;{_rich_text(value)}", styles["BodyText"]))
             story.append(Spacer(1, 1.5 * mm))
+        elif kind == "numbered":
+            number, item = value
+            story.append(Paragraph(f"{number}.&nbsp;{_rich_text(item)}", styles["BodyText"]))
+            story.append(Spacer(1, 1.5 * mm))
+        elif kind == "blockquote":
+            quote = Table(
+                [[Paragraph(_rich_text(value), styles["BodyText"])]],
+                colWidths=[A4[0] - 36 * mm],
+            )
+            quote.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fbf8f1")),
+                ("LINEBEFORE", (0, 0), (0, -1), 3, colors.HexColor("#d97757")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]))
+            story.append(quote)
+            story.append(Spacer(1, 3 * mm))
+        elif kind == "hr":
+            story.append(HRFlowable(
+                width="100%",
+                thickness=0.5,
+                color=colors.HexColor("#dedbd3"),
+                spaceBefore=3 * mm,
+                spaceAfter=5 * mm,
+            ))
+        elif kind == "mermaid":
+            rendered = _render_mermaid_png(value)
+            if rendered:
+                png, width, height = rendered
+                max_width, max_height = A4[0] - 36 * mm, 170 * mm
+                scale = min(max_width / width, max_height / height)
+                story.append(Image(BytesIO(png), width * scale, height * scale))
+            else:
+                story.append(Paragraph(_rich_text(value), styles["BodyText"]))
+            story.append(Spacer(1, 3 * mm))
+        elif kind == "code":
+            code = Table(
+                [[Paragraph(_rich_text(value).replace("\n", "<br/>"), styles["BodyText"])]],
+                colWidths=[A4[0] - 36 * mm],
+            )
+            code.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f0eee8")),
+                ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#dedbd3")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]))
+            story.append(code)
+            story.append(Spacer(1, 3 * mm))
         elif kind == "table":
             rows = [[Paragraph(_rich_text(cell), styles["BodyText"]) for cell in row] for row in value]
             if rows:
@@ -263,7 +416,14 @@ def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[s
         bottomMargin=18 * mm,
         title=title,
     )
-    doc.build(story)
+    def add_page_number(canvas, document) -> None:
+        canvas.saveState()
+        canvas.setFont(regular_font, 8)
+        canvas.setFillColor(colors.HexColor("#888579"))
+        canvas.drawCentredString(A4[0] / 2, 8 * mm, str(document.page))
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
     return {"page_count": _page_count(output)}
 
 

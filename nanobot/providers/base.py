@@ -15,6 +15,8 @@ from typing import Any
 import json_repair
 from loguru import logger
 
+from nanobot.utils.runtime import normalize_tool_message_content
+
 STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
 DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
 MAX_STREAM_IDLE_TIMEOUT_S = 3600.0
@@ -264,6 +266,17 @@ class LLMProvider(ABC):
         result: list[dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content")
+
+            if msg.get("role") == "tool" and not isinstance(content, str):
+                content = normalize_tool_message_content(
+                    str(msg.get("name") or "tool"),
+                    content,
+                )
+                if isinstance(content, str):
+                    clean = dict(msg)
+                    clean["content"] = content
+                    result.append(clean)
+                    continue
 
             if isinstance(content, str) and not content:
                 clean = dict(msg)

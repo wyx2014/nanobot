@@ -11,7 +11,9 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.context import RequestContext
 from nanobot.agent.tools.long_task import (
     CompleteGoalTool,
+    GetGoalTool,
     LongTaskTool,
+    UpdateGoalTool,
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import RuntimeEventBus
@@ -32,6 +34,22 @@ def _tools(sm: SessionManager) -> tuple[LongTaskTool, CompleteGoalTool]:
     lt.set_context(rc)
     cg.set_context(rc)
     return lt, cg
+
+
+def _goal_tools(sm: SessionManager) -> tuple[LongTaskTool, GetGoalTool, UpdateGoalTool]:
+    lt = LongTaskTool(sessions=sm)
+    gg = GetGoalTool(sessions=sm)
+    ug = UpdateGoalTool(sessions=sm)
+    rc = RequestContext(
+        channel="websocket",
+        chat_id="c1",
+        session_key="websocket:c1",
+        metadata={},
+    )
+    lt.set_context(rc)
+    gg.set_context(rc)
+    ug.set_context(rc)
+    return lt, gg, ug
 
 
 @pytest.mark.asyncio
@@ -73,6 +91,61 @@ async def test_complete_goal_closes_active_goal(tmp_path):
     blob = sess.metadata.get(GOAL_STATE_KEY)
     assert blob["status"] == "completed"
     assert blob["recap"] == "Done."
+
+
+@pytest.mark.asyncio
+async def test_get_goal_returns_public_goal_state(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, gg, ug = _goal_tools(sm)
+
+    await lt.execute(goal="Ship it", ui_summary="ship")
+    await ug.execute(status="blocked", blocker="missing token")
+
+    out = await gg.execute()
+    assert out["active"] is True
+    assert out["goal"]["objective"] == "Ship it"
+    assert "_blocked_audit" not in out["goal"]
+
+
+@pytest.mark.asyncio
+async def test_update_goal_blocks_only_after_three_same_blockers(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, _gg, ug = _goal_tools(sm)
+
+    await lt.execute(goal="Wait for external input")
+    assert "1/3" in await ug.execute(status="blocked", blocker="api unavailable")
+    assert "2/3" in await ug.execute(status="blocked", blocker="api unavailable")
+    out = await ug.execute(
+        status="blocked",
+        blocker="api unavailable",
+        recap="Cannot continue until API returns.",
+    )
+    assert "marked blocked" in out
+
+    blob = sm.get_or_create("websocket:c1").metadata[GOAL_STATE_KEY]
+    assert blob["status"] == "blocked"
+    assert blob["blocker"] == "api unavailable"
+    assert "_blocked_audit" not in blob
+
+
+@pytest.mark.asyncio
+async def test_update_goal_resets_blocked_audit_for_different_blocker(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, _gg, ug = _goal_tools(sm)
+
+    await lt.execute(goal="Wait")
+    assert "1/3" in await ug.execute(status="blocked", blocker="one")
+    assert "1/3" in await ug.execute(status="blocked", blocker="two")
+
+
+@pytest.mark.asyncio
+async def test_update_goal_requires_blocker_for_blocked_status(tmp_path):
+    sm = SessionManager(tmp_path)
+    lt, _gg, ug = _goal_tools(sm)
+
+    await lt.execute(goal="Wait")
+    out = await ug.execute(status="blocked")
+    assert "blocker is required" in out
 
 
 @pytest.mark.asyncio
@@ -209,5 +282,9 @@ async def test_long_task_and_complete_goal_registered(tmp_path):
 
     lt = loop.tools.get("long_task")
     cg = loop.tools.get("complete_goal")
+    gg = loop.tools.get("get_goal")
+    ug = loop.tools.get("update_goal")
     assert lt is not None and lt.name == "long_task"
     assert cg is not None and cg.name == "complete_goal"
+    assert gg is not None and gg.name == "get_goal"
+    assert ug is not None and ug.name == "update_goal"

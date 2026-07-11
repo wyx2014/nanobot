@@ -23,6 +23,7 @@ from nanobot.utils.helpers import (
     safe_filename,
     strip_think,
 )
+from nanobot.utils.runtime import normalize_tool_message_content
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
 
 FILE_MAX_MESSAGES = 2000
@@ -191,6 +192,11 @@ class Session:
                 continue
             content = message.get("content", "")
             role = message.get("role")
+            if role == "tool":
+                content = normalize_tool_message_content(
+                    str(message.get("name") or "tool"),
+                    content,
+                )
             if role == "assistant" and isinstance(content, str):
                 content = _sanitize_assistant_replay_text(content)
             # Synthesize an ``[image: path]`` breadcrumb from the persisted

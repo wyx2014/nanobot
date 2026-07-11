@@ -63,39 +63,139 @@ class TestToolEventProgress:
         final_content, _, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
 
         assert final_content == "Done"
-        assert progress == [
-            ("Visible", False, None),
-            (
-                'custom_tool("foo.txt")',
-                True,
-                [{
-                    "version": 1,
-                    "phase": "start",
-                    "call_id": "call1",
-                    "name": "custom_tool",
-                    "arguments": {"path": "foo.txt"},
-                    "result": None,
-                    "error": None,
-                    "files": [],
-                    "embeds": [],
-                }],
-            ),
-            (
-                "",
-                False,
-                [{
-                    "version": 1,
-                    "phase": "end",
-                    "call_id": "call1",
-                    "name": "custom_tool",
-                    "arguments": {"path": "foo.txt"},
-                    "result": "ok",
-                    "error": None,
-                    "files": [],
-                    "embeds": [],
-                }],
-            ),
+        assert progress[0] == ("Visible", False, None)
+        assert progress[1][0:2] == ('custom_tool("foo.txt")', True)
+        assert progress[2][0:2] == ("", False)
+
+        start = progress[1][2][0]
+        finish = progress[2][2][0]
+        assert start["phase"] == "start"
+        assert finish["phase"] == "end"
+        assert start["call_id"] == finish["call_id"] == "call1"
+        assert start["arguments"] == finish["arguments"] == {"path": "foo.txt"}
+        assert finish["result"] == "ok"
+        assert start["sequence"] == finish["sequence"]
+        assert start["batch_id"] == finish["batch_id"]
+        assert start["display"] == finish["display"] == {
+            "category": "tool",
+            "importance": "secondary",
+            "subject": "foo.txt",
+        }
+        assert isinstance(start["occurred_at"], int)
+        assert isinstance(finish["occurred_at"], int)
+
+    @pytest.mark.asyncio
+    async def test_multiple_tools_receive_automatic_task_progress(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_calls = [
+            ToolCallRequest(id="call-search", name="web_search", arguments={"query": "IDC market"}),
+            ToolCallRequest(id="call-exec", name="exec", arguments={"command": "python fetch.py"}),
         ]
+        calls = iter([
+            LLMResponse(content="", tool_calls=tool_calls),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.prepare_call = MagicMock(return_value=(None, {}, None))
+        loop.tools.execute = AsyncMock(return_value="ok")
+        progress: list[tuple[str, bool, list[dict] | None]] = []
+
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict] | None = None,
+        ) -> None:
+            progress.append((content, tool_hint, tool_events))
+
+        await loop._run_agent_loop([], on_progress=on_progress)
+
+        start_events = next(
+            events for _content, hint, events in progress
+            if hint and events and any(event["phase"] == "start" for event in events)
+        )
+        auto_start = start_events[0]
+        assert auto_start["name"] == "update_task_progress"
+        assert auto_start["phase"] == "end"
+        assert auto_start["arguments"]["note"] == "任务包含多个步骤，开始并行处理"
+        assert [step["status"] for step in auto_start["arguments"]["steps"]] == [
+            "running",
+            "running",
+        ]
+        assert [event["name"] for event in start_events[1:]] == ["web_search", "exec"]
+
+        finish_events = next(
+            events for _content, hint, events in progress
+            if not hint
+            and events
+            and any(event["call_id"] == auto_start["call_id"] for event in events)
+        )
+        auto_finish = next(
+            event for event in finish_events
+            if event["call_id"] == auto_start["call_id"]
+        )
+        assert auto_finish["batch_id"] == auto_start["batch_id"]
+        assert auto_finish["sequence"] == auto_start["sequence"]
+        assert auto_finish["arguments"]["note"] == "工具步骤已完成，正在整理结果"
+        assert [step["status"] for step in auto_finish["arguments"]["steps"]] == [
+            "completed",
+            "completed",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_second_serial_tool_triggers_automatic_task_progress(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        loop = _make_loop(tmp_path)
+        calls = iter([
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="call-search",
+                    name="web_search",
+                    arguments={"query": "IDC market"},
+                )],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="call-exec",
+                    name="exec",
+                    arguments={"command": "python fetch.py"},
+                )],
+            ),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.prepare_call = MagicMock(return_value=(None, {}, None))
+        loop.tools.execute = AsyncMock(return_value="ok")
+        progress: list[tuple[str, bool, list[dict] | None]] = []
+
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict] | None = None,
+        ) -> None:
+            progress.append((content, tool_hint, tool_events))
+
+        await loop._run_agent_loop([], on_progress=on_progress)
+
+        start_batches = [
+            events for _content, hint, events in progress
+            if hint and events and any(event["phase"] == "start" for event in events)
+        ]
+        assert len(start_batches) == 2
+        assert all(event["name"] != "update_task_progress" for event in start_batches[0])
+        auto_plan = start_batches[1][0]
+        assert auto_plan["name"] == "update_task_progress"
+        assert (
+            auto_plan["arguments"]["note"]
+            == "任务进入多步骤处理，继续执行下一阶段"
+        )
 
     @pytest.mark.asyncio
     async def test_write_file_emits_file_edit_progress(self, tmp_path: Path) -> None:

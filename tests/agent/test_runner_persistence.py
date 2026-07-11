@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -207,3 +208,46 @@ async def test_runner_keeps_going_when_tool_result_persistence_fails():
     assert result.final_content == "done"
     tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
     assert tool_message["content"] == "tool result"
+
+
+async def test_runner_serializes_structured_tool_results_for_model_history(tmp_path):
+    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+
+    provider = MagicMock()
+    captured_second_call: list[dict] = []
+    call_count = 0
+
+    async def chat_with_retry(*, messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return LLMResponse(
+                content="creating",
+                tool_calls=[ToolCallRequest(id="call_pdf", name="create_pdf", arguments={})],
+                usage={},
+            )
+        captured_second_call[:] = messages
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value={
+        "text": "PDF created successfully",
+        "files": [{"path": "/tmp/report.pdf", "mime_type": "application/pdf"}],
+    })
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "create report"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        workspace=tmp_path,
+        session_key="test:structured-result",
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "done"
+    tool_message = next(msg for msg in captured_second_call if msg.get("role") == "tool")
+    assert isinstance(tool_message["content"], str)
+    assert json.loads(tool_message["content"])["files"][0]["mime_type"] == "application/pdf"

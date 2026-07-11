@@ -43,6 +43,21 @@ def sustained_goal_active(metadata: Mapping[str, Any] | None) -> bool:
     return isinstance(goal, dict) and goal.get("status") == "active"
 
 
+def goal_state_public_blob(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """JSON-safe goal snapshot for tools."""
+    goal = parse_goal_state(goal_state_raw(metadata))
+    if not isinstance(goal, dict):
+        return {"active": False, "goal": None}
+    return {
+        "active": goal.get("status") == "active",
+        "goal": {
+            k: v
+            for k, v in goal.items()
+            if k != "_blocked_audit"
+        },
+    }
+
+
 def sustained_goal_turn(
     metadata: Mapping[str, Any] | None,
     *,

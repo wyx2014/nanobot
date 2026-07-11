@@ -90,6 +90,16 @@ if TYPE_CHECKING:
     )
     from nanobot.cron.service import CronService
 
+
+def _project_skill_scope(workspace: Path, project_path: Path | str | None, metadata: dict[str, Any]) -> dict[str, list[str]]:
+    granted = project_skill_grants(workspace, project_path)
+    requested = metadata.get("skill_scope")
+    explicit = requested.get("explicit_skills", []) if isinstance(requested, dict) else []
+    return {
+        "project_bound_user_skills": granted,
+        "explicit_skills": list(dict.fromkeys(name for name in explicit if isinstance(name, str))),
+    }
+
 class TurnState(Enum):
     RESTORE = auto()
     COMPACT = auto()
@@ -630,9 +640,7 @@ class AgentLoop:
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
         scope = self.workspace_scopes.for_message(msg, session.metadata)
-        msg.metadata["skill_scope"] = {
-            "project_bound_user_skills": project_skill_grants(self.workspace, scope.project_path),
-        }
+        msg.metadata["skill_scope"] = _project_skill_scope(self.workspace, scope.project_path, msg.metadata)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -817,9 +825,9 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
-        skill_scope_token = bind_allowed_workspace_skills({
-            "project_bound_user_skills": project_skill_grants(self.workspace, effective_scope.project_path),
-        })
+        skill_scope_token = bind_allowed_workspace_skills(
+            _project_skill_scope(self.workspace, effective_scope.project_path, metadata or {})
+        )
         # Compute lazily because long_task may create goal metadata during this run.
         def _goal_continue() -> str | None:
             _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
@@ -1207,9 +1215,7 @@ class AgentLoop:
         }
         history = session.get_history(**_hist_kwargs)
         workspace_scope = self.workspace_scopes.for_message(msg, session.metadata)
-        msg.metadata["skill_scope"] = {
-            "project_bound_user_skills": project_skill_grants(self.workspace, workspace_scope.project_path),
-        }
+        msg.metadata["skill_scope"] = _project_skill_scope(self.workspace, workspace_scope.project_path, msg.metadata)
 
         messages = self.context.build_messages(
             history=history,

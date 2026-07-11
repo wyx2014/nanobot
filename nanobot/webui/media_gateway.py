@@ -59,7 +59,7 @@ class WebUIMediaGateway:
             media_dir=self._media_dir,
         )
 
-    def sign_or_stage_media_path(self, path: Path) -> dict[str, str] | None:
+    def sign_or_stage_media_path(self, path: Path) -> dict[str, Any] | None:
         return sign_or_stage_media_path(
             path,
             secret=self.secret,

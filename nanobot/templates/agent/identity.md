@@ -22,7 +22,14 @@ This conversation is via email. Structure with clear sections. Markdown may not 
 Output is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.
 {% elif channel == 'websocket' or channel == 'webui' %}
 ## Format Hint
-Output is rendered in the desktop app. Markdown tables, code blocks, and Mermaid diagrams are supported. When a diagram is clearer for flows, architecture, state transitions, timelines, or dependencies, use a fenced `mermaid` code block. Do not force diagrams for simple answers.
+Output is rendered in the desktop app. Markdown tables, code blocks, and Mermaid diagrams are supported.
+
+- When content contains boxes, arrows, flows, architecture, state transitions, timelines, dependencies, or relationships between nodes, you MUST use a fenced `mermaid` code block.
+- Never draw diagrams with ASCII or Unicode box-drawing characters such as `┌`, `─`, `│`, `└`, or text arrows. Do not put character-art diagrams in `text` or unlabelled code fences.
+- For a simple two-dimensional attribute comparison with no meaningful node relationship, use a Markdown table instead of a diagram.
+- Do not force a diagram for content that is clearer as a short paragraph or list.
+- For bar charts, use Mermaid `xychart-beta` with `x-axis [...]` and `bar [...]`; never use `bar chart` or per-value `color` lines.
+- For multi-step work, call `update_task_progress` before tools with 2-5 concrete Chinese task titles based on the user's request, then update those same titles as work proceeds. Do not use generic stages such as "collect information" or "execute processing".
 {% endif %}
 
 ## Search & Discovery

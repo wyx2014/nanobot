@@ -382,6 +382,30 @@ class TestBuildMessages:
         assert "project-skill" in system
         assert "explicit-only" not in system
 
+    def test_explicit_project_skill_is_loaded_without_a_read_file_turn(self, tmp_path):
+        ws_skills = tmp_path / "skills"
+        ws_skills.mkdir()
+        _write_skill(ws_skills, "selected", "Selected skill")
+        _write_skill(ws_skills, "other", "Other skill")
+        builder = _builder(tmp_path)
+        msg = InboundMessage(
+            channel="websocket",
+            sender_id="u",
+            chat_id="c",
+            content="hello",
+            metadata={
+                "skill_scope": {
+                    "project_bound_user_skills": ["selected", "other"],
+                    "explicit_skills": ["selected"],
+                },
+            },
+        )
+
+        system = builder.build_messages([], "hello", inbound_message=msg)[0]["content"]
+        assert "### Skill: selected" in system
+        assert "- **selected**" not in system
+        assert "- **other**" in system
+
     def test_skill_scope_filters_disallowed_skill_from_replayed_tool_history(self, tmp_path):
         ws_skills = tmp_path / "skills"
         ws_skills.mkdir()

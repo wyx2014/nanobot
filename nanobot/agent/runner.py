@@ -52,6 +52,7 @@ from nanobot.utils.runtime import (
     build_length_recovery_message,
     ensure_nonempty_tool_result,
     is_blank_text,
+    normalize_tool_message_content,
     repeated_external_lookup_error,
     repeated_workspace_violation_error,
 )
@@ -1364,7 +1365,7 @@ class AgentRunner:
         result = ensure_nonempty_tool_result(tool_name, result)
         if tool_name in _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS:
             # Exempt tools bound their own output; skip generic offload and truncation.
-            return result
+            return normalize_tool_message_content(tool_name, result)
         try:
             content = maybe_persist_tool_result(
                 spec.workspace,
@@ -1382,7 +1383,7 @@ class AgentRunner:
             content = result
         if isinstance(content, str) and len(content) > spec.max_tool_result_chars:
             return truncate_text(content, spec.max_tool_result_chars)
-        return content
+        return normalize_tool_message_content(tool_name, content)
 
     @staticmethod
     def _drop_orphan_tool_results(

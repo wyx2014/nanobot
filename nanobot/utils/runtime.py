@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,35 @@ def ensure_nonempty_tool_result(tool_name: str, content: Any) -> Any:
         if text_payload is not None and not text_payload.strip():
             return empty_tool_result_message(tool_name)
     return content
+
+
+def normalize_tool_message_content(tool_name: str, content: Any) -> str | list[dict[str, Any]]:
+    """Return provider-safe content for a persisted ``role=tool`` message.
+
+    Tools may return structured Python values so runtime hooks can expose rich
+    artifacts to channels.  Chat APIs, however, only accept strings or typed
+    content blocks in tool messages.  Persisting a bare dict (or an untyped
+    list) poisons the conversation because every later request replays it.
+    """
+    content = ensure_nonempty_tool_result(tool_name, content)
+    if isinstance(content, str):
+        return content
+    if (
+        isinstance(content, list)
+        and content
+        and all(
+            isinstance(block, dict)
+            and isinstance(block.get("type"), str)
+            and bool(block["type"].strip())
+            for block in content
+        )
+    ):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = str(content)
+        return rendered if rendered.strip() else empty_tool_result_message(tool_name)
 
 
 def is_blank_text(content: str | None) -> bool:

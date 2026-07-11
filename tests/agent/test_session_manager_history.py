@@ -1,3 +1,5 @@
+import json
+
 from nanobot.session.manager import Session, SessionManager
 
 
@@ -29,6 +31,34 @@ def _tool_turn(prefix: str, idx: int) -> list[dict]:
         {"role": "tool", "tool_call_id": f"{prefix}_{idx}_a", "name": "x", "content": "ok"},
         {"role": "tool", "tool_call_id": f"{prefix}_{idx}_b", "name": "y", "content": "ok"},
     ]
+
+
+def test_get_history_repairs_legacy_structured_tool_content():
+    session = Session(key="test:legacy-structured-tool")
+    session.messages.extend([
+        {"role": "user", "content": "create report"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_pdf",
+                "type": "function",
+                "function": {"name": "create_pdf", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_pdf",
+            "name": "create_pdf",
+            "content": {"text": "created", "files": [{"path": "/tmp/report.pdf"}]},
+        },
+    ])
+
+    history = session.get_history()
+
+    tool_message = next(message for message in history if message["role"] == "tool")
+    assert isinstance(tool_message["content"], str)
+    assert json.loads(tool_message["content"])["text"] == "created"
 
 
 def test_list_sessions_includes_metadata_title(tmp_path):

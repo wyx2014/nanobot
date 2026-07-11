@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -54,18 +55,32 @@ def _tool_event_arguments(tool_call: Any) -> dict[str, Any]:
     return arguments if isinstance(arguments, dict) else {}
 
 
-def build_tool_event_start_payload(tool_call: Any) -> dict[str, Any]:
-    return {
+def build_tool_event_start_payload(
+    tool_call: Any,
+    *,
+    sequence: int | None = None,
+    batch_id: str | None = None,
+) -> dict[str, Any]:
+    name = str(getattr(tool_call, "name", "") or "")
+    arguments = _tool_event_arguments(tool_call)
+    payload = {
         "version": 1,
         "phase": "start",
         "call_id": str(getattr(tool_call, "id", "") or ""),
-        "name": getattr(tool_call, "name", ""),
-        "arguments": _tool_event_arguments(tool_call),
+        "name": name,
+        "arguments": arguments,
         "result": None,
         "error": None,
         "files": [],
         "embeds": [],
+        "occurred_at": _unix_millis(),
+        "display": build_tool_event_display(name, arguments),
     }
+    if sequence is not None:
+        payload["sequence"] = sequence
+    if batch_id:
+        payload["batch_id"] = batch_id
+    return payload
 
 
 def tool_event_result_extras(result: Any) -> tuple[list[Any], list[Any]]:
@@ -76,7 +91,12 @@ def tool_event_result_extras(result: Any) -> tuple[list[Any], list[Any]]:
     return files, embeds
 
 
-def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str, Any]]:
+def build_tool_event_finish_payloads(
+    context: AgentHookContext,
+    *,
+    sequence_base: int | None = None,
+    batch_id: str | None = None,
+) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     count = min(len(context.tool_calls), len(context.tool_results), len(context.tool_events))
     for idx in range(count):
@@ -86,17 +106,25 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
         status = event.get("status")
         phase = "end" if status == "ok" else "error"
         files, embeds = tool_event_result_extras(result)
+        name = str(getattr(tool_call, "name", "") or "")
+        arguments = _tool_event_arguments(tool_call)
         payload = {
             "version": 1,
             "phase": phase,
             "call_id": str(getattr(tool_call, "id", "") or ""),
-            "name": getattr(tool_call, "name", ""),
-            "arguments": _tool_event_arguments(tool_call),
+            "name": name,
+            "arguments": arguments,
             "result": result if phase == "end" else None,
             "error": None,
             "files": files,
             "embeds": embeds,
+            "occurred_at": _unix_millis(),
+            "display": build_tool_event_display(name, arguments),
         }
+        if sequence_base is not None:
+            payload["sequence"] = sequence_base + idx
+        if batch_id:
+            payload["batch_id"] = batch_id
         if phase == "error":
             if isinstance(result, str) and result.strip():
                 payload["error"] = result.strip()
@@ -104,3 +132,87 @@ def build_tool_event_finish_payloads(context: AgentHookContext) -> list[dict[str
                 payload["error"] = str(event.get("detail") or "Tool execution failed")
         payloads.append(payload)
     return payloads
+
+
+def build_automatic_task_progress_event(
+    *,
+    call_id: str,
+    steps: list[dict[str, str]],
+    note: str,
+    current_step_id: str | None,
+    sequence: int,
+    batch_id: str,
+) -> dict[str, Any]:
+    """Build a completed synthetic event carrying a runtime-generated plan snapshot."""
+    arguments: dict[str, Any] = {
+        "steps": steps,
+        "note": note,
+    }
+    if current_step_id:
+        arguments["current_step_id"] = current_step_id
+    return {
+        "version": 1,
+        # This is a UI snapshot, not an executable tool call. Keep the phase
+        # terminal so transcript pending-call detection never treats it as work.
+        "phase": "end",
+        "call_id": call_id,
+        "name": "update_task_progress",
+        "sequence": sequence,
+        "batch_id": batch_id,
+        "occurred_at": _unix_millis(),
+        "display": {"category": "plan", "importance": "primary"},
+        "arguments": arguments,
+        "result": "Task progress updated",
+        "error": None,
+        "files": [],
+        "embeds": [],
+    }
+
+
+def build_tool_event_display(name: str, arguments: dict[str, Any]) -> dict[str, str]:
+    """Return stable presentation hints without coupling clients to tool names."""
+    compact = name.lower()
+    if compact == "update_task_progress" or "plan" in compact:
+        category, importance = "plan", "primary"
+    elif "skill" in compact:
+        category, importance = "skill", "primary"
+    elif compact in {"exec", "run_shell_command", "run_cli_app"} or "command" in compact:
+        category, importance = "command", "primary"
+    elif "search" in compact:
+        category, importance = "search", "primary"
+    elif "browser" in compact or "fetch" in compact:
+        category, importance = "browser", "primary"
+    elif compact.startswith("mcp_") or compact == "mcp":
+        category, importance = "mcp", "primary"
+    elif any(token in compact for token in ("write", "edit", "patch")):
+        category, importance = "write", "primary"
+    elif any(token in compact for token in ("read", "list_dir", "grep", "find")):
+        category, importance = "read", "secondary"
+    elif any(token in compact for token in ("image", "video", "media")):
+        category, importance = "media", "primary"
+    else:
+        category, importance = "tool", "secondary"
+
+    display = {"category": category, "importance": importance}
+    subject = _display_subject(arguments)
+    if subject:
+        display["subject"] = subject
+    return display
+
+
+def _display_subject(arguments: dict[str, Any]) -> str | None:
+    for key in (
+        "query", "q", "keyword", "topic", "ticker", "symbol", "code",
+        "path", "file_path", "url", "name",
+    ):
+        value = arguments.get(key)
+        if not isinstance(value, str):
+            continue
+        compact = " ".join(value.split()).strip()
+        if compact:
+            return compact[:96]
+    return None
+
+
+def _unix_millis() -> int:
+    return int(time.time() * 1000)

@@ -1006,7 +1006,7 @@ class WebSocketChannel(BaseChannel):
         }
         if msg.media:
             payload["media"] = msg.media
-            urls: list[dict[str, str]] = []
+            urls: list[dict[str, Any]] = []
             for entry in msg.media:
                 signed = self._media.sign_or_stage_media_path(Path(entry))
                 if signed is not None:

@@ -27,6 +27,9 @@ from nanobot.webui.gateway_services import build_gateway_services
 from nanobot.webui.media_api import (
     b64url_decode,
     b64url_encode,
+    serve_signed_media,
+    sign_media_path,
+    sign_or_stage_media_path,
 )
 
 # PNG magic bytes + a couple of sentinel bytes so we can verify byte-for-byte
@@ -84,6 +87,48 @@ def _fake_media_dir(root: Path):
         return path
 
     return inner
+
+
+def test_pdf_media_metadata_and_inline_download_disposition(tmp_path: Path) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    target = media / "研究报告.pdf"
+    target.write_bytes(b"%PDF-1.4\nexample")
+    secret = b"artifact-secret"
+    media_dir = lambda _channel=None: media
+
+    attachment = sign_or_stage_media_path(target, secret=secret, media_dir=media_dir)
+
+    assert attachment is not None
+    assert attachment["name"] == "研究报告.pdf"
+    assert attachment["mime_type"] == "application/pdf"
+    assert attachment["size"] == target.stat().st_size
+    assert attachment["download_url"].endswith("?download=1")
+
+    signed = sign_media_path(target, secret=secret, media_dir=media_dir)
+    assert signed is not None
+    _prefix, _api, _media, sig, payload = signed.split("/", 4)
+    inline_request = MagicMock(path=signed, headers={})
+    inline = serve_signed_media(
+        sig,
+        payload,
+        secret=secret,
+        request=inline_request,
+        media_dir=media_dir,
+    )
+    assert inline.status_code == 200
+    assert inline.headers["Content-Type"] == "application/pdf"
+    assert inline.headers["Content-Disposition"].startswith("inline;")
+
+    download_request = MagicMock(path=f"{signed}?download=1", headers={})
+    download = serve_signed_media(
+        sig,
+        payload,
+        secret=secret,
+        request=download_request,
+        media_dir=media_dir,
+    )
+    assert download.headers["Content-Disposition"].startswith("attachment;")
 
 
 async def _http_get(

@@ -1278,6 +1278,48 @@ def test_replay_tool_events_keeps_phase_update_when_trace_is_deduped() -> None:
     assert msgs[0]["toolEvents"][0]["error"] == "Error: CLI app 'github' not found"
 
 
+def test_replay_keeps_consecutive_task_progress_snapshots() -> None:
+    msgs = replay_transcript_to_ui_messages([
+        {
+            "event": "message",
+            "chat_id": "t-plan",
+            "text": "",
+            "kind": "progress",
+            "agent_ui": {
+                "kind": "task_progress",
+                "note": "开始查询行业数据",
+                "current_step_id": "research",
+                "steps": [
+                    {"id": "research", "title": "查询行业数据", "status": "running"},
+                    {"id": "draft", "title": "撰写报告", "status": "pending"},
+                ],
+            },
+        },
+        {
+            "event": "message",
+            "chat_id": "t-plan",
+            "text": "",
+            "kind": "progress",
+            "agent_ui": {
+                "kind": "task_progress",
+                "note": "数据已收集，开始撰写报告",
+                "current_step_id": "draft",
+                "steps": [
+                    {"id": "research", "title": "查询行业数据", "status": "completed"},
+                    {"id": "draft", "title": "撰写报告", "status": "running"},
+                ],
+            },
+        },
+    ])
+
+    assert len(msgs) == 2
+    assert [msg["agentUI"]["current_step_id"] for msg in msgs] == ["research", "draft"]
+    assert [msg["agentUI"]["note"] for msg in msgs] == [
+        "开始查询行业数据",
+        "数据已收集，开始撰写报告",
+    ]
+
+
 def test_replay_file_edit_progress_merges_after_interleaved_activity(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
     key = "websocket:t-file-progress"

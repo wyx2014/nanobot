@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.skill_scope import allowed_workspace_skills_from_scope
+from nanobot.agent.skill_scope import allowed_workspace_skills_from_scope, explicit_skills_from_scope
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
@@ -181,14 +181,23 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
+        available_skills = {
+            entry["name"]
+            for entry in self.skills.list_skills(
+                allowed_workspace_skills=allowed_workspace_skills,
+            )
+        }
+        requested_skills = [*(skill_names or []), *explicit_skills_from_scope(skill_scope)]
+        selected_skills = list(dict.fromkeys(name for name in requested_skills if name in available_skills))
         always_skills = self.skills.get_always_skills(allowed_workspace_skills=allowed_workspace_skills)
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
+        active_skills = list(dict.fromkeys([*selected_skills, *always_skills]))
+        if active_skills:
+            always_content = self.skills.load_skills_for_context(active_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
         skills_summary = self.skills.build_skills_summary(
-            exclude=set(always_skills),
+            exclude=set(active_skills),
             allowed_workspace_skills=allowed_workspace_skills,
         )
         if skills_summary:

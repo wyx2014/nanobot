@@ -8,8 +8,8 @@ from the skills listing (path shown there) before composing ``long_task.goal`` t
 Active objectives are mirrored each turn into the Runtime Context block (see
 ``nanobot.session.goal_state.goal_state_runtime_lines``) so compaction cannot hide them.
 Work proceeds in ordinary agent turns (same runner, compaction as configured).
-Call ``complete_goal`` when the sustained objective should stop being tracked:
-finished successfully, or cancelled / superseded / redirected—in every case the recap should match reality.
+Call ``update_goal`` when the sustained objective is complete or genuinely blocked.
+``complete_goal`` remains as a compatibility alias for successful completion.
 
 There is **no** sub-agent orchestrator and **no** special WebSocket ``agent_ui`` stream.
 """
@@ -27,6 +27,7 @@ from nanobot.bus.runtime_events import GoalStateChanged, RuntimeEventBus, Runtim
 from nanobot.session.goal_state import (
     GOAL_STATE_KEY,
     discard_legacy_goal_state_key,
+    goal_state_public_blob,
     goal_state_raw,
     parse_goal_state,
 )
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
 
 def _iso_now() -> str:
     return datetime.now().isoformat()
+
+
+_BLOCKED_THRESHOLD = 3
 
 
 class _GoalToolsMixin(ContextAware):
@@ -143,8 +147,8 @@ class LongTaskTool(Tool, _GoalToolsMixin):
             "as soon as the user's intent is clear. Write a good idempotent goal, but do not delay the tool "
             "call with long planning, research, or execution-detail thinking. "
             "The active goal is mirrored in Runtime Context each turn. Use normal tools until done, then call "
-            "complete_goal when the objective is satisfied, cancelled, or replaced. "
-            "If a goal is already active, finish it or call complete_goal before registering another."
+            "update_goal with status='complete' when the objective is satisfied and verified. "
+            "If a goal is already active, finish it before registering another."
         )
 
     async def execute(self, goal: str, ui_summary: str | None = None, **kwargs: Any) -> str:
@@ -157,7 +161,7 @@ class LongTaskTool(Tool, _GoalToolsMixin):
         if isinstance(prior, dict) and prior.get("status") == "active":
             return (
                 "Error: a sustained goal is already active. "
-                "Use complete_goal when finished, or ask the user before replacing it."
+                "Use update_goal when finished, or ask the user before replacing it."
             )
 
         summary = (ui_summary or "").strip()[:120]
@@ -174,9 +178,195 @@ class LongTaskTool(Tool, _GoalToolsMixin):
         extra = f"\nSummary line: {summary}" if summary else ""
         return (
             "Goal recorded. Keep working toward the objective using ordinary tools. "
-            "When fully done (verified against what was asked), call complete_goal with a "
-            f"short recap.{extra}"
+            "When fully done (verified against what was asked), call update_goal with "
+            f"status='complete' and a short recap.{extra}"
         )
+
+
+@tool_parameters(tool_parameters_schema(required=[]))
+class GetGoalTool(Tool, _GoalToolsMixin):
+    """Return the current sustained goal state for this session."""
+
+    def __init__(
+        self,
+        sessions: Any,
+        runtime_events: RuntimeEventBus | None = None,
+    ) -> None:
+        _GoalToolsMixin.__init__(self, sessions, runtime_events)
+
+    @classmethod
+    def create(cls, ctx: Any) -> Tool:
+        sess = getattr(ctx, "sessions", None)
+        assert sess is not None
+        return cls(
+            sessions=sess,
+            runtime_events=getattr(ctx, "runtime_events", None),
+        )
+
+    @classmethod
+    def enabled(cls, ctx: Any) -> bool:
+        return getattr(ctx, "sessions", None) is not None
+
+    @property
+    def name(self) -> str:
+        return "get_goal"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Get the current sustained goal for this thread, including status and objective. "
+            "Use before deciding whether a long-running objective is active, complete, or blocked."
+        )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, **kwargs: Any) -> dict[str, Any]:
+        sess = self._session()
+        if sess is None:
+            return {"active": False, "goal": None, "error": "missing active chat session"}
+        return goal_state_public_blob(sess.metadata)
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        status=StringSchema(
+            "Set to 'complete' only when the full objective is achieved and verified. "
+            "Set to 'blocked' only when the same blocker has repeated for at least three "
+            "consecutive goal turns and no meaningful progress is possible without user input "
+            "or an external state change.",
+            enum=["complete", "blocked"],
+        ),
+        recap=StringSchema(
+            "Short recap for the user. For complete, summarize what was delivered. "
+            "For blocked, summarize the repeated blocker.",
+            max_length=8000,
+            nullable=True,
+        ),
+        blocker=StringSchema(
+            "Required when status='blocked': stable description of the blocking condition.",
+            max_length=1000,
+            nullable=True,
+        ),
+        required=["status"],
+    )
+)
+class UpdateGoalTool(Tool, _GoalToolsMixin):
+    """Mark the active sustained goal complete or genuinely blocked."""
+
+    def __init__(
+        self,
+        sessions: Any,
+        runtime_events: RuntimeEventBus | None = None,
+    ) -> None:
+        _GoalToolsMixin.__init__(self, sessions, runtime_events)
+
+    @classmethod
+    def create(cls, ctx: Any) -> Tool:
+        sess = getattr(ctx, "sessions", None)
+        assert sess is not None
+        return cls(
+            sessions=sess,
+            runtime_events=getattr(ctx, "runtime_events", None),
+        )
+
+    @classmethod
+    def enabled(cls, ctx: Any) -> bool:
+        return getattr(ctx, "sessions", None) is not None
+
+    @property
+    def name(self) -> str:
+        return "update_goal"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Update the existing sustained goal. Use only to mark it achieved or genuinely blocked. "
+            "Do not use 'complete' until the requested end state is actually verified. "
+            "Do not use 'blocked' for uncertainty or first-time trouble; the same blocker must repeat "
+            "for three consecutive goal turns."
+        )
+
+    async def execute(
+        self,
+        status: str,
+        recap: str | None = None,
+        blocker: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        sess = self._session()
+        if sess is None:
+            return "Error: update_goal requires an active chat session."
+        prior = parse_goal_state(goal_state_raw(sess.metadata))
+        if not isinstance(prior, dict) or prior.get("status") != "active":
+            return "No active goal to update."
+
+        status = status.strip().lower()
+        if status == "complete":
+            return await self._complete(sess, prior, recap)
+        if status == "blocked":
+            return await self._blocked(sess, prior, blocker, recap)
+        return "Error: status must be 'complete' or 'blocked'."
+
+    async def _complete(self, sess: Any, prior: dict[str, Any], recap: str | None) -> str:
+        ended = _iso_now()
+        sess.metadata[GOAL_STATE_KEY] = {
+            **prior,
+            "status": "completed",
+            "completed_at": ended,
+            "recap": (recap or "").strip(),
+        }
+        sess.metadata[GOAL_STATE_KEY].pop("_blocked_audit", None)
+        discard_legacy_goal_state_key(sess.metadata)
+        self._sessions.save(sess)
+        await self._publish_goal_state_changed(sess.metadata)
+        tail = (recap or "").strip()
+        if tail:
+            return f"Goal marked complete ({ended}). Recap:\n{tail}"
+        return f"Goal marked complete ({ended})."
+
+    async def _blocked(
+        self,
+        sess: Any,
+        prior: dict[str, Any],
+        blocker: str | None,
+        recap: str | None,
+    ) -> str:
+        blocker = (blocker or "").strip()
+        if not blocker:
+            return "Error: blocker is required when status is 'blocked'."
+
+        audit = prior.get("_blocked_audit")
+        if not isinstance(audit, dict) or audit.get("blocker") != blocker:
+            audit = {"blocker": blocker, "count": 0}
+        audit["count"] = int(audit.get("count") or 0) + 1
+
+        if audit["count"] < _BLOCKED_THRESHOLD:
+            sess.metadata[GOAL_STATE_KEY] = {**prior, "_blocked_audit": audit}
+            discard_legacy_goal_state_key(sess.metadata)
+            self._sessions.save(sess)
+            return (
+                f"Blocked audit recorded ({audit['count']}/{_BLOCKED_THRESHOLD}). "
+                "Keep the goal active and continue if any meaningful progress is possible."
+            )
+
+        ended = _iso_now()
+        sess.metadata[GOAL_STATE_KEY] = {
+            **prior,
+            "status": "blocked",
+            "blocked_at": ended,
+            "blocker": blocker,
+            "recap": (recap or "").strip(),
+        }
+        sess.metadata[GOAL_STATE_KEY].pop("_blocked_audit", None)
+        discard_legacy_goal_state_key(sess.metadata)
+        self._sessions.save(sess)
+        await self._publish_goal_state_changed(sess.metadata)
+        tail = (recap or "").strip()
+        if tail:
+            return f"Goal marked blocked ({ended}). Recap:\n{tail}"
+        return f"Goal marked blocked ({ended})."
 
 
 @tool_parameters(
@@ -228,24 +418,8 @@ class CompleteGoalTool(Tool, _GoalToolsMixin):
         )
 
     async def execute(self, recap: str | None = None, **kwargs: Any) -> str:
-        sess = self._session()
-        if sess is None:
-            return "Error: complete_goal requires an active chat session."
-        prior = parse_goal_state(goal_state_raw(sess.metadata))
-        if not isinstance(prior, dict) or prior.get("status") != "active":
-            return "No active goal to complete."
-
-        ended = _iso_now()
-        sess.metadata[GOAL_STATE_KEY] = {
-            **prior,
-            "status": "completed",
-            "completed_at": ended,
-            "recap": (recap or "").strip(),
-        }
-        discard_legacy_goal_state_key(sess.metadata)
-        self._sessions.save(sess)
-        await self._publish_goal_state_changed(sess.metadata)
-        tail = (recap or "").strip()
-        if tail:
-            return f"Goal marked complete ({ended}). Recap:\n{tail}"
-        return f"Goal marked complete ({ended})."
+        updater = UpdateGoalTool(self._sessions, self._runtime_events)
+        rc = self._request_ctx.get()
+        if rc is not None:
+            updater.set_context(rc)
+        return await updater.execute(status="complete", recap=recap)

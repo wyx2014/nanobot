@@ -626,7 +626,7 @@ async def cmd_history(ctx: CommandContext) -> OutboundMessage:
 
 _GOAL_PROMPT_TEMPLATE = """The user declared a sustained objective for this thread.
 
-Inspect or clarify if needed, then call `long_task` with the refined objective (and optional short ui_summary). Work proceeds as normal assistant turns using your usual tools. When the objective is fully done and verified, call `complete_goal` with a brief recap. If the user later cancels or changes direction, still call `complete_goal` with an honest recap (then `long_task` again only after there is no active goal). Do not use `long_task` / `complete_goal` for trivial one-shot answers.
+Inspect or clarify if needed, then call `long_task` with the refined objective (and optional short ui_summary). Work proceeds as normal assistant turns using your usual tools. When the objective is fully done and verified, call `update_goal` with status "complete" and a brief recap. If the same blocker repeats for three consecutive goal turns and no meaningful progress is possible, call `update_goal` with status "blocked" and a stable blocker description. Do not use goal tools for trivial one-shot answers.
 
 Goal:
 {goal}
