@@ -172,7 +172,9 @@ def build_automatic_task_progress_event(
 def build_tool_event_display(name: str, arguments: dict[str, Any]) -> dict[str, str]:
     """Return stable presentation hints without coupling clients to tool names."""
     compact = name.lower()
-    if compact == "update_task_progress" or "plan" in compact:
+    if compact == "spawn":
+        category, importance = "expert", "primary"
+    elif compact == "update_task_progress" or "plan" in compact:
         category, importance = "plan", "primary"
     elif "skill" in compact:
         category, importance = "skill", "primary"
@@ -194,6 +196,29 @@ def build_tool_event_display(name: str, arguments: dict[str, Any]) -> dict[str, 
         category, importance = "tool", "secondary"
 
     display = {"category": category, "importance": importance}
+    if compact == "spawn":
+        role = str(arguments.get("label") or "").strip()
+        role_display = {
+            "business-analyst": (
+                "商业模式分析",
+                "研究主营业务、生意属性、护城河与关键公告",
+            ),
+            "financial-analyst": (
+                "财务质量与估值",
+                "核验财务报表、现金流、盈利质量与估值基础",
+            ),
+            "industry-researcher": (
+                "行业格局研究",
+                "分析行业板块、可比公司、竞争格局与长期变化",
+            ),
+            "risk-assessor": (
+                "风险与治理评估",
+                "核查治理公告、诉讼处罚、减持质押与下行风险",
+            ),
+        }.get(role)
+        if role_display is not None:
+            display["title"], display["subject"] = role_display
+            return display
     subject = _display_subject(arguments)
     if subject:
         display["subject"] = subject

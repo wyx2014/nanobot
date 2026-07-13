@@ -66,6 +66,7 @@ from nanobot.webui.http_utils import (
     safe_host_header as _safe_host_header,
 )
 from nanobot.webui.media_gateway import WebUIMediaGateway
+from nanobot.webui.expert_teams import EXPERT_TEAM_SESSION_KEY, public_expert_team_binding
 from nanobot.webui.session_automations import (
     all_automations_payload,
     serialize_automation_jobs,
@@ -406,6 +407,12 @@ class GatewayHTTPHandler:
                 row["run_started_at"] = started_at
             scope = self.workspaces.scope_for_session_key(key)
             row["workspace_scope"] = scope.payload()
+            session_data = self.session_manager.read_session_file(key)
+            metadata = session_data.get("metadata") if isinstance(session_data, dict) else None
+            if isinstance(metadata, dict):
+                expert_team = public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
+                if expert_team is not None:
+                    row["expert_team"] = expert_team
             cleaned.append(row)
         return {"sessions": cleaned}
 
@@ -438,6 +445,7 @@ class GatewayHTTPHandler:
             return _http_error(404, "session not found")
         scope = self.workspaces.scope_for_session_key(decoded_key)
         session_messages: list[dict[str, Any]] | None = None
+        session_data: dict[str, Any] | None = None
         if self.session_manager is not None:
             session_data = self.session_manager.read_session_file(decoded_key)
             raw_messages = session_data.get("messages") if isinstance(session_data, dict) else None
@@ -471,6 +479,11 @@ class GatewayHTTPHandler:
         if data is None:
             return _http_error(404, "webui thread not found")
         data["workspace_scope"] = scope.payload()
+        metadata = session_data.get("metadata") if isinstance(session_data, dict) else None
+        if isinstance(metadata, dict):
+            expert_team = public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
+            if expert_team is not None:
+                data["expert_team"] = expert_team
         return _http_json_response(data)
 
     def _handle_file_preview(self, request: WsRequest, key: str) -> Response:

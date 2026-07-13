@@ -1,5 +1,6 @@
 """File system tools: read, write, edit, list."""
 
+import asyncio
 import difflib
 import mimetypes
 import os
@@ -20,6 +21,7 @@ from nanobot.agent.skill_scope import current_allowed_workspace_skills
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
+from nanobot.utils.markdown_html import markdown_write_result, write_html_companion
 
 
 class FileToolsConfig(Base):
@@ -500,7 +502,9 @@ class WriteFileTool(_FsTool):
             "apply_patch; use edit_file only for small exact replacements."
         )
 
-    async def execute(self, path: str | None = None, content: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self, path: str | None = None, content: str | None = None, **kwargs: Any,
+    ) -> str | dict[str, Any]:
         try:
             if not path:
                 raise ValueError("Unknown path")
@@ -510,7 +514,13 @@ class WriteFileTool(_FsTool):
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             self._file_states.record_write(fp)
-            return f"Successfully wrote {len(content)} characters to {fp}"
+            companion = await asyncio.to_thread(write_html_companion, fp, content)
+            if companion is not None:
+                self._file_states.record_write(companion)
+            return markdown_write_result(
+                f"Successfully wrote {len(content)} characters to {fp}",
+                [companion] if companion is not None else [],
+            )
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -841,7 +851,7 @@ class EditFileTool(_FsTool):
         new_text: str | None = None,
         replace_all: bool = False, occurrence: int | None = None,
         line_hint: int | None = None, expected_replacements: int | None = None, **kwargs: Any,
-    ) -> str:
+    ) -> str | dict[str, Any]:
         try:
             if not path:
                 raise ValueError("Unknown path")
@@ -864,7 +874,13 @@ class EditFileTool(_FsTool):
                     fp.parent.mkdir(parents=True, exist_ok=True)
                     fp.write_text(new_text, encoding="utf-8")
                     self._file_states.record_write(fp)
-                    return f"Successfully created {fp}"
+                    companion = await asyncio.to_thread(write_html_companion, fp, new_text)
+                    if companion is not None:
+                        self._file_states.record_write(companion)
+                    return markdown_write_result(
+                        f"Successfully created {fp}",
+                        [companion] if companion is not None else [],
+                    )
                 return self._file_not_found_msg(path, fp)
 
             # File size protection
@@ -883,7 +899,13 @@ class EditFileTool(_FsTool):
                     return f"Error: Cannot create file — {path} already exists and is not empty."
                 fp.write_text(new_text, encoding="utf-8")
                 self._file_states.record_write(fp)
-                return f"Successfully edited {fp}"
+                companion = await asyncio.to_thread(write_html_companion, fp, new_text)
+                if companion is not None:
+                    self._file_states.record_write(companion)
+                return markdown_write_result(
+                    f"Successfully edited {fp}",
+                    [companion] if companion is not None else [],
+                )
 
             # Read-before-edit check
             warning = self._file_states.check_read(fp)
@@ -972,7 +994,10 @@ class EditFileTool(_FsTool):
             msg = f"Successfully edited {fp}"
             if warning:
                 msg = f"{warning}\n{msg}"
-            return msg
+            companion = await asyncio.to_thread(write_html_companion, fp, new_content)
+            if companion is not None:
+                self._file_states.record_write(companion)
+            return markdown_write_result(msg, [companion] if companion is not None else [])
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:

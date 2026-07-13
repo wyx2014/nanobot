@@ -59,6 +59,26 @@ def test_read_only_discovery_is_marked_secondary() -> None:
     }
 
 
+def test_expert_team_spawn_has_role_specific_display() -> None:
+    call = ToolCallRequest(
+        id="call-financial",
+        name="spawn",
+        arguments={
+            "label": "financial-analyst",
+            "task": "Analyze financial quality and valuation",
+        },
+    )
+
+    event = build_tool_event_start_payload(call)
+
+    assert event["display"] == {
+        "category": "expert",
+        "importance": "primary",
+        "title": "财务质量与估值",
+        "subject": "核验财务报表、现金流、盈利质量与估值基础",
+    }
+
+
 def test_structured_file_result_is_forwarded_as_activity_evidence() -> None:
     call = ToolCallRequest(
         id="call-pdf",

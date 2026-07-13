@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nanobot.agent.loop import _generated_artifact_paths
+
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
@@ -323,3 +325,16 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     args = mgr._announce_result.await_args.args
     assert args[3] == "Task completed but no final response was generated."
     assert args[5] == "ok"
+
+
+def test_generated_artifact_paths_only_reads_current_structured_tool_results(tmp_path):
+    import json
+
+    html = tmp_path / "report.html"
+    html.write_text("<html></html>", encoding="utf-8")
+    messages = [
+        {"role": "assistant", "content": "old"},
+        {"role": "tool", "content": json.dumps({"text": "ok", "files": [{"path": str(html)}]})},
+    ]
+
+    assert _generated_artifact_paths(messages) == [str(html)]

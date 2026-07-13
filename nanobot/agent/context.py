@@ -17,6 +17,7 @@ from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.webui.interactive_prompt import interactive_prompt_answer_session_extra
+from nanobot.webui.expert_teams import expert_team_system_prompt
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
@@ -162,6 +163,7 @@ class ContextBuilder:
         session_key: str | None = None,
         unified_session: bool = False,
         skill_scope: Mapping[str, Any] | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
@@ -202,6 +204,10 @@ class ContextBuilder:
         )
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+
+        team_prompt = expert_team_system_prompt(session_metadata)
+        if team_prompt:
+            parts.append(team_prompt)
 
         if include_memory_recent_history:
             entries = self.memory.read_recent_history_for_prompt(
@@ -385,6 +391,7 @@ class ContextBuilder:
                     session_key=session_key,
                     unified_session=unified_session,
                     skill_scope=skill_scope if isinstance(skill_scope, Mapping) else None,
+                    session_metadata=session_metadata,
                 ),
             },
             *history,

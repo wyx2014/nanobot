@@ -409,6 +409,15 @@ class ChannelManager:
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):
             await channel.send(msg)
+        elif msg.media:
+            # Streaming only covers the assistant text. Generated artifacts are
+            # discovered after the model turn finishes, so suppressing the
+            # final outbound message would silently drop those attachments.
+            # WebUI replaces its streamed bubble with this complete payload;
+            # other channels receive an attachment-only follow-up to avoid
+            # repeating the already streamed answer text.
+            media_message = msg if msg.channel == "websocket" else replace(msg, content="")
+            await channel.send(media_message)
 
     def _coalesce_stream_deltas(
         self, first_msg: OutboundMessage

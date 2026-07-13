@@ -34,6 +34,12 @@ from nanobot.utils.media_decode import (
     save_base64_data_url,
 )
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
+from nanobot.webui.expert_teams import (
+    EXPERT_TEAM_SESSION_KEY,
+    ExpertTeamError,
+    normalize_expert_team_binding,
+    public_expert_team_binding,
+)
 from nanobot.webui.forking import handle_webui_fork_chat
 from nanobot.webui.gateway_services import GatewayServices
 from nanobot.webui.http_utils import (
@@ -398,6 +404,37 @@ class WebSocketChannel(BaseChannel):
         await self._maybe_push_active_goal_state(chat_id)
         await self._maybe_push_turn_run_wall_clock(chat_id)
 
+    def _session_expert_team(self, chat_id: str) -> dict[str, Any] | None:
+        if self.gateway.session_manager is None:
+            return None
+        row = self.gateway.session_manager.read_session_file(f"websocket:{chat_id}")
+        metadata = row.get("metadata") if isinstance(row, dict) else None
+        if not isinstance(metadata, dict):
+            return None
+        return public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
+
+    def _bind_expert_team(
+        self,
+        chat_id: str,
+        raw: Any,
+    ) -> dict[str, Any] | None:
+        """Validate and persist a team binding without trusting client runtime fields."""
+        requested = normalize_expert_team_binding(raw) if raw is not None else None
+        if self.gateway.session_manager is None:
+            return requested
+        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        existing = session.metadata.get(EXPERT_TEAM_SESSION_KEY)
+        existing_id = existing.get("id") if isinstance(existing, dict) else None
+        if requested is not None and existing_id not in (None, requested["id"]):
+            raise ExpertTeamError("expert team cannot be changed for an existing session", status=409)
+        binding = requested
+        if binding is None and isinstance(existing_id, str):
+            binding = normalize_expert_team_binding({"id": existing_id})
+        if binding is not None and existing != binding:
+            session.metadata[EXPERT_TEAM_SESSION_KEY] = binding
+            self.gateway.session_manager.save(session)
+        return binding
+
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
         payload: dict[str, Any] = {"event": event}
@@ -698,6 +735,11 @@ class WebSocketChannel(BaseChannel):
         t = envelope.get("type")
         if t == "new_chat":
             new_id = str(uuid.uuid4())
+            try:
+                expert_team = self._bind_expert_team(new_id, envelope.get("expert_team"))
+            except ExpertTeamError as exc:
+                await self._send_event(connection, "error", detail="expert_team_rejected", reason=exc.message)
+                return
             scope = await self._workspace_scope_or_error(
                 connection,
                 lambda: self._workspaces.scope_for_new_chat(
@@ -716,6 +758,7 @@ class WebSocketChannel(BaseChannel):
                 chat_id=new_id,
                 scope="metadata",
                 workspace_scope=scope.payload(),
+                expert_team=public_expert_team_binding(expert_team),
             )
             await self._hydrate_after_subscribe(new_id)
             return
@@ -775,6 +818,17 @@ class WebSocketChannel(BaseChannel):
                 return
             if not isinstance(content, str):
                 content = ""
+            try:
+                expert_team = self._bind_expert_team(cid, envelope.get("expert_team"))
+            except ExpertTeamError as exc:
+                await self._send_event(
+                    connection,
+                    "error",
+                    chat_id=cid if _is_valid_chat_id(cid) else None,
+                    detail="expert_team_rejected",
+                    reason=exc.message,
+                )
+                return
 
             raw_media = envelope.get("media")
             media_paths: list[str] = []
@@ -828,6 +882,11 @@ class WebSocketChannel(BaseChannel):
             skill_scope = normalize_skill_scope(envelope.get("skill_scope"))
             if skill_scope:
                 metadata["skill_scope"] = skill_scope
+            is_team_run = expert_team is not None and not content.strip().startswith("/")
+            if expert_team is not None:
+                metadata[EXPERT_TEAM_SESSION_KEY] = expert_team
+            if is_team_run:
+                metadata["expert_team_run_id"] = uuid.uuid4().hex[:12]
             if interactive_prompt_answer:
                 metadata[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = interactive_prompt_answer
             metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
@@ -847,6 +906,16 @@ class WebSocketChannel(BaseChannel):
                     media_paths=media_paths or None,
                     cli_apps=cli_apps or None,
                     mcp_presets=mcp_presets or None,
+                )
+            if is_team_run:
+                await self._send_event(
+                    connection,
+                    "team_run_started",
+                    chat_id=cid,
+                    run_id=metadata["expert_team_run_id"],
+                    team_id=expert_team["id"],
+                    team_name=expert_team["name"],
+                    members=expert_team.get("members", []),
                 )
             await self._handle_message(
                 sender_id=client_id,
@@ -919,6 +988,11 @@ class WebSocketChannel(BaseChannel):
                 model_preset=msg.metadata.get("model_preset"),
             )
             return
+        if msg.metadata.get("_team_member_updated"):
+            member = msg.metadata.get("team_member")
+            if isinstance(member, dict):
+                await self.send_team_member_updated(msg.chat_id, member)
+            return
         # Snapshot the subscriber set so ConnectionClosed cleanups mid-iteration are safe.
         conns = list(self._subs.get(msg.chat_id, ()))
         if not conns:
@@ -955,6 +1029,14 @@ class WebSocketChannel(BaseChannel):
             lat_i = int(lat) if isinstance(lat, (int, float)) else None
             gs = msg.metadata.get("goal_state")
             gs_blob = gs if isinstance(gs, dict) else None
+            team = msg.metadata.get(EXPERT_TEAM_SESSION_KEY)
+            run_id = msg.metadata.get("expert_team_run_id")
+            if isinstance(team, dict) and isinstance(run_id, str):
+                await self.send_team_run_completed(
+                    msg.chat_id,
+                    run_id=run_id,
+                    team_id=str(team.get("id") or ""),
+                )
             await self.send_turn_end(
                 msg.chat_id,
                 latency_ms=lat_i,
@@ -1238,9 +1320,46 @@ class WebSocketChannel(BaseChannel):
         body: dict[str, Any] = {"event": "session_updated", "chat_id": chat_id}
         if scope:
             body["scope"] = scope
+        expert_team = self._session_expert_team(chat_id)
+        if expert_team is not None:
+            body["expert_team"] = expert_team
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" session_updated ")
+
+    async def send_team_run_completed(self, chat_id: str, *, run_id: str, team_id: str) -> None:
+        conns = list(self._subs.get(chat_id, ()))
+        if not conns:
+            return
+        raw = json.dumps({
+            "event": "team_run_completed",
+            "chat_id": chat_id,
+            "run_id": run_id,
+            "team_id": team_id,
+            "status": "completed",
+        }, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" team_run_completed ")
+
+    async def send_team_member_updated(self, chat_id: str, member: dict[str, Any]) -> None:
+        conns = list(self._subs.get(chat_id, ()))
+        if not conns:
+            return
+        raw = json.dumps({
+            "event": "team_member_updated",
+            "chat_id": chat_id,
+            "run_id": member.get("run_id"),
+            "team_id": member.get("team_id"),
+            "member": {
+                "id": member.get("id"),
+                "name": member.get("name"),
+                "status": member.get("status"),
+                "task_id": member.get("task_id"),
+                "activity": member.get("activity"),
+            },
+        }, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" team_member_updated ")
 
     async def send_runtime_model_updated(
         self,

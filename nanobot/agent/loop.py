@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
@@ -95,9 +96,18 @@ def _project_skill_scope(workspace: Path, project_path: Path | str | None, metad
     granted = project_skill_grants(workspace, project_path)
     requested = metadata.get("skill_scope")
     explicit = requested.get("explicit_skills", []) if isinstance(requested, dict) else []
+    expert_team = metadata.get("expert_team")
+    team_skills = [
+        str(item.get("skill")).strip()
+        for item in expert_team.get("data_sources", [])
+        if isinstance(item, dict) and str(item.get("skill") or "").strip()
+    ] if isinstance(expert_team, dict) else []
     return {
-        "project_bound_user_skills": granted,
-        "explicit_skills": list(dict.fromkeys(name for name in explicit if isinstance(name, str))),
+        "project_bound_user_skills": list(dict.fromkeys([*granted, *team_skills])),
+        "explicit_skills": list(dict.fromkeys([
+            *(name for name in explicit if isinstance(name, str)),
+            *team_skills,
+        ])),
     }
 
 class TurnState(Enum):
@@ -161,6 +171,29 @@ class TurnContext:
     turn_latency_ms: int | None = None
 
     trace: list[StateTraceEntry] = field(default_factory=list)
+
+
+def _generated_artifact_paths(messages: list[dict[str, Any]]) -> list[str]:
+    """Extract current-turn structured tool artifacts for automatic delivery."""
+    paths: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.lstrip().startswith("{"):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        files = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(files, list):
+            continue
+        for entry in files:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if isinstance(path, str) and path.strip() and Path(path).is_file():
+                paths.append(path.strip())
+    return list(dict.fromkeys(paths))
 
 
 class AgentLoop:
@@ -680,10 +713,12 @@ class AgentLoop:
         """
         tasks = self._active_tasks.pop(key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        # Cancel subagents before awaiting the main turn. The main turn may be
+        # blocked waiting for those same subagents in _drain_pending.
+        sub_cancelled = await self.subagents.cancel_by_session(key)
         for t in tasks:
             with suppress(asyncio.CancelledError, Exception):
                 await t
-        sub_cancelled = await self.subagents.cancel_by_session(key)
         return cancelled + sub_cancelled
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
@@ -779,35 +814,138 @@ class AgentLoop:
                 user_content = self.context._build_user_content(content, media)
                 return {"role": "user", "content": user_content}
 
-            items: list[dict[str, Any]] = []
-            while len(items) < limit:
+            expert_team_wait = bool(
+                isinstance(metadata, dict)
+                and isinstance(metadata.get("expert_team"), dict)
+            )
+
+            def _is_subagent_result(pending_msg: InboundMessage) -> bool:
+                return bool(
+                    isinstance(pending_msg.metadata, dict)
+                    and pending_msg.metadata.get("injected_event") == "subagent_result"
+                )
+
+            def _announced_task_ids(pending_messages: list[InboundMessage]) -> set[str]:
+                return {
+                    str(msg.metadata.get("subagent_task_id"))
+                    for msg in pending_messages
+                    if _is_subagent_result(msg) and msg.metadata.get("subagent_task_id")
+                }
+
+            def _remaining_unannounced(pending_messages: list[InboundMessage]) -> set[str]:
+                if session is None:
+                    return set()
+                return (
+                    self.subagents.get_running_task_ids_by_session(session.key)
+                    - _announced_task_ids(pending_messages)
+                )
+
+            pending_messages: list[InboundMessage] = []
+            while len(pending_messages) < limit:
                 try:
-                    items.append(_to_user_message(pending_queue.get_nowait()))
+                    pending_messages.append(pending_queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
 
             # Block if nothing drained but sub-agents spawned in this dispatch
             # are still running.  Keeps the runner loop alive so subsequent
             # completions are injected in-order rather than dispatched separately.
-            if (not items
+            if (not pending_messages
                     and session is not None
                     and self.subagents.get_running_count_by_session(session.key) > 0):
                 try:
-                    msg = await asyncio.wait_for(pending_queue.get(), timeout=300)
+                    # A four-role research team can legitimately take longer
+                    # than a single background helper.  Do not resume the Team
+                    # Lead after five minutes while members are still running;
+                    # that causes it to misclassify unfinished members as
+                    # failed.  Keep a finite upper bound for truly hung work.
+                    wait_timeout = 600 if expert_team_wait else 300
+                    msg = await asyncio.wait_for(
+                        pending_queue.get(),
+                        timeout=wait_timeout,
+                    )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Timeout waiting for sub-agent completion in session {}",
                         session.key,
                     )
-                    return items
-                items.append(_to_user_message(msg))
-                while len(items) < limit:
+                    return []
+                pending_messages.append(msg)
+                while len(pending_messages) < limit:
                     try:
-                        items.append(_to_user_message(pending_queue.get_nowait()))
+                        pending_messages.append(pending_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
 
-            return items
+            # A team must be handed to its lead as one internal result bundle. If
+            # each member completion is processed independently, the model tends
+            # to summarize that member and treats the final summary as the whole
+            # turn's answer. Wait for every still-unannounced member here, then
+            # append a deterministic continuation contract below.
+            if expert_team_wait and session is not None and pending_messages:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 600
+                while _remaining_unannounced(pending_messages):
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        logger.warning(
+                            "Timeout batching expert-team results in session {}",
+                            session.key,
+                        )
+                        break
+                    try:
+                        pending_messages.append(await asyncio.wait_for(
+                            pending_queue.get(),
+                            timeout=remaining,
+                        ))
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Timeout waiting for remaining expert-team members in session {}",
+                            session.key,
+                        )
+                        break
+
+                # Consume results that raced with the last awaited announcement.
+                while True:
+                    try:
+                        pending_messages.append(pending_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                result_messages = [msg for msg in pending_messages if _is_subagent_result(msg)]
+                other_messages = [msg for msg in pending_messages if not _is_subagent_result(msg)]
+                items: list[dict[str, Any]] = []
+                if result_messages:
+                    bundle = "\n\n---\n\n".join(msg.content for msg in result_messages)
+                    remaining_ids = _remaining_unannounced(pending_messages)
+                    if remaining_ids:
+                        bundle += (
+                            "\n\n[Expert-team runtime coordination]\n"
+                            "Some team members are still running. Treat the material above as "
+                            "internal evidence only. Do not publish a member summary, do not ask "
+                            "the user what to do, and do not close the workflow; continue waiting "
+                            "for the remaining member deliveries."
+                        )
+                    else:
+                        bundle += (
+                            "\n\n[Expert-team runtime coordination: all members terminal]\n"
+                            "All research members have now completed or exhausted their retry. "
+                            "Do not answer with separate member summaries and do not ask the user "
+                            "whether to continue. Immediately continue the canonical workflow: "
+                            "(1) update member steps from these actual results; (2) mark `team-lead` "
+                            "running and synthesize the completed reports; (3) personally fill any "
+                            "failed dimension from the verified structured data package and the "
+                            "other reports; (4) write the full report artifact; (5) mark `team-lead` "
+                            "completed and `report-audit` running, execute the required data audit "
+                            "and correct material discrepancies; (6) mark `report-audit` completed "
+                            "and only then deliver the final report to the user. A single failed "
+                            "member is a degradable gap, not permission to end the team workflow."
+                        )
+                    items.append({"role": "user", "content": bundle})
+                items.extend(_to_user_message(msg) for msg in other_messages)
+                return items[:limit]
+
+            return [_to_user_message(msg) for msg in pending_messages[:limit]]
 
         active_session_key = session.key if session else session_key
         effective_scope = self.workspace_scopes.for_turn(
@@ -1133,6 +1271,13 @@ class AgentLoop:
                                 leftover, session_key,
                             )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        orphaned = await self.subagents.cancel_by_session(session_key)
+                        if orphaned:
+                            logger.warning(
+                                "Cancelled {} orphaned subagent(s) while finalizing session {}",
+                                orphaned,
+                                session_key,
+                            )
                         await self._runtime_events().run_status_changed(
                             msg, session_key, "idle"
                         )
@@ -1407,6 +1552,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
+            media=_generated_artifact_paths(all_msgs),
             metadata=meta,
         )
 
@@ -1753,7 +1899,7 @@ class AgentLoop:
         ctx.outbound = self._assemble_outbound(
             ctx.msg,
             ctx.final_content,
-            ctx.all_messages,
+            ctx.all_messages[ctx.save_skip:],
             ctx.stop_reason,
             ctx.had_injections,
             ctx.on_stream,

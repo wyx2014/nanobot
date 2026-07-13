@@ -18,6 +18,11 @@ from websockets.http11 import Response
 from nanobot.agent.tools.mcp import request_mcp_reload
 from nanobot.bus.queue import MessageBus
 from nanobot.webui.cli_apps_api import cli_apps_action, cli_apps_payload
+from nanobot.webui.expert_teams import (
+    ExpertTeamError,
+    expert_team_detail_payload,
+    expert_teams_payload,
+)
 from nanobot.webui.http_utils import query_first as _query_first
 from nanobot.webui.mcp_presets_api import mcp_presets_settings_action
 from nanobot.webui.project_skills_api import (
@@ -145,6 +150,10 @@ class WebUISettingsRouter:
             return self._handle_settings_skills_action(request, "delete")
         if path == "/api/settings/skills/save":
             return self._handle_settings_skills_action(request, "save")
+        if path == "/api/settings/expert-teams":
+            return self._handle_settings_expert_teams(request)
+        if path == "/api/settings/expert-teams/detail":
+            return self._handle_settings_expert_team_detail(request)
         if path == "/api/settings/project-skills":
             return self._handle_settings_project_skills(request)
         if path == "/api/settings/project-skills/save":
@@ -460,6 +469,27 @@ class WebUISettingsRouter:
                 self.logger.exception("Skills action '{}' failed", action)
             return self._error_response(status, message)
         return self._json_response(payload)
+
+    def _handle_settings_expert_teams(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            return self._json_response(expert_teams_payload())
+        except Exception:
+            self.logger.exception("failed to load expert teams payload")
+            return self._error_response(500, "failed to load expert teams")
+
+    def _handle_settings_expert_team_detail(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        team_id = (_query_first(self._query(request), "id") or "").strip()
+        try:
+            return self._json_response(expert_team_detail_payload(team_id))
+        except ExpertTeamError as exc:
+            return self._error_response(exc.status, exc.message)
+        except Exception:
+            self.logger.exception("failed to load expert team detail")
+            return self._error_response(500, "failed to load expert team detail")
 
     def _handle_settings_project_skills(self, request: WsRequest) -> Response:
         if not self._authorized(request):

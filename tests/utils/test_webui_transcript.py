@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from nanobot.webui.transcript import (
     WEBUI_TRANSCRIPT_SCHEMA_VERSION,
     WebUITranscriptRecorder,
@@ -721,6 +723,60 @@ def test_build_response_restores_session_users_for_legacy_transcript(
         ("assistant", "assistant one"),
         ("user", "prompt two"),
         ("assistant", "assistant two"),
+    ]
+
+
+def test_build_response_restores_generated_html_from_session_tool_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:legacy-artifact"
+    artifact = tmp_path / "reports" / "company-report.html"
+    artifact.parent.mkdir()
+    artifact.write_text("<!doctype html><title>report</title>", encoding="utf-8")
+    append_transcript_object(
+        key,
+        {"event": "message", "chat_id": "legacy-artifact", "text": "final answer"},
+    )
+    append_transcript_object(key, {"event": "turn_end", "chat_id": "legacy-artifact"})
+
+    out = build_webui_thread_response(
+        key,
+        session_messages=[
+            {"role": "user", "content": "research company"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "write-1", "function": {"name": "write_file"}}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "write-1",
+                "content": json.dumps({"files": [{"path": str(artifact)}]}),
+            },
+            {"role": "assistant", "content": "final answer"},
+        ],
+        augment_assistant_media=lambda paths: [
+            {
+                "url": "/api/media/signed",
+                "local_path": path,
+                "name": artifact.name,
+                "kind": "file",
+            }
+            for path in paths
+        ],
+    )
+
+    assert out is not None
+    assistant = next(message for message in out["messages"] if message["role"] == "assistant")
+    assert assistant["media"] == [
+        {
+            "url": "/api/media/signed",
+            "local_path": str(artifact),
+            "name": "company-report.html",
+            "kind": "file",
+        }
     ]
 
 

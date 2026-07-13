@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
+from nanobot.utils.markdown_html import markdown_write_result, write_html_companion
 
 
 @dataclass(slots=True)
@@ -143,7 +145,7 @@ class ApplyPatchTool(_FsTool):
         edits: list[dict] | None = None,
         dry_run: bool = False,
         **kwargs: Any,
-    ) -> str:
+    ) -> str | dict[str, Any]:
         try:
             if not edits:
                 raise _PatchError("must provide edits")
@@ -283,10 +285,18 @@ class ApplyPatchTool(_FsTool):
                         path.write_bytes(data)
                 raise
 
-            for path in writes:
+            companions: list[Path] = []
+            for path, content in writes.items():
                 self._file_states.record_write(path)
-            return "Patch applied:\n" + "\n".join(
-                _format_summary(summary) for summary in summaries
+                companion = await asyncio.to_thread(write_html_companion, path, content)
+                if companion is not None:
+                    self._file_states.record_write(companion)
+                    companions.append(companion)
+            return markdown_write_result(
+                "Patch applied:\n" + "\n".join(
+                    _format_summary(summary) for summary in summaries
+                ),
+                companions,
             )
         except PermissionError as exc:
             return f"Error: {exc}"

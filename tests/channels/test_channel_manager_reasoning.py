@@ -141,6 +141,40 @@ async def test_legacy_one_shot_reasoning_expands_to_delta_plus_end(manager):
 
 
 @pytest.mark.asyncio
+async def test_streamed_websocket_final_delivers_generated_media(manager):
+    channel = manager.channels["mock"]
+    msg = OutboundMessage(
+        channel="websocket",
+        chat_id="c1",
+        content="完整研究结论",
+        media=["/tmp/report.html"],
+        metadata={"_streamed": True},
+    )
+
+    await manager._send_once(channel, msg)
+
+    channel._send_mock.assert_awaited_once_with(msg)
+
+
+@pytest.mark.asyncio
+async def test_streamed_non_websocket_final_delivers_media_without_duplicate_text(manager):
+    channel = manager.channels["mock"]
+    msg = OutboundMessage(
+        channel="mock",
+        chat_id="c1",
+        content="already streamed",
+        media=["/tmp/report.html"],
+        metadata={"_streamed": True},
+    )
+
+    await manager._send_once(channel, msg)
+
+    sent = channel._send_mock.await_args.args[0]
+    assert sent.content == ""
+    assert sent.media == ["/tmp/report.html"]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_drops_reasoning_when_channel_opts_out(manager):
     channel = manager.channels["mock"]
     channel.show_reasoning = False

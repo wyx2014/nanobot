@@ -368,6 +368,27 @@ class TestAnnounceResult:
 
         assert published[0].metadata["origin_message_id"] == "msg-123"
 
+    @pytest.mark.asyncio
+    async def test_expert_team_result_is_marked_as_internal_delivery(self, tmp_path):
+        sm = _manager(tmp_path)
+        published = []
+        sm.bus.publish_inbound = AsyncMock(side_effect=lambda msg: published.append(msg))
+
+        await sm._announce_result(
+            "t1",
+            "industry-researcher",
+            "research industry",
+            "report body",
+            {"channel": "websocket", "chat_id": "chat-1"},
+            "error",
+            expert_team=True,
+        )
+
+        content = published[0].content
+        assert "Expert-team internal delivery" in content
+        assert "Do not ask the user whether to retry or continue" in content
+        assert "Team Lead synthesis" in content
+
 
 # ---------------------------------------------------------------------------
 # _format_partial_progress
@@ -457,8 +478,48 @@ class TestCancelBySession:
 
         count = await sm.cancel_by_session("s1")
         assert count == 2
+        assert sm.get_running_count() == 0
+        assert sm.get_running_count_by_session("s1") == 0
+        assert "s1" not in sm._session_tasks
         block.set()
         await _drain_subagent_tasks(sm)
+
+    @pytest.mark.asyncio
+    async def test_expert_team_cancel_publishes_cancelled_member_state(self, tmp_path):
+        sm = _manager(tmp_path)
+        started = asyncio.Event()
+
+        async def _slow_run(spec):
+            started.set()
+            await asyncio.Event().wait()
+
+        sm.runner.run = _slow_run
+        await sm.spawn(
+            "research",
+            label="business-analyst",
+            origin_channel="websocket",
+            origin_chat_id="chat-1",
+            session_key="websocket:chat-1",
+            expert_team={
+                "id": "asset-research-team",
+                "members": [{"id": "business-analyst", "name": "商业分析师"}],
+            },
+            expert_team_run_id="run-1",
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        count = await sm.cancel_by_session("websocket:chat-1")
+
+        assert count == 1
+        updates = [
+            await asyncio.wait_for(sm.bus.consume_outbound(), timeout=1.0),
+            await asyncio.wait_for(sm.bus.consume_outbound(), timeout=1.0),
+        ]
+        assert [msg.metadata["team_member"]["status"] for msg in updates] == [
+            "running",
+            "cancelled",
+        ]
+        assert "并发槽位已释放" in updates[-1].metadata["team_member"]["activity"]
 
     @pytest.mark.asyncio
     async def test_no_tasks_returns_zero(self, tmp_path):

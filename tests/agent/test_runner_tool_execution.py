@@ -358,3 +358,46 @@ async def test_runner_blocks_repeated_external_fetches():
         if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_3"
     ][0]
     assert "repeated external lookup blocked" in blocked_tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_runner_finalizes_after_consecutive_repeated_lookup_blocks():
+    provider = MagicMock()
+    normal_calls = {"n": 0}
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        if tools is None:
+            assert "circuit breaker" in messages[-1]["content"]
+            return LLMResponse(
+                content="Final report using already collected evidence.",
+                tool_calls=[],
+                usage={},
+            )
+        normal_calls["n"] += 1
+        return LLMResponse(
+            content="still searching",
+            tool_calls=[ToolCallRequest(
+                id=f"repeat_{normal_calls['n']}",
+                name="web_search",
+                arguments={"query": "same query forever"},
+            )],
+            usage={},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="search result")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "research task"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=20,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "repeated_external_lookup"
+    assert result.final_content == "Final report using already collected evidence."
+    assert normal_calls["n"] == 5
+    assert tools.execute.await_count == 2

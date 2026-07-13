@@ -2065,6 +2065,100 @@ def apply_session_interactive_prompt_states(
     return out
 
 
+def apply_session_generated_artifacts(
+    messages: list[dict[str, Any]],
+    session_messages: list[dict[str, Any]] | None,
+    augment_assistant_media: Callable[[list[str]], list[dict[str, Any]]] | None,
+) -> list[dict[str, Any]]:
+    """Restore generated files when an older streamed final suppressed media delivery.
+
+    Structured filesystem tool results are durable in the canonical session.  Before
+    generated-artifact delivery was stream-aware, however, their files never reached
+    the WebUI display transcript. Match each artifact-producing turn to its final
+    assistant text and attach freshly signed media during replay.
+    """
+    if not messages or not session_messages or augment_assistant_media is None:
+        return messages
+
+    deliveries: list[tuple[str, list[str]]] = []
+    paths: list[str] = []
+    final_text = ""
+
+    def flush() -> None:
+        nonlocal paths, final_text
+        unique = list(dict.fromkeys(paths))
+        if unique and final_text:
+            deliveries.append((final_text, unique))
+        paths = []
+        final_text = ""
+
+    for message in session_messages:
+        role = message.get("role")
+        if role == "user":
+            flush()
+            continue
+        if role == "assistant":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                final_text = content.strip()
+            continue
+        if role != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.lstrip().startswith("{"):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        files = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(files, list):
+            continue
+        for entry in files:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if isinstance(path, str) and path.strip() and Path(path).is_file():
+                paths.append(path.strip())
+    flush()
+
+    if not deliveries:
+        return messages
+    out = [dict(message) for message in messages]
+    for answer, artifact_paths in deliveries:
+        target_index = next(
+            (
+                index
+                for index in range(len(out) - 1, -1, -1)
+                if out[index].get("role") == "assistant"
+                and out[index].get("kind") != "trace"
+                and str(out[index].get("content") or "").strip() == answer
+            ),
+            None,
+        )
+        if target_index is None:
+            continue
+        signed = augment_assistant_media(artifact_paths)
+        if not signed:
+            continue
+        existing = out[target_index].get("media")
+        merged = [dict(item) for item in existing if isinstance(item, dict)] if isinstance(existing, list) else []
+        keys = {
+            str(item.get("local_path") or item.get("url") or item.get("name") or "")
+            for item in merged
+        }
+        for item in signed:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("local_path") or item.get("url") or item.get("name") or "")
+            if key and key in keys:
+                continue
+            merged.append(dict(item))
+            if key:
+                keys.add(key)
+        if merged:
+            out[target_index] = {**out[target_index], "media": merged}
+    return out
+
+
 def build_webui_thread_response(
     session_key: str,
     *,
@@ -2094,6 +2188,7 @@ def build_webui_thread_response(
         augment_assistant_text=augment_assistant_text,
     )
     msgs = apply_session_interactive_prompt_states(msgs, session_messages)
+    msgs = apply_session_generated_artifacts(msgs, session_messages, augment_assistant_media)
     payload = {
         "schemaVersion": WEBUI_TRANSCRIPT_SCHEMA_VERSION,
         "sessionKey": session_key,

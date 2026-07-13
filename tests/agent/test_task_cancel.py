@@ -101,6 +101,41 @@ class TestHandleStop:
         assert all(e.is_set() for e in events)
         assert "2 个任务" in out.content
 
+    @pytest.mark.asyncio
+    async def test_stop_cancels_subagents_before_awaiting_main_task(self):
+        """The main task may be waiting for subagents, so cancel children first."""
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_stop
+        from nanobot.command.router import CommandContext
+
+        loop, _bus = _make_loop()
+        subagents_cancelled = asyncio.Event()
+
+        async def cancel_subagents(_key):
+            subagents_cancelled.set()
+            return 4
+
+        loop.subagents.cancel_by_session = AsyncMock(side_effect=cancel_subagents)
+
+        async def main_waiting_for_children():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Reproduces cleanup that cannot finish until children stop.
+                await subagents_cancelled.wait()
+                raise
+
+        task = asyncio.create_task(main_waiting_for_children())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop")
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/stop", loop=loop)
+
+        out = await asyncio.wait_for(cmd_stop(ctx), timeout=1.0)
+
+        assert subagents_cancelled.is_set()
+        assert "5 个任务" in out.content
+
 
 class TestDispatch:
     def test_exec_tool_not_registered_when_disabled(self):
@@ -123,6 +158,24 @@ class TestDispatch:
         await loop._dispatch(msg)
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert out.content == "hi"
+        loop.subagents.cancel_by_session.assert_awaited_once_with("test:c1")
+
+    @pytest.mark.asyncio
+    async def test_terminal_turn_cleans_up_orphaned_subagents(self):
+        from nanobot.bus.events import InboundMessage, OutboundMessage
+
+        loop, bus = _make_loop()
+        loop.subagents.cancel_by_session = AsyncMock(return_value=4)
+        loop._process_message = AsyncMock(
+            return_value=OutboundMessage(channel="test", chat_id="c1", content="finished")
+        )
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="hello")
+
+        await loop._dispatch(msg)
+
+        out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert out.content == "finished"
+        loop.subagents.cancel_by_session.assert_awaited_once_with("test:c1")
 
     @pytest.mark.asyncio
     async def test_dispatch_streaming_preserves_message_metadata(self):

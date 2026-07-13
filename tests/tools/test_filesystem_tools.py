@@ -435,6 +435,24 @@ class TestWorkspaceRestriction:
         assert (writable / "ok.txt").read_text(encoding="utf-8") == "allowed"
 
     @pytest.mark.asyncio
+    async def test_markdown_write_creates_html_artifact(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        monkeypatch.delenv("NANOBOT_HTML_RENDER_URL", raising=False)
+        monkeypatch.delenv("NANOBOT_HTML_RENDER_TOKEN", raising=False)
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+
+        result = await tool.execute(
+            path=str(workspace / "research.md"),
+            content="# 研究报告\n\n## 结论\n\n这是报告正文。",
+        )
+
+        assert isinstance(result, dict)
+        assert result["files"][0]["path"] == str(workspace / "research.html")
+        assert (workspace / "research.html").is_file()
+        assert "研究报告" in (workspace / "research.html").read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
     async def test_extra_write_allowed_files_allow_only_exact_file(self, tmp_path):
         workspace = tmp_path / "ws"
         workspace.mkdir()

@@ -42,6 +42,14 @@ class SpawnTool(Tool, ContextAware):
             "spawn_origin_message_id",
             default=None,
         )
+        self._expert_team: ContextVar[dict[str, Any] | None] = ContextVar(
+            "spawn_expert_team",
+            default=None,
+        )
+        self._expert_team_run_id: ContextVar[str | None] = ContextVar(
+            "spawn_expert_team_run_id",
+            default=None,
+        )
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
@@ -53,6 +61,10 @@ class SpawnTool(Tool, ContextAware):
         self._origin_chat_id.set(ctx.chat_id)
         self._session_key.set(ctx.session_key or f"{ctx.channel}:{ctx.chat_id}")
         self._origin_message_id.set(ctx.message_id)
+        team = ctx.metadata.get("expert_team")
+        self._expert_team.set(dict(team) if isinstance(team, dict) else None)
+        run_id = ctx.metadata.get("expert_team_run_id")
+        self._expert_team_run_id.set(run_id if isinstance(run_id, str) else None)
 
     @property
     def name(self) -> str:
@@ -76,21 +88,43 @@ class SpawnTool(Tool, ContextAware):
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
-        running = self._manager.get_running_count()
-        limit = self._manager.max_concurrent_subagents
-        if running >= limit:
+        team = self._expert_team.get()
+        team_limit = team.get("requested_concurrency") if isinstance(team, dict) else None
+        limit = (
+            max(1, min(4, int(team_limit)))
+            if isinstance(team_limit, int)
+            else self._manager.max_concurrent_subagents
+        )
+        session_key = self._session_key.get()
+        global_running = self._manager.get_running_count()
+        get_session_count = getattr(self._manager, "get_running_count_by_session", None)
+        session_running = (
+            get_session_count(session_key)
+            if callable(get_session_count)
+            else global_running
+        )
+        global_limit = max(self._manager.max_concurrent_subagents, limit)
+        if session_running >= limit or global_running >= global_limit:
             return (
                 f"Cannot spawn subagent: concurrency limit reached "
-                f"({running}/{limit} running). Wait for a running subagent "
+                f"({session_running}/{limit} in session, {global_running}/{global_limit} total). "
+                f"Wait for a running subagent "
                 f"to complete before spawning a new one."
             )
+        team_kwargs: dict[str, Any] = {}
+        if team is not None:
+            team_kwargs = {
+                "expert_team": team,
+                "expert_team_run_id": self._expert_team_run_id.get(),
+            }
         return await self._manager.spawn(
             task=task,
             label=label,
             origin_channel=self._origin_channel.get(),
             origin_chat_id=self._origin_chat_id.get(),
-            session_key=self._session_key.get(),
+            session_key=session_key,
             origin_message_id=self._origin_message_id.get(),
             temperature=temperature,
             workspace_scope=current_workspace_scope(),
+            **team_kwargs,
         )

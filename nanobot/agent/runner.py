@@ -69,6 +69,7 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+_MAX_CONSECUTIVE_REPEAT_LOOKUP_BLOCKS = 3
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
@@ -364,6 +365,7 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
+        consecutive_repeated_lookup_blocks = 0
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
@@ -453,6 +455,16 @@ class AgentRunner:
                     workspace_violation_counts,
                 )
                 tool_events.extend(new_events)
+                blocked_repeated_lookup = any(
+                    event.get("status") == "error"
+                    and event.get("detail") == "repeated external lookup blocked"
+                    for event in new_events
+                )
+                consecutive_repeated_lookup_blocks = (
+                    consecutive_repeated_lookup_blocks + 1
+                    if blocked_repeated_lookup
+                    else 0
+                )
                 tools_used.extend(
                     tool_call.name
                     for tool_call, event in zip(response.tool_calls, new_events)
@@ -519,6 +531,32 @@ class AgentRunner:
                 )
                 if _drained:
                     had_injections = True
+                if (
+                    not _drained
+                    and consecutive_repeated_lookup_blocks
+                    >= _MAX_CONSECUTIVE_REPEAT_LOOKUP_BLOCKS
+                ):
+                    logger.warning(
+                        "Repeated external lookup circuit breaker triggered for {} "
+                        "after {} consecutive blocked iteration(s)",
+                        spec.session_key or "default",
+                        consecutive_repeated_lookup_blocks,
+                    )
+                    final_content = await self._try_finalize_after_repeated_lookup_loop(
+                        spec,
+                        hook,
+                        messages,
+                        usage,
+                        iteration=iteration,
+                    )
+                    if final_content is None:
+                        final_content = self._max_iterations_fallback(spec)
+                    stop_reason = "repeated_external_lookup"
+                    self._append_final_message(messages, final_content)
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    break
                 await hook.after_iteration(context)
                 continue
 
@@ -932,6 +970,47 @@ class AgentRunner:
         if is_blank_text(clean):
             return None
         return clean
+
+    async def _try_finalize_after_repeated_lookup_loop(
+        self,
+        spec: AgentRunSpec,
+        hook: AgentHook,
+        messages: list[dict[str, Any]],
+        usage: dict[str, int],
+        *,
+        iteration: int,
+    ) -> str | None:
+        finalization_messages = list(messages)
+        finalization_messages.append({
+            "role": "user",
+            "content": (
+                "The repeated external-lookup circuit breaker has stopped further searches. "
+                "Do not call any tools. Complete the requested deliverable now using evidence "
+                "already present in the conversation. Clearly label any unresolved evidence gaps "
+                "instead of retrying, guessing, or claiming a blocked lookup succeeded."
+            ),
+        })
+        try:
+            response = await self._request_no_tools(spec, finalization_messages)
+        except Exception:
+            logger.exception(
+                "Repeated-lookup finalization failed for {}; using fallback",
+                spec.session_key or "default",
+            )
+            return None
+        raw_usage = self._usage_or_estimate(spec, finalization_messages, response)
+        self._accumulate_usage(usage, raw_usage)
+        if response.finish_reason == "error" or response.has_tool_calls:
+            return None
+        final_context = AgentHookContext(
+            iteration=iteration,
+            messages=messages,
+            response=response,
+            usage=dict(raw_usage),
+            session_key=spec.session_key,
+        )
+        clean = hook.finalize_content(final_context, response.content)
+        return None if is_blank_text(clean) else clean
 
     async def _request_no_tools(
         self,
