@@ -1037,6 +1037,8 @@ class WebSocketChannel(BaseChannel):
             lat_i = int(lat) if isinstance(lat, (int, float)) else None
             gs = msg.metadata.get("goal_state")
             gs_blob = gs if isinstance(gs, dict) else None
+            finish_reason = msg.metadata.get("finish_reason")
+            finish_reason_str = finish_reason if isinstance(finish_reason, str) else None
             team = msg.metadata.get(EXPERT_TEAM_SESSION_KEY)
             run_id = msg.metadata.get("expert_team_run_id")
             if isinstance(team, dict) and isinstance(run_id, str):
@@ -1049,6 +1051,7 @@ class WebSocketChannel(BaseChannel):
                 msg.chat_id,
                 latency_ms=lat_i,
                 goal_state=gs_blob,
+                finish_reason=finish_reason_str,
                 metadata=msg.metadata,
             )
             await self.send_session_updated(msg.chat_id, scope="thread")
@@ -1273,6 +1276,7 @@ class WebSocketChannel(BaseChannel):
         latency_ms: int | None = None,
         *,
         goal_state: dict[str, Any] | None = None,
+        finish_reason: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Signal that the agent has fully finished processing the current turn."""
@@ -1282,6 +1286,8 @@ class WebSocketChannel(BaseChannel):
             body["latency_ms"] = int(latency_ms)
         if goal_state is not None:
             body["goal_state"] = goal_state
+        if finish_reason:
+            body["finish_reason"] = finish_reason
         self._transcripts.prepare_and_append(
             chat_id,
             body,

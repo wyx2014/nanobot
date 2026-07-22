@@ -1388,6 +1388,26 @@ async def test_send_turn_end_includes_latency_ms_when_present() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_turn_end_includes_cancelled_finish_reason() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={"_turn_end": True, "finish_reason": "cancelled"},
+    ))
+
+    assert _sent_ws_payloads(mock_ws) == [
+        {"event": "turn_end", "chat_id": "chat-1", "finish_reason": "cancelled"},
+        {"event": "session_updated", "chat_id": "chat-1", "scope": "thread"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_send_turn_end_includes_goal_state_when_present() -> None:
     bus = MagicMock()
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))

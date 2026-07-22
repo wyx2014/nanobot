@@ -377,6 +377,9 @@ class WebuiTurnCoordinator:
         turn_metadata: dict[str, Any] = {**msg.metadata, "_turn_end": True}
         if latency_ms is not None:
             turn_metadata["latency_ms"] = int(latency_ms)
+        finish_reason = msg.metadata.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            turn_metadata["finish_reason"] = finish_reason
         session = self.sessions.get_or_create(session_key)
         turn_metadata["goal_state"] = goal_state_ws_blob(session.metadata)
         await self.bus.publish_outbound(OutboundMessage(
@@ -385,7 +388,8 @@ class WebuiTurnCoordinator:
             content="",
             metadata=turn_metadata,
         ))
-        self._schedule_title_update(msg, session_key=session_key)
+        if turn_metadata.get("finish_reason") != "cancelled":
+            self._schedule_title_update(msg, session_key=session_key)
 
     def _schedule_title_update(self, msg: InboundMessage, *, session_key: str) -> None:
         title_context = self._title_contexts.pop(session_key, None)

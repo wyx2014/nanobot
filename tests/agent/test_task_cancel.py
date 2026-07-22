@@ -138,6 +138,31 @@ class TestHandleStop:
 
 
 class TestDispatch:
+    @pytest.mark.asyncio
+    async def test_cancelled_websocket_turn_emits_terminal_completion(self):
+        """A /stop cancellation must close WebSocket stream state, not just the task."""
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.runtime_events import TurnCompleted
+
+        loop, _bus = _make_loop()
+        seen: list[object] = []
+        loop._runtime_events().bus.subscribe(seen.append)
+        loop._process_message = AsyncMock(side_effect=asyncio.CancelledError())
+        msg = InboundMessage(
+            channel="websocket",
+            sender_id="u1",
+            chat_id="chat-1",
+            content="long-running task",
+            metadata={"webui": True},
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await loop._dispatch(msg)
+
+        completed = [event for event in seen if isinstance(event, TurnCompleted)]
+        assert len(completed) == 1
+        assert completed[0].context.metadata["finish_reason"] == "cancelled"
+
     def test_exec_tool_not_registered_when_disabled(self):
         from nanobot.agent.tools.shell import ExecToolConfig
         from nanobot.config.schema import ToolsConfig

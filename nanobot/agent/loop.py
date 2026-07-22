@@ -1381,6 +1381,17 @@ class AgentLoop:
                             session_key,
                             exc_info=True,
                         )
+                    # A cancelled WebSocket turn still needs the same terminal
+                    # delivery contract as a completed/error turn.  Without it,
+                    # browser clients retain open reasoning placeholders until a
+                    # later event happens to close them.
+                    if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        await self._runtime_events().turn_completed(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            session_key=session_key,
+                            metadata={**msg.metadata, "finish_reason": "cancelled"},
+                        )
                     raise
                 except Exception as exc:
                     dispatch_failed = True
