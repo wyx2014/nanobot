@@ -78,6 +78,14 @@ _SVG_MEDIA_HEADERS: tuple[tuple[str, str], ...] = (
         "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
     ),
 )
+_HTML_MEDIA_HEADERS: tuple[tuple[str, str], ...] = (
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; connect-src 'none'; img-src data: blob:; "
+        "font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+        "sandbox allow-scripts",
+    ),
+)
 
 _BYTE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
@@ -160,13 +168,17 @@ def _artifact_attachment(
 ) -> dict[str, Any]:
     name = display_name or path.name
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    preview_url = f"{signed_url}?preview=1" if mime == "text/html" else signed_url
     try:
         size = path.stat().st_size
     except OSError:
         size = None
     return {
-        "url": signed_url,
+        "url": preview_url,
         "download_url": f"{signed_url}?download=1",
+        # Desktop renderers need the original path to support Finder reveal.
+        # The URL remains the source for content delivery and preview.
+        "local_path": str(path),
         "name": name,
         "kind": media_attachment_kind(name),
         "mime_type": mime,
@@ -261,10 +273,14 @@ def serve_signed_media(
     if not candidate.is_file():
         return _http_error(404, "not found")
 
-    mime, _ = mimetypes.guess_type(candidate.name)
-    if mime not in _MEDIA_ALLOWED_MIMES:
-        mime = "application/octet-stream"
     request_query = parse_qs(urlparse(request.path).query) if request else {}
+    mime, _ = mimetypes.guess_type(candidate.name)
+    html_preview = (
+        mime == "text/html"
+        and request_query.get("preview") == ["1"]
+    )
+    if mime not in _MEDIA_ALLOWED_MIMES and not html_preview:
+        mime = "application/octet-stream"
     disposition = "attachment" if request_query.get("download") == ["1"] else "inline"
     encoded_name = quote(candidate.name, safe="")
     common_headers = [
@@ -275,6 +291,13 @@ def serve_signed_media(
     ]
     if mime == "image/svg+xml":
         common_headers.extend(_SVG_MEDIA_HEADERS)
+    elif mime == "text/html":
+        # Generated reports intentionally support self-contained inline
+        # scripts (charts and table interactions), but they run in an opaque
+        # sandboxed origin with networking, forms, popups, and navigation
+        # disabled. This keeps the preview useful without granting it access
+        # to the gateway origin.
+        common_headers.extend(_HTML_MEDIA_HEADERS)
     try:
         size = candidate.stat().st_size
     except OSError:

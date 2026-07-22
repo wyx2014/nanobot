@@ -48,6 +48,7 @@ _MAX_TEST_TOOLS = 16
 _DEFAULT_TEST_TIMEOUT = 20
 _DEFAULT_CUSTOM_TIMEOUT = 30
 _CUSTOM_ACTIONS = {"custom", "import", "import-cursor", "tools"}
+PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.78"
 
 McpReload = Callable[[], Awaitable[dict[str, Any]]]
 
@@ -134,7 +135,8 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
         server=MCPServerConfig(
             type="stdio",
             command="npx",
-            args=["-y", "@playwright/mcp@latest"],
+            args=["-y", PLAYWRIGHT_MCP_PACKAGE],
+            connect_timeout=15,
             tool_timeout=60,
         ),
     ),

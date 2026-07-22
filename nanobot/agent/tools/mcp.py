@@ -939,6 +939,10 @@ async def connect_mcp_servers(
             )
             return name, server_stack
 
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await server_stack.aclose()
+            raise
         except Exception as e:
             hint = ""
             text = str(e).lower()
@@ -965,7 +969,19 @@ async def connect_mcp_servers(
 
     for name, cfg in mcp_servers.items():
         try:
-            result = await connect_single_server(name, cfg)
+            connect_timeout = max(1, int(getattr(cfg, "connect_timeout", 15)))
+            # ``asyncio.timeout`` keeps the transport in the current task.
+            # MCP stdio uses AnyIO cancel scopes that must be closed by the
+            # same task that opened them.
+            async with asyncio.timeout(connect_timeout):
+                result = await connect_single_server(name, cfg)
+        except TimeoutError:
+            logger.warning(
+                "MCP server '{}' connection timed out after {}s; continuing without it",
+                name,
+                connect_timeout,
+            )
+            continue
         except Exception as e:
             logger.exception("MCP server '{}' connection failed: {}", name, e)
             continue
@@ -1058,6 +1074,7 @@ async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
     except asyncio.CancelledError:
         logger.warning("MCP connection cancelled (will retry next message)")
         state._mcp_connected = bool(state._mcp_stacks)
+        raise
     except BaseException as e:
         logger.warning("Failed to connect MCP servers (will retry next message): {}", e)
         state._mcp_connected = bool(state._mcp_stacks)

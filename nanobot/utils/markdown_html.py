@@ -33,7 +33,7 @@ def _title(markdown: str, source: Path) -> str:
     return source.stem.replace("_", " ").replace("-", " ").strip() or "Document"
 
 
-def _desktop_html(markdown: str, title: str) -> str | None:
+def _desktop_html(markdown: str, title: str, source: Path) -> str | None:
     url = os.environ.get("NANOBOT_HTML_RENDER_URL")
     token = os.environ.get("NANOBOT_HTML_RENDER_TOKEN")
     if not url or not token or not url.startswith("http://127.0.0.1:"):
@@ -41,7 +41,7 @@ def _desktop_html(markdown: str, title: str) -> str | None:
     try:
         request = Request(
             url,
-            data=json.dumps({"markdown": markdown, "title": title}).encode(),
+            data=json.dumps({"markdown": markdown, "title": title, "source_path": str(source)}).encode(),
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
         )
@@ -85,7 +85,7 @@ def write_html_companion(source: Path, markdown: str) -> Path | None:
         except OSError:
             return None
     title = _title(markdown, source)
-    rendered = _desktop_html(markdown, title) or _fallback_html(markdown, title)
+    rendered = _desktop_html(markdown, title, source) or _fallback_html(markdown, title)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(rendered, encoding="utf-8")
     return output

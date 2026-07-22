@@ -1550,8 +1550,41 @@ def replay_transcript_to_ui_messages(
             "interactivePrompt": prompt,
         }
 
-    def absorb_complete(extra: dict[str, Any], idx: int) -> None:
+    def absorb_complete(
+        extra: dict[str, Any],
+        idx: int,
+        *,
+        replace_stream: bool = False,
+    ) -> None:
         nonlocal active_activity_segment_id, active_file_edit_segment_id
+        for message_index in range(len(messages) - 1, -1, -1):
+            candidate = messages[message_index]
+            if candidate.get("role") == "user":
+                break
+            if candidate.get("role") != "assistant" or candidate.get("kind") == "trace":
+                continue
+            exact_stream_replay = (
+                candidate.get("isStreaming") is True
+                and bool(str(candidate.get("content") or ""))
+                and candidate.get("content") == extra.get("content")
+            )
+            if (
+                _same_turn(candidate, extra)
+                and (replace_stream or exact_stream_replay)
+            ):
+                messages[message_index] = {
+                    **candidate,
+                    **extra,
+                    "id": candidate.get("id"),
+                    "role": "assistant",
+                    "createdAt": candidate.get("createdAt"),
+                    "isStreaming": False,
+                    "reasoningStreaming": False,
+                }
+                active_activity_segment_id = None
+                active_file_edit_segment_id = None
+                return
+            break
         last = messages[-1] if messages else None
         if last and is_reasoning_only_placeholder(last) and _same_turn(last, extra):
             messages[-1] = {
@@ -1941,7 +1974,11 @@ def replay_transcript_to_ui_messages(
                 extra["latencyMs"] = int(lat)
             extra.update(_turn_fields(rec, "answer"))
             extra.update(_source_fields(rec))
-            absorb_complete(extra, idx)
+            absorb_complete(
+                extra,
+                idx,
+                replace_stream=rec.get("replace_stream") is True,
+            )
             if interactive_prompt is not None:
                 record_prompt_index(interactive_prompt)
             if media:

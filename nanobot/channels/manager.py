@@ -59,6 +59,8 @@ class ChannelManager:
         session_manager: "SessionManager | None" = None,
         cron_service: Any | None = None,
         webui_runtime_model_name: Callable[[], str | None] | None = None,
+        webui_runtime_ready: Callable[[], bool] | None = None,
+        webui_runtime_mcp_status: Callable[[], str] | None = None,
         webui_cron_pending_job_ids: Callable[[str], set[str]] | None = None,
         webui_static_dist: bool = True,
         webui_runtime_surface: str = "browser",
@@ -69,6 +71,8 @@ class ChannelManager:
         self._session_manager = session_manager
         self._cron_service = cron_service
         self._webui_runtime_model_name = webui_runtime_model_name
+        self._webui_runtime_ready = webui_runtime_ready
+        self._webui_runtime_mcp_status = webui_runtime_mcp_status
         self._webui_cron_pending_job_ids = webui_cron_pending_job_ids
         self._webui_static_dist = webui_static_dist
         self._webui_runtime_surface = webui_runtime_surface
@@ -126,6 +130,8 @@ class ChannelManager:
                         default_restrict_to_workspace=self.config.tools.restrict_to_workspace,
                         disabled_skills=set(self.config.agents.defaults.disabled_skills),
                         runtime_model_name=self._webui_runtime_model_name,
+                        runtime_ready=self._webui_runtime_ready,
+                        runtime_mcp_status=self._webui_runtime_mcp_status,
                         runtime_surface=self._webui_runtime_surface,
                         runtime_capabilities_overrides=self._webui_runtime_capabilities,
                         cron_service=self._cron_service,
@@ -354,6 +360,12 @@ class ChannelManager:
 
                 if (
                     msg.metadata.get("_runtime_model_updated")
+                    and msg.channel == "websocket"
+                    and "websocket" not in self.channels
+                ):
+                    continue
+                if (
+                    msg.metadata.get("_runtime_status_updated")
                     and msg.channel == "websocket"
                     and "websocket" not in self.channels
                 ):

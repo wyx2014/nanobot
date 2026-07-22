@@ -570,6 +570,99 @@ async def test_injection_cycles_capped_at_max():
 
 
 @pytest.mark.asyncio
+async def test_expert_team_injections_can_continue_past_normal_cycle_cap():
+    """Active expert teams may consume later-phase results beyond five rounds."""
+    from nanobot.agent.runner import _MAX_INJECTION_CYCLES, AgentRunner, AgentRunSpec
+    from nanobot.bus.events import InboundMessage
+
+    provider = MagicMock()
+    call_count = {"n": 0}
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        return LLMResponse(content=f"answer-{call_count['n']}", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    total_injections = _MAX_INJECTION_CYCLES + 3
+    drain_count = {"n": 0}
+
+    async def inject_cb():
+        drain_count["n"] += 1
+        if drain_count["n"] <= total_injections:
+            return [InboundMessage(
+                channel="system",
+                sender_id="subagent",
+                chat_id="c",
+                content=f"team-result-{drain_count['n']}",
+            )]
+        return []
+
+    def team_work_pending() -> bool:
+        return drain_count["n"] < total_injections
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "start team"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=20,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        injection_callback=inject_cb,
+        injection_overflow_predicate=team_work_pending,
+    ))
+
+    assert result.had_injections is True
+    assert call_count["n"] == total_injections + 1
+    assert result.final_content == f"answer-{total_injections + 1}"
+    assert any(
+        message.get("role") == "user"
+        and message.get("content") == f"team-result-{total_injections}"
+        for message in result.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_response_guard_keeps_runner_alive_until_completion():
+    """A trusted completion guard may reject a premature final response."""
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock()
+    call_count = {"n": 0}
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        return LLMResponse(content=f"answer-{call_count['n']}", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    guard_count = {"n": 0}
+
+    def guard(messages):
+        guard_count["n"] += 1
+        return "continue final delivery" if guard_count["n"] == 1 else None
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "create report"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        final_response_guard=guard,
+    ))
+
+    assert call_count["n"] == 2
+    assert result.final_content == "answer-2"
+    assert any(
+        message.get("role") == "user"
+        and message.get("content") == "continue final delivery"
+        for message in result.messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_injections_flag_is_false_by_default():
     """had_injections should be False when no injection callback or no messages."""
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
@@ -615,6 +708,34 @@ async def test_pending_queue_cleanup_on_dispatch(tmp_path):
 
     # The queue should be cleaned up after dispatch
     assert msg.session_key not in loop._pending_queues
+
+
+@pytest.mark.asyncio
+async def test_dispatch_preserves_running_expert_team_after_early_final_response(tmp_path):
+    """A normal early answer must not cancel unfinished expert-team members."""
+    from nanobot.bus.events import InboundMessage, OutboundMessage
+
+    loop = _make_loop(tmp_path)
+    loop._process_message = AsyncMock(return_value=OutboundMessage(
+        channel="websocket",
+        chat_id="c",
+        content="等待团队成员完成...",
+    ))
+    loop.subagents.get_running_count_by_session.return_value = 3
+    loop.sessions.get_or_create.return_value.metadata = {
+        "expert_team": {"id": "trading-analysis-team"},
+    }
+
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u",
+        chat_id="c",
+        content="分析股票",
+        metadata={"expert_team": {"id": "trading-analysis-team"}},
+    )
+    await loop._dispatch(msg)
+
+    loop.subagents.cancel_by_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio

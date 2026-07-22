@@ -110,6 +110,76 @@ def _project_skill_scope(workspace: Path, project_path: Path | str | None, metad
         ])),
     }
 
+
+def _expert_team_binding(
+    message_metadata: dict[str, Any] | None,
+    session_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the active expert-team binding from the message or session."""
+    for metadata in (message_metadata, session_metadata):
+        if not isinstance(metadata, dict):
+            continue
+        team = metadata.get("expert_team")
+        if isinstance(team, dict):
+            return team
+    return None
+
+
+def _tool_call_names(messages: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+    return names
+
+
+def _expert_team_completion_guard_message(
+    team: dict[str, Any] | None,
+    messages: list[dict[str, Any]],
+) -> str | None:
+    """Keep a report-producing team alive until required delivery tools ran."""
+    completion = team.get("completion") if isinstance(team, dict) else None
+    if not isinstance(completion, dict):
+        return None
+    required = [
+        str(item).strip()
+        for item in completion.get("required_tools", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    if not required:
+        return None
+    called = _tool_call_names(messages)
+    missing = [name for name in required if name not in called]
+    if not missing:
+        return None
+    artifacts = [
+        str(item).strip().lower().lstrip(".")
+        for item in completion.get("required_artifacts", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    custom = str(completion.get("instruction") or "").strip()
+    delivery = ", ".join(artifacts) if artifacts else "the required final artifacts"
+    missing_tools = ", ".join(f"`{name}`" for name in missing)
+    return (
+        "[Expert-team completion guard]\n"
+        "The expert-team workflow is not complete yet. Do not give the user a short "
+        "member summary and do not end the turn. Continue with Team Lead synthesis "
+        "and report audit, then produce and verify "
+        f"{delivery}. Required delivery tool(s) not yet attempted: {missing_tools}. "
+        "Use `write_file` for the final Markdown source; do not use `write_stdin` to "
+        "wait for spawn task ids. If a renderer fails after a real attempt, preserve "
+        "the successful artifacts and disclose the failure in the final response."
+        + (f"\n\nTeam-specific instruction:\n{custom}" if custom else "")
+    )
+
+
 class TurnState(Enum):
     RESTORE = auto()
     COMPACT = auto()
@@ -354,6 +424,9 @@ class AgentLoop:
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._mcp_warmup_complete = not bool(self._mcp_servers)
+        self._mcp_owner_task: asyncio.Task[None] | None = None
+        self._mcp_shutdown_event: asyncio.Event | None = None
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -569,6 +642,45 @@ class AgentLoop:
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
         await agent_context.connect_mcp(self, self.tools)
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether the loop can consume and dispatch inbound messages."""
+        return self._running
+
+    @property
+    def mcp_status(self) -> str:
+        """Compact startup status exposed to native/WebUI clients."""
+        if not self._mcp_servers:
+            return "disabled"
+        if self._mcp_connecting or (
+            self._mcp_owner_task is not None and not self._mcp_warmup_complete
+        ):
+            return "warming"
+        if self._mcp_connected:
+            return "ready"
+        return "unavailable" if self._mcp_warmup_complete else "pending"
+
+    async def _run_mcp_owner(self) -> None:
+        """Own startup MCP transports for their complete async lifecycle."""
+        try:
+            await self._connect_mcp()
+            self._mcp_warmup_complete = True
+            await self.bus.publish_outbound(OutboundMessage(
+                channel="websocket",
+                chat_id="",
+                content="",
+                metadata={
+                    "_runtime_status_updated": True,
+                    "agent_ready": self.is_ready,
+                    "mcp_status": self.mcp_status,
+                },
+            ))
+            if self._mcp_shutdown_event is not None:
+                await self._mcp_shutdown_event.wait()
+        finally:
+            self._mcp_warmup_complete = True
+            await self._close_mcp_stacks()
 
     def _set_tool_context(
         self, channel: str, chat_id: str,
@@ -814,10 +926,10 @@ class AgentLoop:
                 user_content = self.context._build_user_content(content, media)
                 return {"role": "user", "content": user_content}
 
-            expert_team_wait = bool(
-                isinstance(metadata, dict)
-                and isinstance(metadata.get("expert_team"), dict)
-            )
+            expert_team_wait = _expert_team_binding(
+                metadata,
+                session.metadata if session is not None else None,
+            ) is not None
 
             def _is_subagent_result(pending_msg: InboundMessage) -> bool:
                 return bool(
@@ -979,6 +1091,25 @@ class AgentLoop:
             )
 
         session_metadata = session.metadata if session is not None else None
+        expert_team = _expert_team_binding(metadata, session_metadata)
+        expert_team_active = expert_team is not None
+        expert_team_completion = (
+            expert_team.get("completion")
+            if isinstance(expert_team, dict)
+            and isinstance(expert_team.get("completion"), dict)
+            else None
+        )
+        initial_message_count = len(initial_messages)
+
+        def _expert_team_injections_pending() -> bool:
+            """Allow team results past the normal cycle cap while work is active."""
+            if not expert_team_active or pending_queue is None or session is None:
+                return False
+            return (
+                not pending_queue.empty()
+                or self.subagents.get_running_count_by_session(session.key) > 0
+            )
+
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
@@ -999,6 +1130,19 @@ class AgentLoop:
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
+                injection_overflow_predicate=(
+                    _expert_team_injections_pending if expert_team_active else None
+                ),
+                final_response_guard=(
+                    (
+                        lambda messages: _expert_team_completion_guard_message(
+                            expert_team,
+                            messages[initial_message_count:],
+                        )
+                    )
+                    if expert_team_completion is not None
+                    else None
+                ),
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
                 llm_timeout_s=runner_wall_llm_timeout_s(
@@ -1041,10 +1185,15 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
+        self._mcp_shutdown_event = asyncio.Event()
+        if self._mcp_servers:
+            self._mcp_warmup_complete = False
+            self._mcp_owner_task = asyncio.create_task(
+                self._run_mcp_owner(),
+                name="nanobot-mcp-warmup",
+            )
+        logger.info("Agent loop started")
         try:
-            await self._connect_mcp()
-            logger.info("Agent loop started")
-
             while self._running:
                 try:
                     msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
@@ -1126,7 +1275,7 @@ class AgentLoop:
                     else None
                 )
         finally:
-            # MCP stdio transports use AnyIO cancel scopes; close them from the task that opened them.
+            self._running = False
             await self.close_mcp()
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -1138,6 +1287,7 @@ class AgentLoop:
         gate = self._concurrency_gate or nullcontext()
 
         pending: asyncio.Queue | None = None
+        dispatch_failed = False
         try:
             async with lock, gate:
                 # Only the task that owns the session lock may publish the
@@ -1202,6 +1352,7 @@ class AgentLoop:
                         )
                     self._cron_turns.complete(msg, response=response)
                 except asyncio.CancelledError:
+                    dispatch_failed = True
                     self._cron_turns.complete(
                         msg,
                         error=asyncio.CancelledError(),
@@ -1232,6 +1383,7 @@ class AgentLoop:
                         )
                     raise
                 except Exception as exc:
+                    dispatch_failed = True
                     logger.exception("Error processing message for session {}", session_key)
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -1271,13 +1423,47 @@ class AgentLoop:
                                 leftover, session_key,
                             )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
-                        orphaned = await self.subagents.cancel_by_session(session_key)
-                        if orphaned:
+                        running_count = self.subagents.get_running_count_by_session(
+                            session_key
+                        )
+                        running_subagents = (
+                            running_count if isinstance(running_count, int) else 0
+                        )
+                        session_metadata = None
+                        try:
+                            session_metadata = self.sessions.get_or_create(
+                                session_key
+                            ).metadata
+                        except Exception:
+                            logger.debug(
+                                "Could not inspect expert-team session metadata for {}",
+                                session_key,
+                                exc_info=True,
+                            )
+                        preserve_expert_team = (
+                            not dispatch_failed
+                            and running_subagents > 0
+                            and _expert_team_binding(
+                                msg.metadata,
+                                session_metadata,
+                            ) is not None
+                        )
+                        if preserve_expert_team:
                             logger.warning(
-                                "Cancelled {} orphaned subagent(s) while finalizing session {}",
-                                orphaned,
+                                "Preserving {} running expert-team subagent(s) after "
+                                "an early main-turn final response in session {}",
+                                running_subagents,
                                 session_key,
                             )
+                        else:
+                            orphaned = await self.subagents.cancel_by_session(session_key)
+                            if orphaned:
+                                logger.warning(
+                                    "Cancelled {} orphaned subagent(s) while finalizing "
+                                    "session {}",
+                                    orphaned,
+                                    session_key,
+                                )
                         await self._runtime_events().run_status_changed(
                             msg, session_key, "idle"
                         )
@@ -1291,17 +1477,31 @@ class AgentLoop:
                 self._runtime_events().clear_turn(session_key)
                 await self._cron_turns.publish_next_deferred(session_key)
 
-    async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()
-        for name, stack in self._mcp_stacks.items():
+    async def _close_mcp_stacks(self) -> None:
+        """Close live MCP transports from their owning task."""
+        for name, stack in list(self._mcp_stacks.items()):
             try:
                 await stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
         self._mcp_stacks.clear()
+        self._mcp_connected = False
+
+    async def close_mcp(self) -> None:
+        """Drain background work and stop the startup MCP owner task."""
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+        owner = self._mcp_owner_task
+        if owner is not None and owner is not asyncio.current_task():
+            if self._mcp_shutdown_event is not None:
+                self._mcp_shutdown_event.set()
+            await asyncio.gather(owner, return_exceptions=True)
+            if self._mcp_owner_task is owner:
+                self._mcp_owner_task = None
+            self._mcp_shutdown_event = None
+            return
+        await self._close_mcp_stacks()
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

@@ -401,3 +401,52 @@ async def test_runner_finalizes_after_consecutive_repeated_lookup_blocks():
     assert result.final_content == "Final report using already collected evidence."
     assert normal_calls["n"] == 5
     assert tools.execute.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_finalizes_after_consecutive_identical_local_reads():
+    provider = MagicMock()
+    normal_calls = {"n": 0}
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        if tools is None:
+            assert "circuit breaker" in messages[-1]["content"]
+            return LLMResponse(
+                content="Stopped the loop and reported the missing evidence.",
+                tool_calls=[],
+                usage={},
+            )
+        normal_calls["n"] += 1
+        return LLMResponse(
+            content="checking the helper again",
+            tool_calls=[ToolCallRequest(
+                id=f"repeat_local_{normal_calls['n']}",
+                name="read_file",
+                arguments={"path": "/workspace/skills/ifind-finance-data/call-node.js"},
+            )],
+            usage={},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="[File unchanged since last read]")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "research task"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=20,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "repeated_local_tool_call"
+    assert result.final_content == "Stopped the loop and reported the missing evidence."
+    assert normal_calls["n"] == 5
+    assert tools.execute.await_count == 2
+    blocked_results = [
+        msg["content"] for msg in result.messages
+        if msg.get("role") == "tool"
+        and "repeated local tool call blocked" in str(msg.get("content"))
+    ]
+    assert len(blocked_results) == 3

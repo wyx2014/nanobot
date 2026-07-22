@@ -131,6 +131,53 @@ def test_pdf_media_metadata_and_inline_download_disposition(tmp_path: Path) -> N
     assert download.headers["Content-Disposition"].startswith("attachment;")
 
 
+def test_html_media_uses_browser_preview_url_and_sandboxed_inline_response(
+    tmp_path: Path,
+) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    target = media / "研究报告.html"
+    target.write_text(
+        "<!doctype html><title>报告</title><script>document.body.dataset.ready='1'</script>",
+        encoding="utf-8",
+    )
+    secret = b"artifact-secret"
+    media_dir = lambda _channel=None: media
+
+    attachment = sign_or_stage_media_path(target, secret=secret, media_dir=media_dir)
+
+    assert attachment is not None
+    assert attachment["url"].startswith("/api/media/")
+    assert attachment["url"].endswith("?preview=1")
+    signed_path = attachment["url"].split("?", 1)[0]
+    assert attachment["download_url"] == f"{signed_path}?download=1"
+
+    _prefix, _api, _media, sig, payload = signed_path.split("/", 4)
+    preview = serve_signed_media(
+        sig,
+        payload,
+        secret=secret,
+        request=MagicMock(path=attachment["url"], headers={}),
+        media_dir=media_dir,
+    )
+
+    assert preview.status_code == 200
+    assert preview.headers["Content-Type"] == "text/html"
+    assert preview.headers["Content-Disposition"].startswith("inline;")
+    csp = preview.headers["Content-Security-Policy"]
+    assert "connect-src 'none'" in csp
+    assert "sandbox allow-scripts" in csp
+
+    download = serve_signed_media(
+        sig,
+        payload,
+        secret=secret,
+        request=MagicMock(path=attachment["download_url"], headers={}),
+        media_dir=media_dir,
+    )
+    assert download.headers["Content-Disposition"].startswith("attachment;")
+
+
 async def _http_get(
     url: str, headers: dict[str, str] | None = None
 ) -> httpx.Response:

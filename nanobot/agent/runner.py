@@ -54,6 +54,7 @@ from nanobot.utils.runtime import (
     is_blank_text,
     normalize_tool_message_content,
     repeated_external_lookup_error,
+    repeated_local_lookup_error,
     repeated_workspace_violation_error,
 )
 
@@ -113,6 +114,8 @@ class AgentRunSpec:
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    injection_overflow_predicate: Callable[[], bool] | None = None
+    final_response_guard: Callable[[list[dict[str, Any]]], str | None] | None = None
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
@@ -189,23 +192,48 @@ class AgentRunner:
         phase: str = "after error",
         iteration: int | None = None,
         allow_goal_continue: bool = False,
+        allow_final_response_guard: bool = False,
     ) -> tuple[bool, int]:
         """Drain pending injections. Returns (should_continue, updated_cycles).
 
-        If injections are found and we haven't exceeded _MAX_INJECTION_CYCLES,
-        append them to *messages* (and emit a checkpoint if *assistant_message*
-        and *iteration* are both provided) and return (True, cycles+1) so the
-        caller continues the iteration loop.  Otherwise return (False, cycles).
+        If injections are found before the normal cycle cap, or an explicit
+        overflow predicate says trusted work is still pending, append them to
+        *messages* (and emit a checkpoint if *assistant_message* and *iteration*
+        are both provided) and return (True, cycles+1) so the caller continues
+        the iteration loop. Otherwise return (False, cycles).
         """
         injections: list[dict[str, Any]] = []
         real_injection = False
-        if injection_cycles < _MAX_INJECTION_CYCLES:
+        guard_injection = False
+        allow_overflow = False
+        if injection_cycles >= _MAX_INJECTION_CYCLES:
+            predicate = spec.injection_overflow_predicate
+            if predicate is not None:
+                try:
+                    allow_overflow = bool(predicate())
+                except Exception:
+                    logger.exception("injection_overflow_predicate callback failed")
+        if injection_cycles < _MAX_INJECTION_CYCLES or allow_overflow:
             injections = await self._drain_injections(spec)
             real_injection = bool(injections)
         if not injections and allow_goal_continue and assistant_message is not None:
             predicate = spec.goal_active_predicate
             if predicate is not None and predicate():
                 injections = [self._build_goal_continue_message(spec)]
+        if (
+            not injections
+            and allow_final_response_guard
+            and assistant_message is not None
+            and spec.final_response_guard is not None
+        ):
+            try:
+                guard_message = spec.final_response_guard([*messages, assistant_message])
+            except Exception:
+                logger.exception("final_response_guard callback failed")
+                guard_message = None
+            if guard_message and guard_message.strip():
+                injections = [{"role": "user", "content": guard_message.strip()}]
+                guard_injection = True
         if not injections:
             return False, injection_cycles
         if real_injection:
@@ -226,10 +254,22 @@ class AgentRunner:
                 )
         self._append_injected_messages(messages, injections)
         if real_injection:
-            logger.info(
-                "Injected {} follow-up message(s) {} ({}/{})",
-                len(injections), phase, injection_cycles, _MAX_INJECTION_CYCLES,
-            )
+            if injection_cycles > _MAX_INJECTION_CYCLES:
+                logger.info(
+                    "Injected {} expert-team follow-up message(s) {} "
+                    "({}; normal cycle cap {})",
+                    len(injections),
+                    phase,
+                    injection_cycles,
+                    _MAX_INJECTION_CYCLES,
+                )
+            else:
+                logger.info(
+                    "Injected {} follow-up message(s) {} ({}/{})",
+                    len(injections), phase, injection_cycles, _MAX_INJECTION_CYCLES,
+                )
+        elif guard_injection:
+            logger.info("Injected final-response completion guard {}", phase)
         else:
             logger.info("Injected sustained-goal continuation {}", phase)
         return True, injection_cycles
@@ -365,7 +405,9 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
+        local_lookup_state: dict[str, Any] = {}
         consecutive_repeated_lookup_blocks = 0
+        repeated_block_kind: str | None = None
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
@@ -453,13 +495,28 @@ class AgentRunner:
                     response.tool_calls,
                     external_lookup_counts,
                     workspace_violation_counts,
+                    local_lookup_state,
                 )
                 tool_events.extend(new_events)
-                blocked_repeated_lookup = any(
+                blocked_repeated_external_lookup = any(
                     event.get("status") == "error"
                     and event.get("detail") == "repeated external lookup blocked"
                     for event in new_events
                 )
+                blocked_repeated_local_lookup = any(
+                    event.get("status") == "error"
+                    and event.get("detail") == "repeated local tool call blocked"
+                    for event in new_events
+                )
+                blocked_repeated_lookup = (
+                    blocked_repeated_external_lookup or blocked_repeated_local_lookup
+                )
+                if blocked_repeated_local_lookup:
+                    repeated_block_kind = "local"
+                elif blocked_repeated_external_lookup:
+                    repeated_block_kind = "external"
+                elif not blocked_repeated_lookup:
+                    repeated_block_kind = None
                 consecutive_repeated_lookup_blocks = (
                     consecutive_repeated_lookup_blocks + 1
                     if blocked_repeated_lookup
@@ -551,7 +608,11 @@ class AgentRunner:
                     )
                     if final_content is None:
                         final_content = self._max_iterations_fallback(spec)
-                    stop_reason = "repeated_external_lookup"
+                    stop_reason = (
+                        "repeated_local_tool_call"
+                        if repeated_block_kind == "local"
+                        else "repeated_external_lookup"
+                    )
                     self._append_final_message(messages, final_content)
                     context.final_content = final_content
                     context.stop_reason = stop_reason
@@ -637,6 +698,7 @@ class AgentRunner:
                 phase="after final response",
                 iteration=iteration,
                 allow_goal_continue=True,
+                allow_final_response_guard=True,
             )
             if should_continue:
                 had_injections = True
@@ -984,7 +1046,7 @@ class AgentRunner:
         finalization_messages.append({
             "role": "user",
             "content": (
-                "The repeated external-lookup circuit breaker has stopped further searches. "
+                "The repeated tool-call circuit breaker has stopped an identical lookup loop. "
                 "Do not call any tools. Complete the requested deliverable now using evidence "
                 "already present in the conversation. Clearly label any unresolved evidence gaps "
                 "instead of retrying, guessing, or claiming a blocked lookup succeeded."
@@ -1120,14 +1182,20 @@ class AgentRunner:
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
+        local_lookup_state: dict[str, Any] | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None, bool]:
+        local_lookup_state = local_lookup_state if local_lookup_state is not None else {}
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
                 batch_results = await asyncio.gather(*(
                     self._run_tool(
-                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                        spec,
+                        tool_call,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                        local_lookup_state,
                     )
                     for tool_call in batch
                 ))
@@ -1136,7 +1204,11 @@ class AgentRunner:
                 batch_results = []
                 for tool_call in batch:
                     result = await self._run_tool(
-                        spec, tool_call, external_lookup_counts, workspace_violation_counts,
+                        spec,
+                        tool_call,
+                        external_lookup_counts,
+                        workspace_violation_counts,
+                        local_lookup_state,
                     )
                     tool_results.append(result)
                     batch_results.append(result)
@@ -1160,6 +1232,7 @@ class AgentRunner:
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
+        local_lookup_state: dict[str, Any],
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         lookup_error = repeated_external_lookup_error(
@@ -1176,6 +1249,20 @@ class AgentRunner:
             if spec.fail_on_tool_error:
                 return lookup_error + hint, event, RuntimeError(lookup_error)
             return lookup_error + hint, event, None
+        local_lookup_error = repeated_local_lookup_error(
+            tool_call.name,
+            tool_call.arguments,
+            local_lookup_state,
+        )
+        if local_lookup_error:
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": "repeated local tool call blocked",
+            }
+            if spec.fail_on_tool_error:
+                return local_lookup_error + hint, event, RuntimeError(local_lookup_error)
+            return local_lookup_error + hint, event, None
         prepare_call = getattr(spec.tools, "prepare_call", None)
         tool, params, prep_error = None, tool_call.arguments, None
         if callable(prepare_call):

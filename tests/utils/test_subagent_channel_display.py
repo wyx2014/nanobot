@@ -55,3 +55,18 @@ def test_scrub_truncates_very_long_result() -> None:
     assert out.endswith("…")
     assert len(out) < len(raw)
     assert body not in out
+
+
+def test_scrub_hides_expert_team_internal_delivery() -> None:
+    raw = """[Subagent 'risk-manager' completed successfully]
+
+Task: decide
+
+Result:
+final risk verdict
+
+[Expert-team internal delivery]
+Continue report audit."""
+    out = scrub_subagent_announce_body(raw)
+    assert out == "[Subagent 'risk-manager' completed successfully]\n\nfinal risk verdict"
+    assert "internal delivery" not in out.lower()

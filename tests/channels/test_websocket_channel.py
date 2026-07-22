@@ -1143,6 +1143,31 @@ async def test_send_delta_stream_end_includes_inline_final_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_streamed_complete_message_replaces_streamed_bubble() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "streaming": True},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="完整研究报告",
+        metadata={"_streamed": True},
+    ))
+
+    mock_ws.send.assert_awaited_once()
+    payload = json.loads(mock_ws.send.await_args.args[0])
+    assert payload["event"] == "message"
+    assert payload["text"] == "完整研究报告"
+    assert payload["replace_stream"] is True
+
+
+@pytest.mark.asyncio
 async def test_send_delta_stream_end_rewrites_local_markdown_image(monkeypatch, tmp_path) -> None:
     bus = MagicMock()
     workspace = tmp_path / "workspace"

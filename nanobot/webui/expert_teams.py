@@ -62,7 +62,7 @@ def _manifest(team_id: str) -> tuple[Path, dict[str, Any]]:
     return root, _load_team(team_id, str(root))
 
 
-def _members(raw: Any) -> list[dict[str, str]]:
+def _members(raw: Any, source_root: Path | None = None) -> list[dict[str, str]]:
     if not isinstance(raw, list):
         return []
     out: list[dict[str, str]] = []
@@ -73,13 +73,42 @@ def _members(raw: Any) -> list[dict[str, str]]:
         name = str(item.get("name") or "").strip()
         if not member_id or not name:
             continue
-        out.append({
+        member = {
             "id": member_id,
             "name": name,
             "framework": str(item.get("framework") or "").strip(),
             "description": str(item.get("description") or "").strip(),
-        })
+            "phase": str(item.get("phase") or "").strip(),
+            "phase_label": str(item.get("phase_label") or "").strip(),
+        }
+        playbook = str(item.get("playbook") or "").strip()
+        if source_root is not None and playbook:
+            try:
+                text = _safe_child(source_root, playbook).read_text(encoding="utf-8").strip()
+            except (ExpertTeamError, OSError):
+                text = ""
+            if text:
+                member["instructions"] = text
+        out.append(member)
     return out
+
+
+def _lead_playbooks(source_root: Path, runtime: Mapping[str, Any]) -> list[str]:
+    raw = runtime.get("lead_playbooks")
+    if not isinstance(raw, list):
+        return []
+    playbooks: list[str] = []
+    for relative in raw[:6]:
+        if not isinstance(relative, str) or not relative.strip():
+            continue
+        try:
+            path = _safe_child(source_root, relative)
+            text = path.read_text(encoding="utf-8").strip()
+        except (ExpertTeamError, OSError):
+            continue
+        if text:
+            playbooks.append(text)
+    return playbooks
 
 
 def _workflows(raw: Any) -> list[dict[str, Any]]:
@@ -135,6 +164,30 @@ def _data_sources(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _completion(runtime: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = runtime.get("completion")
+    if not isinstance(raw, Mapping):
+        return None
+    required_tools = [
+        str(item).strip()
+        for item in raw.get("required_tools", [])
+        if isinstance(item, str) and str(item).strip()
+    ][:8]
+    required_artifacts = [
+        str(item).strip().lower().lstrip(".")
+        for item in raw.get("required_artifacts", [])
+        if isinstance(item, str) and str(item).strip()
+    ][:8]
+    instruction = str(raw.get("instruction") or "").strip()
+    if not required_tools:
+        return None
+    return {
+        "required_tools": list(dict.fromkeys(required_tools)),
+        "required_artifacts": list(dict.fromkeys(required_artifacts)),
+        **({"instruction": instruction} if instruction else {}),
+    }
+
+
 def _availability(team_root: Path, manifest: Mapping[str, Any]) -> tuple[bool, str]:
     source_root = str(manifest.get("source_root") or "").strip()
     adapter = str((manifest.get("runtime") or {}).get("adapter") or "").strip()
@@ -146,7 +199,8 @@ def _availability(team_root: Path, manifest: Mapping[str, Any]) -> tuple[bool, s
 
 
 def _summary(team_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
-    members = _members(manifest.get("members"))
+    source_root = _safe_child(team_root, str(manifest.get("source_root") or ""))
+    members = _members(manifest.get("members"), source_root)
     workflows = _workflows(manifest.get("workflows"))
     available, reason = _availability(team_root, manifest)
     runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
@@ -218,6 +272,9 @@ def normalize_expert_team_binding(raw: Any) -> dict[str, Any] | None:
     root, manifest = _manifest(team_id)
     team_root = _safe_child(root, team_id)
     summary = _summary(team_root, manifest)
+    source_root = _safe_child(team_root, str(manifest.get("source_root") or ""))
+    runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
+    completion = _completion(runtime)
     if not summary["enabled"] or not summary["available"]:
         raise ExpertTeamError(summary["unavailable_reason"] or "expert team is unavailable", status=409)
     return {
@@ -231,10 +288,14 @@ def normalize_expert_team_binding(raw: Any) -> dict[str, Any] | None:
                 "name": member["name"],
                 "framework": member["framework"],
                 "description": member["description"],
+                "phase": member["phase"],
+                "phase_label": member["phase_label"],
+                **({"instructions": member["instructions"]} if member.get("instructions") else {}),
             }
-            for member in _members(manifest.get("members"))
+            for member in _members(manifest.get("members"), source_root)
         ],
         "data_sources": _data_sources(manifest.get("data_sources")),
+        **({"completion": completion} if completion is not None else {}),
     }
 
 
@@ -250,7 +311,12 @@ def public_expert_team_binding(raw: Any) -> dict[str, Any] | None:
         return None
     if binding is None:
         return None
-    return {"id": binding["id"], "name": binding["name"], "version": binding["version"]}
+    return {
+        "id": binding["id"],
+        "name": binding["name"],
+        "version": binding["version"],
+        "member_count": len(binding["members"]),
+    }
 
 
 def expert_team_system_prompt(session_metadata: Mapping[str, Any] | None) -> str:
@@ -272,12 +338,14 @@ def expert_team_system_prompt(session_metadata: Mapping[str, Any] | None) -> str
         workflow_path = _safe_child(source_root, workflow["source"])
         adapter = adapter_path.read_text(encoding="utf-8")
         workflow_text = workflow_path.read_text(encoding="utf-8")
+        lead_playbooks = _lead_playbooks(source_root, runtime)
     except (ExpertTeamError, OSError):
         return ""
     return (
         f"# Active Expert Team: {manifest.get('name')}\n\n"
         f"Team resource root (read-only): `{source_root}`\n\n"
         f"# Canonical Entry Workflow: {workflow['name']}\n\n{workflow_text}\n\n"
+        f"---\n\n# Lead Method Playbooks\n\n{'\n\n---\n\n'.join(lead_playbooks)}\n\n"
         f"---\n\n# Nanobot Runtime Compatibility Overrides (higher priority)\n\n{adapter}\n\n"
         "The compatibility overrides above are authoritative for runtime/tool/permission semantics. "
         "Do not perform Claude Code permission checks from the canonical workflow."

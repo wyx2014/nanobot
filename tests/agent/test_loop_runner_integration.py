@@ -301,10 +301,21 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
-        content="working",
-        tool_calls=[ToolCallRequest(id="call_1", name="list_dir", arguments={"path": "."})],
-    ))
+    request_count = 0
+
+    async def keep_working(**kwargs):
+        nonlocal request_count
+        request_count += 1
+        return LLMResponse(
+            content="working",
+            tool_calls=[ToolCallRequest(
+                id=f"call_{request_count}",
+                name="list_dir",
+                arguments={"path": f"./step-{request_count}"},
+            )],
+        )
+
+    provider.chat_with_retry = AsyncMock(side_effect=keep_working)
     mgr = SubagentManager(
         provider=provider,
         workspace=tmp_path,

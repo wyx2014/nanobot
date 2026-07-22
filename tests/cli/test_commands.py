@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cli import commands as cli_commands
 from nanobot.cli.commands import app
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, MCPServerConfig
 from nanobot.cron.service import CronJobSkippedError
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronPayload
@@ -27,6 +27,21 @@ from nanobot.webui.metadata import (
 )
 
 runner = CliRunner()
+
+
+def test_desktop_playwright_mcp_migration_pins_latest() -> None:
+    config = Config()
+    config.tools.mcp_servers["playwright"] = MCPServerConfig(
+        command="npx",
+        args=["-y", "@playwright/mcp@latest"],
+    )
+
+    assert cli_commands._pin_desktop_playwright_mcp(config) is True
+    assert config.tools.mcp_servers["playwright"].args == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+    ]
+    assert cli_commands._pin_desktop_playwright_mcp(config) is False
 
 
 def test_proactive_websocket_delivery_gets_fresh_turn_id() -> None:

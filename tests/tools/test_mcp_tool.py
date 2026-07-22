@@ -688,6 +688,43 @@ async def test_connect_mcp_servers_streamable_http_uses_finite_timeout(
 
 
 @pytest.mark.asyncio
+async def test_connect_mcp_servers_times_out_stalled_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    never_ready = asyncio.Event()
+
+    class _StalledClientSession:
+        def __init__(self, _read: object, _write: object) -> None:
+            pass
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def initialize(self) -> None:
+            await never_ready.wait()
+
+    @asynccontextmanager
+    async def _stdio_client(_params: object):
+        yield object(), object()
+
+    monkeypatch.setattr(sys.modules["mcp"], "ClientSession", _StalledClientSession)
+    monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _stdio_client)
+
+    registry = ToolRegistry()
+    started = asyncio.get_running_loop().time()
+    stacks = await connect_mcp_servers(
+        {"stalled": MCPServerConfig(command="stalled-mcp", connect_timeout=1)},
+        registry,
+    )
+
+    assert stacks == {}
+    assert asyncio.get_running_loop().time() - started < 2
+
+
+@pytest.mark.asyncio
 async def test_connect_mcp_servers_wraps_windows_stdio_launchers(
     fake_mcp_runtime: dict[str, object | None],
     monkeypatch: pytest.MonkeyPatch,

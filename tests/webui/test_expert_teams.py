@@ -9,6 +9,7 @@ def _write_team(root: Path) -> None:
     team = root / "asset-research-team"
     source = team / "source/ai-berkshire"
     (source / "skills").mkdir(parents=True)
+    (source / "playbooks").mkdir(parents=True)
     (team / "adapter.md").write_text(
         "adapter instructions: never inspect .claude permissions; use web_search",
         encoding="utf-8",
@@ -17,6 +18,8 @@ def _write_team(root: Path) -> None:
         "canonical workflow: inspect .claude/settings.local.json for WebSearch",
         encoding="utf-8",
     )
+    (source / "playbooks/team-lead.md").write_text("lead playbook instructions", encoding="utf-8")
+    (source / "playbooks/business-analyst.md").write_text("member playbook instructions", encoding="utf-8")
     (team / "team.yaml").write_text(
         """
 schema_version: 1
@@ -29,6 +32,12 @@ entry_workflow: investment-team
 runtime:
   requested_concurrency: 4
   adapter: adapter.md
+  completion:
+    required_tools: [write_file, create_docx, create_pdf]
+    required_artifacts: [html, docx, pdf]
+    instruction: finish the audited report
+  lead_playbooks:
+    - playbooks/team-lead.md
 data_sources:
   - id: ifind-finance-data
     name: 同花顺 iFinD 金融数据
@@ -38,7 +47,7 @@ data_sources:
     assignments:
       business-analyst: 公司摘要与主营构成
 members:
-  - { id: business-analyst, name: 商业分析师 }
+  - { id: business-analyst, name: 商业分析师, phase: research, phase_label: 第一阶段, playbook: playbooks/business-analyst.md }
 workflows:
   - { id: investment-team, name: 团队深度投研, source: skills/investment-team.md, mode: team, featured: true }
 """.strip(),
@@ -62,16 +71,32 @@ def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> 
         "name": "商业分析师",
         "framework": "",
         "description": "",
+        "phase": "research",
+        "phase_label": "第一阶段",
+        "instructions": "member playbook instructions",
     }]
     assert binding["data_sources"][0]["skill"] == "ifind-finance-data"
+    assert binding["completion"] == {
+        "required_tools": ["write_file", "create_docx", "create_pdf"],
+        "required_artifacts": ["html", "docx", "pdf"],
+        "instruction": "finish the audited report",
+    }
     detail = expert_teams.expert_team_detail_payload("asset-research-team")
     assert detail["data_sources"][0]["priority"] == "primary"
 
     prompt = expert_teams.expert_team_system_prompt({"expert_team": binding})
     assert "adapter instructions" in prompt
     assert "canonical workflow" in prompt
+    assert "lead playbook instructions" in prompt
     assert prompt.rfind("never inspect .claude permissions") > prompt.rfind("inspect .claude/settings.local.json")
     assert "Do not perform Claude Code permission checks" in prompt
+
+    assert expert_teams.public_expert_team_binding(binding) == {
+        "id": "asset-research-team",
+        "name": "资产投研团队",
+        "version": "1.0.0",
+        "member_count": 1,
+    }
 
 
 def test_expert_team_rejects_unknown_id(tmp_path: Path, monkeypatch) -> None:

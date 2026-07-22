@@ -615,6 +615,8 @@ class WebSocketChannel(BaseChannel):
                         "event": "ready",
                         "chat_id": default_chat_id,
                         "client_id": client_id,
+                        "agent_ready": self._http_router.agent_ready(),
+                        "mcp_status": self._http_router.mcp_status(),
                     },
                     ensure_ascii=False,
                 )
@@ -982,6 +984,12 @@ class WebSocketChannel(BaseChannel):
             raise
 
     async def send(self, msg: OutboundMessage) -> None:
+        if msg.metadata.get("_runtime_status_updated"):
+            await self.send_runtime_status_updated(
+                agent_ready=msg.metadata.get("agent_ready"),
+                mcp_status=msg.metadata.get("mcp_status"),
+            )
+            return
         if msg.metadata.get("_runtime_model_updated"):
             await self.send_runtime_model_updated(
                 model_name=msg.metadata.get("model"),
@@ -1086,6 +1094,12 @@ class WebSocketChannel(BaseChannel):
             "chat_id": msg.chat_id,
             "text": wire_text,
         }
+        if msg.metadata.get("_streamed"):
+            # The answer text already arrived through delta/stream_end frames.
+            # This authoritative frame exists to add generated artifacts and
+            # final metadata, so WebUI clients must replace the streamed
+            # bubble instead of appending a duplicate assistant reply.
+            payload["replace_stream"] = True
         if msg.media:
             payload["media"] = msg.media
             urls: list[dict[str, Any]] = []
@@ -1380,3 +1394,26 @@ class WebSocketChannel(BaseChannel):
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" runtime_model_updated ")
+
+    async def send_runtime_status_updated(
+        self,
+        *,
+        agent_ready: Any,
+        mcp_status: Any,
+    ) -> None:
+        """Broadcast startup/runtime readiness without blocking chat traffic."""
+        conns = list(self._conn_chats)
+        if not conns:
+            return
+        body = {
+            "event": "runtime_status",
+            "agent_ready": agent_ready is True,
+            "mcp_status": (
+                mcp_status
+                if mcp_status in {"disabled", "pending", "warming", "ready", "unavailable"}
+                else "unknown"
+            ),
+        }
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" runtime_status ")

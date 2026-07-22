@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from contextlib import suppress
@@ -443,7 +444,9 @@ class WriteStdinTool(Tool):
             "stdin, close_stdin=true to send EOF, or terminate=true to stop the "
             "process. Use wait_for with wait_timeout_ms for dev servers, test "
             "watchers, and prompts where you need to wait for expected output. "
-            "Do not use this to start new commands; start them with exec."
+            "Do not use this to start new commands; start them with exec. "
+            "Never pass an id returned by spawn: subagent results are delivered "
+            "automatically and are not exec sessions."
         )
 
     async def execute(
@@ -494,6 +497,13 @@ class WriteStdinTool(Tool):
             )
             return format_session_poll(session_id, poll)
         except KeyError:
+            if re.fullmatch(r"[0-9a-fA-F]{8}", session_id):
+                return (
+                    f"Error: exec session not found: {session_id}. "
+                    "This looks like a spawn/subagent task id, not an exec session id. "
+                    "Do not poll spawn with write_stdin; wait for its automatic result "
+                    "delivery and continue the workflow when it arrives."
+                )
             return f"Error: exec session not found: {session_id}"
         except Exception as exc:
             return f"Error writing to exec session: {exc}"

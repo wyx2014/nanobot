@@ -339,6 +339,21 @@ def test_write_stdin_reports_missing_session(tmp_path):
     assert "exec session not found" in result
 
 
+def test_write_stdin_explains_spawn_task_id_misuse(tmp_path):
+    manager = ExecSessionManager()
+    tool = WriteStdinTool(manager=manager)
+
+    result = asyncio.run(tool.execute(
+        session_id="53f4d26e",
+        chars="",
+        wait_for="[risk-manager-END]",
+    ))
+
+    assert "spawn/subagent task id" in result
+    assert "Do not poll spawn with write_stdin" in result
+    assert "automatic result delivery" in result
+
+
 def test_list_exec_sessions_reports_running_commands(tmp_path):
     async def run() -> tuple[str, str, str]:
         manager = ExecSessionManager()

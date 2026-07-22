@@ -173,6 +173,36 @@ async def test_agent_loop_run_closes_mcp_from_connection_owner_task(
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_becomes_ready_while_mcp_warms_in_background(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    loop = _make_loop(tmp_path, mcp_servers={"playwright": object()})
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+
+    async def _slow_connect(_servers, _registry):
+        connect_started.set()
+        await release_connect.wait()
+        return {}
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", _slow_connect)
+
+    task = asyncio.create_task(loop.run())
+    await asyncio.wait_for(connect_started.wait(), timeout=1)
+
+    assert loop.is_ready is True
+    assert loop.mcp_status == "warming"
+
+    loop.stop()
+    release_connect.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert loop.is_ready is False
+    assert loop._mcp_owner_task is None
+
+
+@pytest.mark.asyncio
 async def test_reload_mcp_servers_adds_and_removes_tools_without_restart(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -19,6 +19,7 @@ from nanobot.agent.tools.schema import IntegerSchema, StringSchema, tool_paramet
 
 _MIN_VALID_PDF_BYTES = 1_000
 _DEFAULT_TIMEOUT_SECONDS = 30
+_MARKDOWN_IMAGE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
 
 
 @tool_parameters(
@@ -93,6 +94,7 @@ class CreatePdfTool(_FsTool):
                 asyncio.to_thread(
                     _render_pdf,
                     content,
+                    source,
                     output,
                     render_title,
                     template or "simple",
@@ -193,6 +195,12 @@ def _markdown_blocks(content: str) -> list[tuple[str, Any]]:
             flush_table()
             blocks.append(("hr", ""))
             continue
+        image = _MARKDOWN_IMAGE_RE.match(line)
+        if image:
+            flush_paragraph()
+            flush_table()
+            blocks.append(("image", (image.group(1).strip(), image.group(2).strip())))
+            continue
         if line.startswith("|") and line.endswith("|"):
             flush_paragraph()
             cells = [cell.strip() for cell in line.strip("|").split("|")]
@@ -244,6 +252,7 @@ def _render_mermaid_png(code: str) -> tuple[bytes, float, float] | None:
 
 def _render_pdf_with_desktop(
     content: str,
+    source: Path,
     output: Path,
     title: str,
     template: str,
@@ -260,6 +269,7 @@ def _render_pdf_with_desktop(
                 "markdown": content,
                 "title": title,
                 "template": template,
+                "source_path": str(source),
             }).encode(),
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
@@ -276,8 +286,8 @@ def _render_pdf_with_desktop(
         return None
 
 
-def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[str, int]:
-    desktop_result = _render_pdf_with_desktop(content, output, title, template)
+def _render_pdf(content: str, source: Path, output: Path, title: str, template: str) -> dict[str, int]:
+    desktop_result = _render_pdf_with_desktop(content, source, output, title, template)
     if desktop_result is not None:
         return desktop_result
 
@@ -321,6 +331,26 @@ def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[s
     if template == "research_report":
         story.append(Spacer(1, 2 * mm))
 
+    def add_local_image(alt: str, image_ref: str) -> bool:
+        try:
+            candidate = Path(image_ref.strip().strip('"\''))
+            if candidate.is_absolute():
+                return False
+            source_directory = source.parent.resolve()
+            image_path = (source_directory / candidate).resolve()
+            image_path.relative_to(source_directory)
+            if not image_path.is_file():
+                return False
+            image = Image(str(image_path))
+            image._restrictSize(A4[0] - 36 * mm, 170 * mm)
+            story.append(image)
+            if alt:
+                story.append(Paragraph(_rich_text(alt), styles["BodyText"]))
+            story.append(Spacer(1, 3 * mm))
+            return True
+        except (OSError, ValueError):
+            return False
+
     for kind, value in _markdown_blocks(content):
         if kind == "h1" and _plain(value) == _plain(title):
             continue
@@ -330,7 +360,7 @@ def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[s
         elif kind == "h2":
             story.append(Paragraph(_rich_text(value), styles["Heading2"]))
             story.append(Spacer(1, 1.5 * mm))
-        elif kind.startswith("h"):
+        elif re.fullmatch(r"h[3-6]", kind):
             story.append(Paragraph(_rich_text(value), styles["Heading3"]))
             story.append(Spacer(1, 1 * mm))
         elif kind == "paragraph":
@@ -376,6 +406,9 @@ def _render_pdf(content: str, output: Path, title: str, template: str) -> dict[s
             else:
                 story.append(Paragraph(_rich_text(value), styles["BodyText"]))
             story.append(Spacer(1, 3 * mm))
+        elif kind == "image":
+            alt, image_ref = value
+            add_local_image(alt, image_ref)
         elif kind == "code":
             code = Table(
                 [[Paragraph(_rich_text(value).replace("\n", "<br/>"), styles["BodyText"])]],

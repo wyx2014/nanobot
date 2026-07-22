@@ -385,9 +385,12 @@ class TestAnnounceResult:
         )
 
         content = published[0].content
+        normalized_content = " ".join(content.split())
         assert "Expert-team internal delivery" in content
-        assert "Do not ask the user whether to retry or continue" in content
-        assert "Team Lead synthesis" in content
+        assert "do not ask the user whether to retry or continue" in content.lower()
+        assert "report audit" in normalized_content
+        assert "Summarize this naturally" not in content
+        assert "do not poll the task id with write_stdin" in content
 
 
 # ---------------------------------------------------------------------------

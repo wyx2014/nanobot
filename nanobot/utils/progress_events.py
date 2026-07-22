@@ -178,7 +178,13 @@ def build_tool_event_display(name: str, arguments: dict[str, Any]) -> dict[str, 
         category, importance = "plan", "primary"
     elif "skill" in compact:
         category, importance = "skill", "primary"
-    elif compact in {"exec", "run_shell_command", "run_cli_app"} or "command" in compact:
+    elif compact in {
+        "exec",
+        "write_stdin",
+        "list_exec_sessions",
+        "run_shell_command",
+        "run_cli_app",
+    } or "command" in compact:
         category, importance = "command", "primary"
     elif "search" in compact:
         category, importance = "search", "primary"

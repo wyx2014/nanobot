@@ -32,10 +32,18 @@ def scrub_subagent_announce_body(content: str) -> str:
         return header if header else stripped
 
     after = stripped[ri + len(key) :].lstrip()
-    summ_marker = "summarize this naturally"
-    si = after.lower().find(summ_marker)
-    if si != -1:
-        after = after[:si].rstrip()
+    instruction_markers = (
+        "summarize this naturally",
+        "[expert-team internal delivery]",
+        "[expert-team runtime coordination",
+    )
+    marker_positions = [
+        position
+        for marker in instruction_markers
+        if (position := after.lower().find(marker)) != -1
+    ]
+    if marker_positions:
+        after = after[:min(marker_positions)].rstrip()
 
     body = after.strip()
     limit = _SUBAGENT_CHANNEL_RESULT_MAX_CHARS

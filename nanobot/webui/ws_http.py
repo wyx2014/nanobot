@@ -126,6 +126,27 @@ def _resolve_bootstrap_model_name(
     return _default_model_name_from_config() or ""
 
 
+def _resolve_runtime_ready(runtime_ready: Callable[[], bool] | None) -> bool:
+    if runtime_ready is None:
+        return True
+    try:
+        return runtime_ready() is True
+    except Exception as e:
+        logger.debug("bootstrap runtime readiness resolver failed: {}", e)
+        return False
+
+
+def _resolve_runtime_mcp_status(runtime_mcp_status: Callable[[], str] | None) -> str:
+    if runtime_mcp_status is None:
+        return "unknown"
+    try:
+        status = runtime_mcp_status()
+    except Exception as e:
+        logger.debug("bootstrap MCP status resolver failed: {}", e)
+        return "unknown"
+    return status if status in {"disabled", "pending", "warming", "ready", "unavailable"} else "unknown"
+
+
 # ---------------------------------------------------------------------------
 # GatewayHTTPHandler
 # ---------------------------------------------------------------------------
@@ -145,6 +166,8 @@ class GatewayHTTPHandler:
         session_manager: SessionManager | None,
         static_dist_path: Path | None,
         runtime_model_name: Callable[[], str | None] | None,
+        runtime_ready: Callable[[], bool] | None,
+        runtime_mcp_status: Callable[[], str] | None,
         runtime_surface: str,
         runtime_capabilities_overrides: dict[str, Any] | None,
         bus: MessageBus,
@@ -161,6 +184,8 @@ class GatewayHTTPHandler:
         self.session_manager = session_manager
         self.static_dist_path = static_dist_path
         self.runtime_model_name = runtime_model_name
+        self.runtime_ready = runtime_ready
+        self.runtime_mcp_status = runtime_mcp_status
         self.bus = bus
         self.tokens = tokens
         self.media = media
@@ -198,6 +223,12 @@ class GatewayHTTPHandler:
 
     def workspace_controls_available(self, connection: Any) -> bool:
         return self._runtime_surface == "native" or _is_localhost(connection)
+
+    def agent_ready(self) -> bool:
+        return _resolve_runtime_ready(self.runtime_ready)
+
+    def mcp_status(self) -> str:
+        return _resolve_runtime_mcp_status(self.runtime_mcp_status)
 
     # -- Token management ---------------------------------------------------
 
@@ -337,6 +368,8 @@ class GatewayHTTPHandler:
                 "ws_url": ws_url,
                 "expires_in": self.config.token_ttl_s,
                 "model_name": _resolve_bootstrap_model_name(self.runtime_model_name),
+                "agent_ready": self.agent_ready(),
+                "mcp_status": self.mcp_status(),
                 "runtime_surface": self._runtime_surface,
                 "runtime_capabilities": self._capabilities,
             }

@@ -719,6 +719,23 @@ DESKTOP_BOOTSTRAP_PROVIDER = "openai_codex"
 DESKTOP_BOOTSTRAP_MODEL = "openai-codex/gpt-5.1-codex"
 
 
+def _pin_desktop_playwright_mcp(config: Config) -> bool:
+    """Migrate the built-in Playwright preset away from startup-time @latest resolution."""
+    server = config.tools.mcp_servers.get("playwright")
+    if server is None or server.command.strip().lower() != "npx":
+        return False
+    latest = "@playwright/mcp@latest"
+    if latest not in server.args:
+        return False
+    from nanobot.webui.mcp_presets_api import PLAYWRIGHT_MCP_PACKAGE
+
+    server.args = [
+        PLAYWRIGHT_MCP_PACKAGE if arg == latest else arg
+        for arg in server.args
+    ]
+    return True
+
+
 def _desktop_provider_error_is_recoverable(error: ValueError) -> bool:
     message = str(error)
     return "No API key configured" in message or "requires api_key and api_base" in message
@@ -796,6 +813,8 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
         workspace_path = Path(workspace).expanduser()
         loaded.agents.defaults.workspace = str(workspace_path)
         changed = True
+
+    changed = _pin_desktop_playwright_mcp(loaded) or changed
 
     if _is_persisted_desktop_bootstrap(loaded):
         changed = _reset_desktop_config_to_unconfigured(loaded) or changed
@@ -1168,6 +1187,8 @@ def _run_gateway(
         session_manager=session_manager,
         cron_service=cron,
         webui_runtime_model_name=_webui_runtime_model_name,
+        webui_runtime_ready=lambda: agent.is_ready,
+        webui_runtime_mcp_status=lambda: agent.mcp_status,
         webui_cron_pending_job_ids=getattr(agent, "pending_cron_job_ids_for_session", None),
         webui_static_dist=webui_static_dist,
         webui_runtime_surface=webui_runtime_surface,

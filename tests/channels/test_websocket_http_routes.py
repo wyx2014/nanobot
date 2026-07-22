@@ -45,6 +45,8 @@ def _make_handler(
     static_dist_path: Path | None = None,
     workspace_path: Path | None = None,
     runtime_model_name: Any | None = None,
+    runtime_ready: Any | None = None,
+    runtime_mcp_status: Any | None = None,
     cron_service: CronService | None = None,
     cron_pending_job_ids: Any | None = None,
 ) -> GatewayServices:
@@ -58,6 +60,8 @@ def _make_handler(
         workspace_path=workspace,
         default_restrict_to_workspace=False,
         runtime_model_name=runtime_model_name,
+        runtime_ready=runtime_ready,
+        runtime_mcp_status=runtime_mcp_status,
         runtime_surface="browser",
         runtime_capabilities_overrides=None,
         cron_service=cron_service,
@@ -73,6 +77,8 @@ def _ch(
     workspace_path: Path | None = None,
     port: int = _PORT,
     runtime_model_name: Any | None = None,
+    runtime_ready: Any | None = None,
+    runtime_mcp_status: Any | None = None,
     cron_service: CronService | None = None,
     cron_pending_job_ids: Any | None = None,
     **extra: Any,
@@ -92,6 +98,8 @@ def _ch(
         static_dist_path=static_dist_path,
         workspace_path=workspace_path,
         runtime_model_name=runtime_model_name,
+        runtime_ready=runtime_ready,
+        runtime_mcp_status=runtime_mcp_status,
         cron_service=cron_service,
         cron_pending_job_ids=cron_pending_job_ids,
     )
@@ -1546,6 +1554,20 @@ def test_localhost_without_auth_is_valid(bus: MagicMock) -> None:
     channel = _ch(bus, host="127.0.0.1")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _NO_HEADERS)
     assert resp.status_code == 200
+
+
+def test_bootstrap_exposes_agent_and_mcp_readiness(bus: MagicMock) -> None:
+    channel = _ch(
+        bus,
+        host="127.0.0.1",
+        runtime_ready=lambda: False,
+        runtime_mcp_status=lambda: "warming",
+    )
+    resp = channel.gateway.http._handle_bootstrap(_LOCAL, _NO_HEADERS)
+    assert resp.status_code == 200
+    body = json.loads(resp.body)
+    assert body["agent_ready"] is False
+    assert body["mcp_status"] == "warming"
 
 
 def test_bootstrap_prefers_runtime_model_name(bus: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:

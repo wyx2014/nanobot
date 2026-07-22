@@ -126,6 +126,11 @@ def test_enable_stdio_preset_uses_config_scoped_cwd(
 
     config = load_config()
     cwd = config.tools.mcp_servers["playwright"].cwd
+    assert config.tools.mcp_servers["playwright"].args == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+    ]
+    assert config.tools.mcp_servers["playwright"].connect_timeout == 15
     assert cwd == str(tmp_path / "mcp" / "playwright")
     assert (tmp_path / "mcp" / "playwright").is_dir()
 

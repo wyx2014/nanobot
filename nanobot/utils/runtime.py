@@ -13,6 +13,10 @@ from nanobot.utils.helpers import stringify_text_blocks
 
 _MAX_REPEAT_EXTERNAL_LOOKUPS = 2
 
+# Third consecutive identical local lookup is almost always an agent loop.
+_MAX_REPEAT_LOCAL_LOOKUPS = 2
+_LOCAL_LOOKUP_TOOLS = frozenset({"read_file", "list_dir", "find_files", "grep"})
+
 # Third same-target workspace violation in a turn escalates to "stop retrying".
 _MAX_REPEAT_WORKSPACE_VIOLATIONS = 2
 
@@ -154,6 +158,53 @@ def repeated_external_lookup_error(
     return (
         "Error: repeated external lookup blocked. "
         "Use the results you already have to answer, or try a meaningfully different source."
+    )
+
+
+def local_lookup_signature(tool_name: str, arguments: Any) -> str | None:
+    """Stable signature for consecutive read-only local calls worth throttling."""
+    if tool_name not in _LOCAL_LOOKUP_TOOLS or not isinstance(arguments, dict):
+        return None
+    if tool_name == "read_file" and arguments.get("force") is True:
+        return None
+    try:
+        rendered = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
+    return f"{tool_name}:{rendered}"
+
+
+def repeated_local_lookup_error(
+    tool_name: str,
+    arguments: Any,
+    state: dict[str, Any],
+) -> str | None:
+    """Block the third consecutive identical local lookup within one agent turn."""
+    signature = local_lookup_signature(tool_name, arguments)
+    if signature is None:
+        state.clear()
+        return None
+
+    if state.get("signature") != signature:
+        state.clear()
+        state.update({"signature": signature, "count": 1})
+        return None
+
+    count = int(state.get("count") or 0) + 1
+    state["count"] = count
+    if count <= _MAX_REPEAT_LOCAL_LOOKUPS:
+        return None
+
+    logger.warning(
+        "Blocking repeated local lookup {} on consecutive attempt {}",
+        signature[:160],
+        count,
+    )
+    return (
+        "Error: repeated local tool call blocked. "
+        "The identical read-only call already ran twice. Use the result already present "
+        "in the conversation, choose a different operation, or finish with an explicit "
+        "evidence gap. Do not issue the same call again."
     )
 
 

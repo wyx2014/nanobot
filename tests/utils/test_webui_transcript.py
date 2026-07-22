@@ -870,6 +870,71 @@ def test_replay_uses_stream_end_final_text() -> None:
     assert msgs[1]["content"] == "![Diagram](/api/media/sig/payload)"
 
 
+def test_replay_replaces_streamed_report_with_authoritative_attachment_message() -> None:
+    msgs = replay_transcript_to_ui_messages(
+        [
+            {
+                "event": "user",
+                "chat_id": "t-report",
+                "text": "分析青岛啤酒",
+                "turn_id": "turn-report",
+            },
+            {
+                "event": "delta",
+                "chat_id": "t-report",
+                "text": "青岛啤酒（600600.SH）投资研究报告",
+                "turn_id": "turn-report",
+            },
+            {
+                "event": "stream_end",
+                "chat_id": "t-report",
+                "turn_id": "turn-report",
+            },
+            {
+                "event": "message",
+                "chat_id": "t-report",
+                "text": "青岛啤酒（600600.SH）投资研究报告",
+                "media_urls": [{
+                    "url": "/api/media/report",
+                    "name": "青岛啤酒投资研究报告.html",
+                }],
+                "replace_stream": True,
+                "turn_id": "turn-report",
+            },
+            {
+                "event": "turn_end",
+                "chat_id": "t-report",
+                "turn_id": "turn-report",
+            },
+        ],
+    )
+
+    assistant = [message for message in msgs if message["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0]["content"] == "青岛啤酒（600600.SH）投资研究报告"
+    assert assistant[0]["media"][0]["name"] == "青岛啤酒投资研究报告.html"
+
+
+def test_replay_repairs_legacy_exact_streamed_attachment_duplicate() -> None:
+    msgs = replay_transcript_to_ui_messages(
+        [
+            {"event": "delta", "chat_id": "legacy", "text": "完整报告"},
+            {"event": "stream_end", "chat_id": "legacy"},
+            {
+                "event": "message",
+                "chat_id": "legacy",
+                "text": "完整报告",
+                "media_urls": [{"url": "/api/media/report", "name": "report.html"}],
+            },
+            {"event": "turn_end", "chat_id": "legacy"},
+        ],
+    )
+
+    assistant = [message for message in msgs if message["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0]["media"][0]["name"] == "report.html"
+
+
 def test_build_response_backfills_legacy_sse_only_transcripts(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
     key = "websocket:t-legacy"

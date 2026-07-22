@@ -4,6 +4,7 @@ import base64
 from io import BytesIO
 
 import pytest
+from PIL import Image
 
 from pypdf import PdfReader, PdfWriter
 
@@ -28,6 +29,12 @@ def test_markdown_blocks_preserves_rich_structures_for_fallback():
         ("numbered", ("1", "**第一项**")),
         ("hr", ""),
         ("h4", "小节"),
+    ]
+
+
+def test_markdown_blocks_preserves_local_image():
+    assert _markdown_blocks("![收入趋势](assets/revenue.png)") == [
+        ("image", ("收入趋势", "assets/revenue.png")),
     ]
 
 
@@ -88,16 +95,20 @@ def test_pdf_renderer_uses_authenticated_desktop_bridge(monkeypatch, tmp_path):
     monkeypatch.setattr(pdf_tools, "urlopen", open_bridge)
     output = tmp_path / "report.pdf"
 
-    result = pdf_tools._render_pdf_with_desktop("# 标题", output, "标题", "research_report")
+    result = pdf_tools._render_pdf_with_desktop("# 标题", output, output, "标题", "research_report")
 
     assert result == {"page_count": 1}
     assert output.read_bytes().startswith(b"%PDF-")
     assert captured["authorization"] == "Bearer secret"
     assert b'"markdown": "# \\u6807\\u9898"' in captured["body"]
+    assert b'"source_path"' in captured["body"]
 
 
 @pytest.mark.asyncio
 async def test_create_pdf_from_markdown(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    Image.new("RGB", (32, 20), "#3156d3").save(assets / "revenue.png")
     source = tmp_path / "report.md"
     source.write_text(
         "# 青岛啤酒研究报告\n\n"
@@ -106,6 +117,7 @@ async def test_create_pdf_from_markdown(tmp_path):
         "这是一份用于验证中文 PDF 生成的报告正文，包含**重点文字**。\n\n"
         "## 核心指标\n\n"
         "| 指标 | 数值 |\n| --- | --- |\n| 营收 | 100 |\n\n"
+        "![收入趋势](assets/revenue.png)\n\n"
         "- 第一条观点\n- 第二条观点\n",
         encoding="utf-8",
     )
@@ -129,6 +141,7 @@ async def test_create_pdf_from_markdown(tmp_path):
     assert "**" not in text
     assert "---" not in text
     assert "重点文字" in text
+    assert sum(len(page.images) for page in PdfReader(str(output)).pages) >= 1
 
 
 @pytest.mark.asyncio

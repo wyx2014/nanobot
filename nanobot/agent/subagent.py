@@ -312,9 +312,18 @@ class SubagentManager:
             tools = self._build_tools(workspace=root, tools_config=cfg)
             system_prompt = self._build_subagent_prompt(workspace=root)
             if expert_team is not None:
+                members = expert_team.get("members")
+                member = next(
+                    (
+                        item for item in members
+                        if isinstance(item, dict) and item.get("id") == label
+                    ),
+                    None,
+                ) if isinstance(members, list) else None
+                instructions = str(member.get("instructions") or "").strip() if isinstance(member, dict) else ""
                 system_prompt = (
                     f"{system_prompt}\n\n---\n\n"
-                    f"{self._build_expert_team_member_contract(label)}\n\n"
+                    f"{self._build_expert_team_member_contract(label, instructions)}\n\n"
                     f"{self._build_expert_team_data_source_prompt(expert_team, label)}"
                 )
             messages: list[dict[str, Any]] = [
@@ -673,20 +682,16 @@ class SubagentManager:
         status_text = "completed successfully" if status == "ok" else "failed"
 
         announce_content = render_template(
-            "agent/subagent_announce.md",
+            (
+                "agent/subagent_team_announce.md"
+                if expert_team
+                else "agent/subagent_announce.md"
+            ),
             label=label,
             status_text=status_text,
             task=task,
             result=result,
         )
-        if expert_team:
-            announce_content += (
-                "\n\n[Expert-team internal delivery]\n"
-                "This result is evidence for the Team Lead, not a request for a standalone "
-                "user-facing summary. Do not ask the user whether to retry or continue. "
-                "Keep the canonical team workflow open until every member is terminal; then "
-                "continue with Team Lead synthesis, gap filling, report audit, and final report output."
-            )
 
         # Inject as system message to trigger main agent.
         # Use session_key_override to align with the main agent's effective
@@ -814,7 +819,7 @@ class SubagentManager:
         return "\n\n".join(sections)
 
     @staticmethod
-    def _build_expert_team_member_contract(label: str) -> str:
+    def _build_expert_team_member_contract(label: str, instructions: str = "") -> str:
         """Runtime contract that keeps imported team prompts nanobot-native."""
         return f"""# Expert Team Member Runtime Contract
 
@@ -838,7 +843,14 @@ task text:
   perfect source. Never fabricate unavailable data; label gaps and confidence.
 - Do not perform permission prechecks or ask the user to configure `.claude`,
   `/permissions`, or Claude Code settings.
-"""
+""" + (f"""
+
+---
+
+# Role Playbook (authoritative for this member)
+
+{instructions}
+""" if instructions else "")
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""

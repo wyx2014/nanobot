@@ -704,6 +704,159 @@ async def test_expert_team_results_are_batched_and_force_team_lead_continuation(
 
 
 @pytest.mark.asyncio
+async def test_expert_team_run_enables_injection_overflow_while_members_are_active(tmp_path):
+    """The loop should opt expert teams into later-phase result delivery."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+    from nanobot.session.manager import Session
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+
+    pending_queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
+    session = Session(
+        key="websocket:expert-overflow",
+        metadata={"expert_team": {"id": "trading-analysis-team"}},
+    )
+    captured_spec = None
+
+    async def fake_runner_run(spec):
+        nonlocal captured_spec
+        captured_spec = spec
+        return SimpleNamespace(
+            stop_reason="done",
+            final_content="done",
+            error=None,
+            tool_events=[],
+            messages=[],
+            usage={},
+            had_injections=False,
+            tools_used=[],
+        )
+
+    loop.runner.run = AsyncMock(side_effect=fake_runner_run)
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "analyze stock"}],
+        session=session,
+        channel="websocket",
+        chat_id="expert-overflow",
+        metadata={},
+        pending_queue=pending_queue,
+    )
+
+    assert captured_spec is not None
+    assert captured_spec.injection_overflow_predicate is not None
+    assert captured_spec.final_response_guard is None
+    loop.subagents.get_running_count_by_session = MagicMock(return_value=1)
+    assert captured_spec.injection_overflow_predicate() is True
+    loop.subagents.get_running_count_by_session.return_value = 0
+    assert captured_spec.injection_overflow_predicate() is False
+
+
+def test_expert_team_completion_guard_requires_final_delivery_tools() -> None:
+    from nanobot.agent.loop import _expert_team_completion_guard_message
+
+    team = {
+        "completion": {
+            "required_tools": ["write_file", "create_docx", "create_pdf"],
+            "required_artifacts": ["html", "docx", "pdf"],
+        },
+    }
+    partial = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "write",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": "{}"},
+        }],
+    }]
+
+    message = _expert_team_completion_guard_message(team, partial)
+    assert message is not None
+    assert "`create_docx`" in message
+    assert "`create_pdf`" in message
+    assert "do not use `write_stdin`" in message
+
+    complete = [*partial, {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "docx",
+                "type": "function",
+                "function": {"name": "create_docx", "arguments": "{}"},
+            },
+            {
+                "id": "pdf",
+                "type": "function",
+                "function": {"name": "create_pdf", "arguments": "{}"},
+            },
+        ],
+    }]
+    assert _expert_team_completion_guard_message(team, complete) is None
+
+
+@pytest.mark.asyncio
+async def test_expert_team_run_configures_final_delivery_guard(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.session.manager import Session
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    session = Session(
+        key="websocket:expert-completion",
+        metadata={
+            "expert_team": {
+                "id": "trading-analysis-team",
+                "completion": {
+                    "required_tools": ["write_file", "create_docx", "create_pdf"],
+                    "required_artifacts": ["html", "docx", "pdf"],
+                },
+            },
+        },
+    )
+    captured_spec = None
+
+    async def fake_runner_run(spec):
+        nonlocal captured_spec
+        captured_spec = spec
+        return SimpleNamespace(
+            stop_reason="done",
+            final_content="done",
+            error=None,
+            tool_events=[],
+            messages=[],
+            usage={},
+            had_injections=False,
+            tools_used=[],
+        )
+
+    loop.runner.run = AsyncMock(side_effect=fake_runner_run)
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "analyze stock"}],
+        session=session,
+        channel="websocket",
+        chat_id="expert-completion",
+        pending_queue=asyncio.Queue(),
+    )
+
+    assert captured_spec is not None
+    assert captured_spec.final_response_guard is not None
+    message = captured_spec.final_response_guard([
+        {"role": "assistant", "content": "risk manager says SELL"},
+    ])
+    assert message is not None
+    assert "not complete yet" in message
+
+
+@pytest.mark.asyncio
 async def test_drain_pending_no_block_when_no_subagents(tmp_path):
     """_drain_pending should not block when no sub-agents are running."""
     from nanobot.agent.loop import AgentLoop
