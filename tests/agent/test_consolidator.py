@@ -7,6 +7,8 @@ import pytest
 from nanobot.agent.memory import (
     _ARCHIVE_SUMMARY_MAX_CHARS,
     Consolidator,
+    EXPERT_TEAM_HISTORY_SOURCE,
+    EXPERT_TEAM_TURN_KEY,
     MemoryStore,
 )
 from nanobot.providers.base import LLMResponse
@@ -93,6 +95,31 @@ class TestConsolidatorSummarize:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert entries[0]["session_key"] == "telegram:chat-1"
 
+    async def test_expert_team_summary_is_source_tagged_and_methodology_is_skipped(
+        self,
+        consolidator,
+        mock_provider,
+        store,
+    ):
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="- [durable] Private portfolio constraint: max position is 5%.",
+            finish_reason="stop",
+        )
+        messages = [{
+            "role": "assistant",
+            "content": "Analyze with four named expert roles.",
+            EXPERT_TEAM_TURN_KEY: "asset-research-team",
+        }]
+
+        result = await consolidator.archive(messages, session_key="websocket:chat-1")
+
+        assert result == "- [durable] Private portfolio constraint: max position is 5%."
+        prompt = mock_provider.chat_with_retry.await_args.kwargs["messages"][0]["content"]
+        assert "Expert-team memory boundary" in prompt
+        assert "named analysis frameworks" in prompt
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[0]["content"].startswith(EXPERT_TEAM_HISTORY_SOURCE)
+
     async def test_summarize_raw_dumps_on_llm_failure(self, consolidator, mock_provider, store):
         """On LLM failure, raw-dump messages to HISTORY.md."""
         mock_provider.chat_with_retry.side_effect = Exception("API error")
@@ -102,6 +129,24 @@ class TestConsolidatorSummarize:
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
         assert "[RAW]" in entries[0]["content"]
+
+    async def test_expert_team_raw_fallback_does_not_pollute_history(
+        self,
+        consolidator,
+        mock_provider,
+        store,
+    ):
+        mock_provider.chat_with_retry.side_effect = Exception("API error")
+        messages = [{
+            "role": "assistant",
+            "content": "Reusable four-role investment workflow",
+            EXPERT_TEAM_TURN_KEY: "asset-research-team",
+        }]
+
+        result = await consolidator.archive(messages, session_key="websocket:chat-1")
+
+        assert result is None
+        assert store.read_unprocessed_history(since_cursor=0) == []
 
     async def test_raw_dump_fallback_appends_session_key(
         self,
@@ -131,6 +176,12 @@ class TestConsolidatorPromptContract:
             assert mark in prompt
         assert "check context below" not in prompt.lower()
         assert "Do not mark something [skip] merely because it might already exist" in prompt
+
+    def test_dream_prompt_keeps_expert_team_methods_out_of_global_memory(self):
+        prompt = render_template("agent/dream.md", strip=True, skill_creator_path="/tmp/skill")
+
+        assert "[source: expert-team]" in prompt
+        assert "does not imply that its methodology should carry" in prompt
 
 
 class TestConsolidatorArchiveErrorHandling:

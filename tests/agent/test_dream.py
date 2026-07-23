@@ -119,6 +119,16 @@ class TestBuildDreamPrompt:
         assert "[correction]: replace the older conflicting fact" in prompt
         assert "Always strip these bracketed tags from saved memory content" in prompt
 
+    def test_legacy_expert_team_workflow_is_source_tagged_before_dream(self, store):
+        store.append_history("四维度分析框架：四角色并行，结果发送给team-lead")
+
+        result = store.build_dream_prompt()
+
+        assert result is not None
+        prompt, _ = result
+        assert "[source: expert-team]" in prompt
+        assert "Selecting a team for one task does not imply" in prompt
+
 
 class TestDreamTools:
     def test_dream_tools_are_restricted_to_file_edits(self, store):

@@ -34,6 +34,16 @@ if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
 
 
+EXPERT_TEAM_TURN_KEY = "_expert_team_turn"
+EXPERT_TEAM_HISTORY_SOURCE = "[source: expert-team]"
+_LEGACY_EXPERT_TEAM_MEMORY_MARKERS = (
+    "四维度分析框架",
+    "四角色并行",
+    "发送给team-lead",
+    "投研团队（",
+)
+
+
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
@@ -492,10 +502,16 @@ class MemoryStore:
             return None
 
         batch = entries[:max_entries]
-        history_text = "\n".join(
-            f"[{e['timestamp']}] {truncate_text(e['content'], 500)}"
-            for e in batch
-        )
+        def _dream_entry_text(entry: dict[str, Any]) -> str:
+            content = str(entry["content"])
+            if (
+                not content.startswith(EXPERT_TEAM_HISTORY_SOURCE)
+                and any(marker in content for marker in _LEGACY_EXPERT_TEAM_MEMORY_MARKERS)
+            ):
+                content = f"{EXPERT_TEAM_HISTORY_SOURCE}\n{content}"
+            return f"[{entry['timestamp']}] {truncate_text(content, 500)}"
+
+        history_text = "\n".join(_dream_entry_text(entry) for entry in batch)
         skill_creator_path = str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md")
         template = render_template(
             "agent/dream.md", strip=True, skill_creator_path=skill_creator_path,
@@ -573,6 +589,10 @@ class MemoryStore:
         session_key: str | None = None,
     ) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
+        messages = [m for m in messages if not m.get(EXPERT_TEAM_TURN_KEY)]
+        if not messages:
+            logger.info("Skipping raw long-term archive for expert-team-only messages")
+            return
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
         formatted = truncate_text(self._format_messages(messages), limit)
         self.append_history(
@@ -848,18 +868,33 @@ class Consolidator:
         if not messages:
             return None
         messages_to_summarize = summary_messages if summary_messages is not None else messages
+        expert_team_derived = any(
+            message.get(EXPERT_TEAM_TURN_KEY)
+            for message in [*messages, *messages_to_summarize]
+        )
         try:
             formatted = MemoryStore._format_messages(messages_to_summarize)
             formatted = self._truncate_to_token_budget(formatted)
+            archive_contract = render_template(
+                "agent/consolidator_archive.md",
+                strip=True,
+            )
+            if expert_team_derived:
+                archive_contract += (
+                    "\n\n## Expert-team memory boundary\n"
+                    "This chunk was produced with an explicitly selected expert team. "
+                    "Preserve only explicit user preferences and non-public project facts. "
+                    "Mark team roles, named analysis frameworks, parallel-work workflows, "
+                    "report structure, scoring rubrics, and output formatting as [skip]. "
+                    "Selecting a team is not evidence that the user wants its methodology "
+                    "in unrelated or future conversations."
+                )
             response = await self.provider.chat_with_retry(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": render_template(
-                            "agent/consolidator_archive.md",
-                            strip=True,
-                        ),
+                        "content": archive_contract,
                     },
                     {"role": "user", "content": formatted},
                 ],
@@ -869,8 +904,13 @@ class Consolidator:
             if response.finish_reason == "error":
                 raise RuntimeError(f"LLM returned error: {response.content}")
             summary = response.content or "[no summary]"
+            history_summary = (
+                f"{EXPERT_TEAM_HISTORY_SOURCE}\n{summary}"
+                if expert_team_derived
+                else summary
+            )
             self.store.append_history(
-                summary,
+                history_summary,
                 max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
                 session_key=session_key,
             )

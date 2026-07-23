@@ -435,6 +435,27 @@ class WebSocketChannel(BaseChannel):
             self.gateway.session_manager.save(session)
         return binding
 
+    def _set_expert_team(
+        self,
+        chat_id: str,
+        raw: Any,
+    ) -> dict[str, Any] | None:
+        """Explicitly replace or clear a persisted expert-team binding."""
+        binding = normalize_expert_team_binding(raw) if raw is not None else None
+        if self.gateway.session_manager is None:
+            return binding
+        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        existing = session.metadata.get(EXPERT_TEAM_SESSION_KEY)
+        if binding is None:
+            if EXPERT_TEAM_SESSION_KEY in session.metadata:
+                session.metadata.pop(EXPERT_TEAM_SESSION_KEY, None)
+                self.gateway.session_manager.save(session)
+            return None
+        if existing != binding:
+            session.metadata[EXPERT_TEAM_SESSION_KEY] = binding
+            self.gateway.session_manager.save(session)
+        return binding
+
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
         payload: dict[str, Any] = {"event": event}
@@ -733,7 +754,7 @@ class WebSocketChannel(BaseChannel):
         client_id: str,
         envelope: dict[str, Any],
     ) -> None:
-        """Route one typed inbound envelope (``new_chat`` / ``attach`` / ``message``)."""
+        """Route one typed inbound WebUI envelope."""
         t = envelope.get("type")
         if t == "new_chat":
             new_id = str(uuid.uuid4())
@@ -775,6 +796,42 @@ class WebSocketChannel(BaseChannel):
             self._attach(connection, cid)
             await self._send_event(connection, "attached", chat_id=cid)
             await self._hydrate_after_subscribe(cid)
+            return
+        if t == "set_expert_team":
+            cid = envelope.get("chat_id")
+            if not _is_valid_chat_id(cid):
+                await self._send_event(connection, "error", detail="invalid chat_id")
+                return
+            if (
+                websocket_turn_wall_started_at(cid) is not None
+                and envelope.get("expert_team") is not None
+            ):
+                await self._send_event(
+                    connection,
+                    "error",
+                    chat_id=cid,
+                    detail="expert_team_rejected",
+                    reason="chat_running",
+                )
+                return
+            try:
+                expert_team = self._set_expert_team(cid, envelope.get("expert_team"))
+            except ExpertTeamError as exc:
+                await self._send_event(
+                    connection,
+                    "error",
+                    chat_id=cid,
+                    detail="expert_team_rejected",
+                    reason=exc.message,
+                )
+                return
+            await self._send_event(
+                connection,
+                "session_updated",
+                chat_id=cid,
+                scope="metadata",
+                expert_team=public_expert_team_binding(expert_team),
+            )
             return
         if t == "set_workspace_scope":
             cid = envelope.get("chat_id")
@@ -1037,8 +1094,6 @@ class WebSocketChannel(BaseChannel):
             lat_i = int(lat) if isinstance(lat, (int, float)) else None
             gs = msg.metadata.get("goal_state")
             gs_blob = gs if isinstance(gs, dict) else None
-            finish_reason = msg.metadata.get("finish_reason")
-            finish_reason_str = finish_reason if isinstance(finish_reason, str) else None
             team = msg.metadata.get(EXPERT_TEAM_SESSION_KEY)
             run_id = msg.metadata.get("expert_team_run_id")
             if isinstance(team, dict) and isinstance(run_id, str):
@@ -1051,7 +1106,6 @@ class WebSocketChannel(BaseChannel):
                 msg.chat_id,
                 latency_ms=lat_i,
                 goal_state=gs_blob,
-                finish_reason=finish_reason_str,
                 metadata=msg.metadata,
             )
             await self.send_session_updated(msg.chat_id, scope="thread")
@@ -1276,7 +1330,6 @@ class WebSocketChannel(BaseChannel):
         latency_ms: int | None = None,
         *,
         goal_state: dict[str, Any] | None = None,
-        finish_reason: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Signal that the agent has fully finished processing the current turn."""
@@ -1286,8 +1339,6 @@ class WebSocketChannel(BaseChannel):
             body["latency_ms"] = int(latency_ms)
         if goal_state is not None:
             body["goal_state"] = goal_state
-        if finish_reason:
-            body["finish_reason"] = finish_reason
         self._transcripts.prepare_and_append(
             chat_id,
             body,

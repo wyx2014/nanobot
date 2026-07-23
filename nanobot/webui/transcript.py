@@ -1123,73 +1123,6 @@ def _merge_tool_events(previous: Any, incoming: list[dict[str, Any]]) -> list[di
     return merged
 
 
-def _mark_cancelled_turn_activity(messages: list[dict[str, Any]]) -> None:
-    """Replace in-flight UI activity in the current turn with terminal errors."""
-    turn_start = 0
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "user":
-            turn_start = index + 1
-            break
-
-    for index in range(turn_start, len(messages)):
-        message = messages[index]
-        next_message = dict(message)
-        changed = False
-
-        agent_ui = message.get("agentUI")
-        if isinstance(agent_ui, dict) and agent_ui.get("kind") == "task_progress":
-            steps = agent_ui.get("steps")
-            if isinstance(steps, list):
-                next_steps = [_cancel_running_step(step) for step in steps]
-                if next_steps != steps:
-                    next_message["agentUI"] = {
-                        **agent_ui,
-                        "steps": next_steps,
-                        "current_step_id": None,
-                        "note": "任务已由用户终止",
-                    }
-                    changed = True
-
-        tool_events = message.get("toolEvents")
-        if isinstance(tool_events, list):
-            next_events = [
-                {**event, "phase": "error", "error": "已由用户终止"}
-                if isinstance(event, dict) and event.get("phase") == "start"
-                else event
-                for event in tool_events
-            ]
-            if next_events != tool_events:
-                next_message["toolEvents"] = next_events
-                changed = True
-
-        file_edits = message.get("fileEdits")
-        if isinstance(file_edits, list):
-            next_edits = [
-                {**edit, "phase": "error", "status": "error", "error": "已由用户终止"}
-                if isinstance(edit, dict) and edit.get("status") == "editing"
-                else edit
-                for edit in file_edits
-            ]
-            if next_edits != file_edits:
-                next_message["fileEdits"] = next_edits
-                changed = True
-
-        if changed:
-            messages[index] = next_message
-
-
-def _cancel_running_step(step: Any) -> Any:
-    if not isinstance(step, dict) or step.get("status") != "running":
-        return step
-    detail = step.get("detail")
-    cancelled_detail = (
-        f"{detail}（已由用户终止）"
-        if isinstance(detail, str) and detail
-        else "已由用户终止"
-    )
-    return {**step, "status": "error", "detail": cancelled_detail}
-
-
 def _file_edit_key(edit: dict[str, Any]) -> str:
     call_id = str(edit.get("call_id") or "")
     tool = str(edit.get("tool") or "")
@@ -2056,8 +1989,6 @@ def replay_transcript_to_ui_messages(
             suppress_until_turn_end = False
             active_activity_segment_id = None
             active_file_edit_segment_id = None
-            if rec.get("finish_reason") == "cancelled":
-                _mark_cancelled_turn_activity(messages)
             turn_id = rec.get("turn_id")
             if isinstance(turn_id, str) and turn_id:
                 if turn_id in replay_turn_aliases:

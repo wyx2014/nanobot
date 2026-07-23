@@ -1441,57 +1441,6 @@ def test_replay_keeps_consecutive_task_progress_snapshots() -> None:
     ]
 
 
-def test_replay_cancelled_turn_closes_in_flight_activity() -> None:
-    msgs = replay_transcript_to_ui_messages([
-        {"event": "user", "chat_id": "t-cancel", "text": "research"},
-        {
-            "event": "message",
-            "chat_id": "t-cancel",
-            "text": "",
-            "kind": "progress",
-            "agent_ui": {
-                "kind": "task_progress",
-                "note": "正在研究",
-                "current_step_id": "research",
-                "steps": [
-                    {"id": "research", "title": "研究", "status": "running"},
-                    {"id": "write", "title": "撰写", "status": "pending"},
-                ],
-            },
-            "tool_events": [{"phase": "start", "call_id": "call-1", "name": "search_web"}],
-        },
-        {
-            "event": "file_edit",
-            "chat_id": "t-cancel",
-            "edits": [
-                {
-                    "version": 1,
-                    "call_id": "call-2",
-                    "tool": "write_file",
-                    "path": "report.md",
-                    "phase": "start",
-                    "status": "editing",
-                },
-            ],
-        },
-        {"event": "turn_end", "chat_id": "t-cancel", "finish_reason": "cancelled"},
-    ])
-
-    progress = next(message for message in msgs if message.get("agentUI"))
-    assert progress["agentUI"]["current_step_id"] is None
-    assert progress["agentUI"]["note"] == "任务已由用户终止"
-    assert progress["agentUI"]["steps"][0]["status"] == "error"
-    assert progress["toolEvents"][0] == {
-        "phase": "error",
-        "call_id": "call-1",
-        "name": "search_web",
-        "error": "已由用户终止",
-    }
-    file_edit = next(message for message in msgs if message.get("fileEdits"))
-    assert file_edit["fileEdits"][0]["status"] == "error"
-    assert file_edit["fileEdits"][0]["phase"] == "error"
-
-
 def test_replay_file_edit_progress_merges_after_interleaved_activity(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
     key = "websocket:t-file-progress"

@@ -738,6 +738,33 @@ async def test_dispatch_preserves_running_expert_team_after_early_final_response
     loop.subagents.cancel_by_session.assert_not_awaited()
 
 
+def test_expert_team_turns_are_marked_for_memory_isolation(tmp_path):
+    from nanobot.agent.memory import EXPERT_TEAM_TURN_KEY
+    from nanobot.bus.events import InboundMessage
+    from nanobot.session.manager import Session
+
+    loop = _make_loop(tmp_path)
+    session = Session(key="websocket:chat")
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u",
+        chat_id="chat",
+        content="分析股票",
+        metadata={"expert_team": {"id": "asset-research-team"}},
+    )
+
+    assert loop._persist_user_message_early(msg, session) is True
+    loop._save_turn(
+        session,
+        [{"role": "assistant", "content": "团队报告"}],
+        0,
+        expert_team_id="asset-research-team",
+    )
+
+    assert session.messages[0][EXPERT_TEAM_TURN_KEY] == "asset-research-team"
+    assert session.messages[1][EXPERT_TEAM_TURN_KEY] == "asset-research-team"
+
+
 @pytest.mark.asyncio
 async def test_waiting_dispatch_does_not_replace_active_pending_queue(tmp_path):
     """A queued dispatch must not steal the active task's injection queue."""

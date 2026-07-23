@@ -42,6 +42,16 @@ Conversation History may contain Consolidator tags. Treat them as routing and re
 
 Always strip these bracketed tags from saved memory content.
 
+## Expert-team source boundary
+
+Conversation History entries beginning with `[source: expert-team]` came from an
+explicitly selected expert team. Never turn its team roles, named analysis
+frameworks, parallel-work workflow, report structure, scoring rubric, or output
+format into a global preference, SOUL rule, MEMORY fact, or reusable skill.
+Selecting a team for one task does not imply that its methodology should carry
+into other sessions. Retain only an explicit user preference or a genuinely
+non-public project fact that remains useful without the team methodology.
+
 ## Skill-to-skill MECE
 - If a new skill overlaps with an existing skill, merge the delta into the existing skill instead of creating a redundant one
 - Check existing skill descriptions (listed above) before creating a new skill

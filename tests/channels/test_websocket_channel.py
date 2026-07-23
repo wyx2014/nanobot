@@ -553,6 +553,90 @@ async def test_webui_message_scope_inherits_persisted_session_scope(
 
 
 @pytest.mark.asyncio
+async def test_webui_clear_expert_team_unbinds_the_following_turn(
+    bus: MagicMock,
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions = SessionManager(tmp_path / "sessions")
+    session = sessions.get_or_create("websocket:chat-team")
+    session.metadata["expert_team"] = {
+        "id": "asset-research-team",
+        "name": "资产投研团队",
+    }
+    sessions.save(session)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"},
+        bus,
+        gateway=_basic_handler(bus, session_manager=sessions, workspace_path=workspace),
+    )
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {"type": "set_expert_team", "chat_id": "chat-team", "expert_team": None},
+    )
+
+    payload = json.loads(conn.send.await_args.args[0])
+    assert payload == {
+        "event": "session_updated",
+        "chat_id": "chat-team",
+        "scope": "metadata",
+        "expert_team": None,
+    }
+    saved = sessions.read_session_file("websocket:chat-team")
+    assert "expert_team" not in saved["metadata"]
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {"type": "message", "chat_id": "chat-team", "content": "普通问题", "webui": True},
+    )
+
+    msg = bus.publish_inbound.await_args.args[0]
+    assert "expert_team" not in msg.metadata
+    assert "expert_team_run_id" not in msg.metadata
+
+
+@pytest.mark.asyncio
+async def test_webui_clear_expert_team_applies_to_next_turn_while_chat_is_running(
+    bus: MagicMock,
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions = SessionManager(tmp_path / "sessions")
+    session = sessions.get_or_create("websocket:chat-team")
+    session.metadata["expert_team"] = {"id": "asset-research-team"}
+    sessions.save(session)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"},
+        bus,
+        gateway=_basic_handler(bus, session_manager=sessions, workspace_path=workspace),
+    )
+    conn = AsyncMock()
+
+    wth._WEBSOCKET_TURN_WALL_STARTED_AT["chat-team"] = 123.0
+    try:
+        await channel._dispatch_envelope(
+            conn,
+            "webui-client",
+            {"type": "set_expert_team", "chat_id": "chat-team", "expert_team": None},
+        )
+    finally:
+        wth._WEBSOCKET_TURN_WALL_STARTED_AT.clear()
+
+    payload = json.loads(conn.send.await_args.args[0])
+    assert payload["event"] == "session_updated"
+    assert payload["expert_team"] is None
+    saved = sessions.read_session_file("websocket:chat-team")
+    assert "expert_team" not in saved["metadata"]
+
+
+@pytest.mark.asyncio
 async def test_webui_scope_expands_home_project_path(
     bus: MagicMock,
     tmp_path,
@@ -1383,26 +1467,6 @@ async def test_send_turn_end_includes_latency_ms_when_present() -> None:
 
     assert _sent_ws_payloads(mock_ws) == [
         {"event": "turn_end", "chat_id": "chat-1", "latency_ms": 1500},
-        {"event": "session_updated", "chat_id": "chat-1", "scope": "thread"},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_send_turn_end_includes_cancelled_finish_reason() -> None:
-    bus = MagicMock()
-    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
-    mock_ws = AsyncMock()
-    channel._attach(mock_ws, "chat-1")
-
-    await channel.send(OutboundMessage(
-        channel="websocket",
-        chat_id="chat-1",
-        content="",
-        metadata={"_turn_end": True, "finish_reason": "cancelled"},
-    ))
-
-    assert _sent_ws_payloads(mock_ws) == [
-        {"event": "turn_end", "chat_id": "chat-1", "finish_reason": "cancelled"},
         {"event": "session_updated", "chat_id": "chat-1", "scope": "thread"},
     ]
 

@@ -22,7 +22,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, CompositeHook
-from nanobot.agent.memory import Consolidator
+from nanobot.agent.memory import Consolidator, EXPERT_TEAM_TURN_KEY
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skill_scope import (
@@ -763,6 +763,9 @@ class AgentLoop:
         has_text = isinstance(msg.content, str) and msg.content.strip()
         if has_text or media_paths:
             extra: dict[str, Any] = ({"media": list(media_paths)} if media_paths else {}) | agent_context.session_extra(msg.metadata)
+            expert_team = _expert_team_binding(msg.metadata)
+            if expert_team is not None:
+                extra[EXPERT_TEAM_TURN_KEY] = expert_team.get("id") or True
             extra.update(kwargs)
             text = msg.content if isinstance(msg.content, str) else ""
             text_override, cron_extra = cron_history_overrides(msg.metadata)
@@ -1380,17 +1383,6 @@ class AgentLoop:
                             "Could not restore checkpoint for cancelled session {}",
                             session_key,
                             exc_info=True,
-                        )
-                    # A cancelled WebSocket turn still needs the same terminal
-                    # delivery contract as a completed/error turn.  Without it,
-                    # browser clients retain open reasoning placeholders until a
-                    # later event happens to close them.
-                    if not turn_continuation.internal_continuation_pending(msg.metadata):
-                        await self._runtime_events().turn_completed(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            session_key=session_key,
-                            metadata={**msg.metadata, "finish_reason": "cancelled"},
                         )
                     raise
                 except Exception as exc:
@@ -2083,6 +2075,12 @@ class AgentLoop:
         self._save_turn(
             ctx.session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
+            expert_team_id=(
+                str(expert_team["id"])
+                if (expert_team := _expert_team_binding(ctx.msg.metadata, ctx.session.metadata))
+                and expert_team.get("id")
+                else None
+            ),
         )
         self._runtime_events().record_turn_latency(
             ctx.session_key,
@@ -2167,6 +2165,7 @@ class AgentLoop:
         skip: int,
         *,
         turn_latency_ms: int | None = None,
+        expert_team_id: str | None = None,
     ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
@@ -2181,6 +2180,8 @@ class AgentLoop:
         last_assistant_idx: int | None = None
         for m in messages[skip:]:
             entry = dict(m)
+            if expert_team_id:
+                entry[EXPERT_TEAM_TURN_KEY] = expert_team_id
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
@@ -2252,6 +2253,11 @@ class AgentLoop:
             sender_id=msg.sender_id,
             injected_event="subagent_result",
             subagent_task_id=task_id,
+            **(
+                {EXPERT_TEAM_TURN_KEY: msg.metadata.get("expert_team_run_id") or True}
+                if isinstance(msg.metadata, dict) and msg.metadata.get("expert_team_run_id")
+                else {}
+            ),
         )
         return True
 
