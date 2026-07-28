@@ -265,6 +265,14 @@ class CronService:
                                 or {}
                             ),
                             session_key=j["payload"].get("sessionKey") or j["payload"].get("session_key"),
+                            project_id=(
+                                j["payload"].get("projectId")
+                                or j["payload"].get("project_id")
+                            ),
+                            created_session_id=(
+                                j["payload"].get("createdSessionId")
+                                or j["payload"].get("created_session_id")
+                            ),
                             origin_channel=(
                                 j["payload"].get("originChannel")
                                 or j["payload"].get("origin_channel")
@@ -476,6 +484,8 @@ class CronService:
                         "to": j.payload.to,
                         "channelMeta": j.payload.channel_meta,
                         "sessionKey": j.payload.session_key,
+                        "projectId": j.payload.project_id,
+                        "createdSessionId": j.payload.created_session_id,
                         "originChannel": j.payload.origin_channel,
                         "originChatId": j.payload.origin_chat_id,
                         "originMetadata": j.payload.origin_metadata,
@@ -768,6 +778,8 @@ class CronService:
         origin_channel: str | None = None,
         origin_chat_id: str | None = None,
         origin_metadata: dict | None = None,
+        project_id: str | None = None,
+        created_session_id: str | None = None,
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -786,6 +798,8 @@ class CronService:
                 to=to,
                 channel_meta=channel_meta or {},
                 session_key=session_key,
+                project_id=project_id,
+                created_session_id=created_session_id,
                 origin_channel=origin_channel,
                 origin_chat_id=origin_chat_id,
                 origin_metadata=origin_metadata or {},
@@ -879,6 +893,7 @@ class CronService:
         to: str | None = ...,
         channel_meta: dict | None = ...,
         origin_metadata: dict | None = ...,
+        project_id: str | None = ...,
         delete_after_run: bool | None = None,
     ) -> CronJob | Literal["not_found", "protected"]:
         """Update mutable fields of an existing job. System jobs cannot be updated.
@@ -910,6 +925,8 @@ class CronService:
             job.payload.channel_meta = channel_meta or {}
         if origin_metadata is not ...:
             job.payload.origin_metadata = origin_metadata or {}
+        if project_id is not ...:
+            job.payload.project_id = project_id
         if delete_after_run is not None:
             job.delete_after_run = delete_after_run
         _normalize_agent_turn_job(job)

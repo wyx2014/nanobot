@@ -7,6 +7,7 @@ import pytest
 
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.filesystem import FileToolsConfig
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ToolsConfig
 from nanobot.providers.base import LLMProvider
@@ -79,3 +80,29 @@ def test_subagent_respects_file_tool_toggle(tmp_path):
         "write_file",
     }
     assert file_tools.isdisjoint(tools.tool_names)
+
+
+def test_expert_team_inherits_only_its_configured_mcp_tools(tmp_path):
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    parent_tools = ToolRegistry()
+    juyuan = MagicMock()
+    juyuan.name = "mcp_juyuan_company_financials"
+    unrelated = MagicMock()
+    unrelated.name = "mcp_browser_snapshot"
+    parent_tools.register(juyuan)
+    parent_tools.register(unrelated)
+    manager = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+        parent_tools=parent_tools,
+    )
+
+    tools = manager._build_tools(expert_team={
+        "mcp_presets": [{"name": "juyuan", "configured": True}],
+    })
+
+    assert tools.get("mcp_juyuan_company_financials") is juyuan
+    assert not tools.has("mcp_browser_snapshot")

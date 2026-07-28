@@ -112,6 +112,21 @@ def test_list_skills_merges_workspace_and_builtin(tmp_path: Path) -> None:
     ]
 
 
+def test_active_skill_context_includes_registry_resolved_directory(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    builtin = tmp_path / "builtin"
+    skill_path = _write_skill(builtin, "ifind-finance-data", body="# iFinD")
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+
+    context = loader.load_skills_for_context(["ifind-finance-data"])
+
+    assert "Registry source: `builtin`" in context
+    assert f"Skill directory: `{skill_path.parent}`" in context
+    assert "do not search the filesystem for another copy" in context
+    assert "# iFinD" in context
+
+
 def test_list_skills_builtin_omitted_when_dir_missing(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     ws_skills = workspace / "skills"

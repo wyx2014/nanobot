@@ -6,6 +6,8 @@ import json
 import random
 import socket
 import time
+import zipfile
+import io
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 from nanobot.session.manager import Session, SessionManager
+from nanobot.storage.journal import SessionEventJournal
 from nanobot.webui.gateway_services import GatewayServices, build_gateway_services
 
 _PORT = 29900
@@ -139,6 +142,109 @@ def _seed_many(workspace: Path, keys: list[str]) -> SessionManager:
     return sm
 
 
+def test_session_listing_does_not_eagerly_replay_event_journals(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sm = _seed_session(tmp_path, key="websocket:large-history")
+
+    def reject_full_recovery(_journal: SessionEventJournal) -> dict[str, int]:
+        raise AssertionError("gateway startup must not replay all event journals")
+
+    monkeypatch.setattr(SessionEventJournal, "recover_all", reject_full_recovery)
+    gateway = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+    gateway.journal.ensure_recovered = MagicMock(
+        side_effect=AssertionError(
+            "session listing must not replay the session event journal"
+        )
+    )
+
+    payload = gateway.http._sessions_list_payload()
+
+    assert [row["key"] for row in payload["sessions"]] == [
+        "websocket:large-history"
+    ]
+    assert gateway.state.get_session("websocket:large-history") is not None
+    gateway.journal.ensure_recovered.assert_not_called()
+
+
+def test_session_listing_uses_metadata_only_after_sqlite_projection(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sm = _seed_session(tmp_path, key="websocket:projected-history")
+    gateway = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+
+    first = gateway.http._sessions_list_payload()
+    assert [row["key"] for row in first["sessions"]] == [
+        "websocket:projected-history"
+    ]
+
+    monkeypatch.setattr(
+        sm,
+        "read_session_file",
+        MagicMock(
+            side_effect=AssertionError(
+                "projected session listing must not load full transcripts"
+            )
+        ),
+    )
+    second = gateway.http._sessions_list_payload()
+
+    assert [row["key"] for row in second["sessions"]] == [
+        "websocket:projected-history"
+    ]
+    sm.read_session_file.assert_not_called()
+
+
+def test_session_listing_merges_sqlite_session_missing_from_jsonl_index(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sm = _seed_session(tmp_path, key="websocket:sqlite-only")
+    gateway = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+    project = gateway.state.ensure_project(tmp_path)
+    state_session = gateway.state.bind_session(
+        "websocket:sqlite-only",
+        project.id,
+        title="SQLite session",
+    )
+    monkeypatch.setattr(
+        "nanobot.webui.ws_http.list_webui_sessions",
+        lambda _manager: [],
+    )
+
+    payload = gateway.http._sessions_list_payload()
+
+    [row] = payload["sessions"]
+    assert row["key"] == "websocket:sqlite-only"
+    assert isinstance(row["created_at"], str)
+    assert isinstance(row["updated_at"], str)
+    assert row["title"] == "SQLite session"
+    assert row["preview"] == "hi"
+    assert row["workspace_scope"]["project_path"] == str(tmp_path)
+    assert row["session_id"] == state_session.id
+    assert row["project_id"] == project.id
+
+
 @pytest.mark.asyncio
 async def test_bootstrap_returns_token_for_localhost(
     bus: MagicMock, tmp_path: Path
@@ -194,6 +300,269 @@ async def test_sessions_routes_require_bearer_token(
         body = msgs.json()
         assert body["key"] == "websocket:abc"
         assert [m["role"] for m in body["messages"]] == ["user", "assistant"]
+
+        runtime = await _http_get(
+            "http://127.0.0.1:29902/api/sessions/"
+            "websocket%3Aabc/runtime-snapshot",
+            headers=auth,
+        )
+        assert runtime.status_code == 200
+        runtime_body = runtime.json()
+        assert runtime_body["session_key"] == "websocket:abc"
+        assert runtime_body["thread_status"] == {"type": "notLoaded"}
+        assert runtime_body["active_turn"] is None
+        assert runtime_body["project_id"].startswith("prj_")
+        assert runtime_body["session_id"].startswith("ses_")
+
+        diagnostics = await _http_get(
+            "http://127.0.0.1:29902/api/sessions/"
+            "websocket%3Aabc/runtime-diagnostics",
+            headers=auth,
+        )
+        assert diagnostics.status_code == 200
+        assert diagnostics.json()["runtime_snapshot"]["session_key"] == "websocket:abc"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_projects_api_exposes_stable_project_and_session_ids(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "customer-a"
+    project_path.mkdir()
+    sm = SessionManager(tmp_path)
+    session = Session(
+        key="websocket:project-chat",
+        metadata={
+            "title": "Project chat",
+            "workspace_scope": {
+                "project_path": str(project_path),
+                "access_mode": "restricted",
+            },
+        },
+    )
+    session.add_message("user", "project question")
+    sm.save(session)
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+        port=29939,
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get("http://127.0.0.1:29939/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+
+        projects_response = await _http_get(
+            "http://127.0.0.1:29939/api/projects",
+            headers=auth,
+        )
+        assert projects_response.status_code == 200
+        project = next(
+            row
+            for row in projects_response.json()["projects"]
+            if row["name"] == "customer-a"
+        )
+        assert project["id"].startswith("prj_")
+        assert project["kind"] == "workspace"
+        assert project["root_path"] == str(project_path)
+
+        sessions_response = await _http_get(
+            f"http://127.0.0.1:29939/api/projects/{project['id']}/sessions",
+            headers=auth,
+        )
+        assert sessions_response.status_code == 200
+        [project_session] = sessions_response.json()["sessions"]
+        assert project_session["id"].startswith("ses_")
+        assert project_session["project_id"] == project["id"]
+        assert project_session["session_key"] == "websocket:project-chat"
+        assert project_session["title"] == "Project chat"
+
+        exported = await _http_get(
+            f"http://127.0.0.1:29939/api/projects/{project['id']}/export",
+            headers=auth,
+        )
+        assert exported.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            assert {"manifest.json", "state-export.json"} <= set(archive.namelist())
+            exported_manifest = json.loads(archive.read("manifest.json"))
+        assert exported_manifest["project"]["id"] == project["id"]
+        assert exported_manifest["sessions"][0]["id"] == project_session["id"]
+
+        relocated_path = tmp_path / "customer-a-relocated"
+        relocated_path.mkdir()
+        relocated = await _http_get(
+            f"http://127.0.0.1:29939/api/projects/{project['id']}/relocate"
+            f"?path={quote(str(relocated_path))}",
+            headers=auth,
+        )
+        assert relocated.status_code == 200
+        assert relocated.json()["project"]["id"] == project["id"]
+        assert relocated.json()["project"]["root_path"] == str(relocated_path)
+
+        archived = await _http_get(
+            f"http://127.0.0.1:29939/api/projects/{project['id']}/archive",
+            headers=auth,
+        )
+        assert archived.status_code == 200
+        assert archived.json()["project"]["status"] == "archived"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_project_memory_routes_are_authenticated_and_project_scoped(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "memory-project"
+    project_path.mkdir()
+    channel = _ch(
+        bus,
+        session_manager=SessionManager(tmp_path),
+        workspace_path=tmp_path,
+        port=29948,
+    )
+    project = channel.gateway.state.ensure_project(project_path, kind="workspace")
+    session = channel.gateway.state.bind_session("websocket:memory-chat", project.id)
+    memory_id = channel.gateway.state.upsert_project_memory(
+        project.id,
+        kind="workflow",
+        title="Package manager",
+        content="Use pnpm.",
+        source_session_id=session.id,
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        url = f"http://127.0.0.1:29948/api/projects/{project.id}/memories"
+        denied = await _http_get(url)
+        assert denied.status_code == 401
+
+        boot = await _http_get("http://127.0.0.1:29948/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+        listing = await _http_get(url, headers=auth)
+        assert listing.status_code == 200
+        body = listing.json()
+        assert body["project_id"] == project.id
+        assert body["retrieval"]["deep_rag_enabled"] is False
+        assert body["memories"][0]["id"] == memory_id
+        assert body["memories"][0]["content"] == "Use pnpm."
+
+        reindexed = await _http_get(f"{url}/reindex", headers=auth)
+        assert reindexed.status_code == 200
+        assert reindexed.json()["retrieval"]["deep_rag_enabled"] is False
+
+        forgotten = await _http_get(f"{url}/{memory_id}/forget", headers=auth)
+        assert forgotten.status_code == 200
+        assert forgotten.json()["ok"] is True
+        after = await _http_get(url, headers=auth)
+        assert after.json()["memories"] == []
+
+        cleared = await _http_get(f"{url}/clear", headers=auth)
+        assert cleared.status_code == 200
+        assert cleared.json()["removed"] == 0
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_session_artifact_routes_list_and_serve_workspace_file(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    sm = _seed_session(tmp_path, key="websocket:artifact-chat")
+    report = tmp_path / "reports" / "market.pdf"
+    report.parent.mkdir()
+    report.write_bytes(b"%PDF-session-artifact")
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+        port=29938,
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        unauthenticated = await _http_get(
+            "http://127.0.0.1:29938/api/sessions/"
+            "websocket%3Aartifact-chat/artifacts"
+        )
+        assert unauthenticated.status_code == 401
+
+        boot = await _http_get("http://127.0.0.1:29938/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+        listing = await _http_get(
+            "http://127.0.0.1:29938/api/sessions/"
+            "websocket%3Aartifact-chat/artifacts",
+            headers=auth,
+        )
+        assert listing.status_code == 200
+        row = next(
+            artifact
+            for artifact in listing.json()["artifacts"]
+            if artifact["path"] == "reports/market.pdf"
+        )
+        assert row["name"] == "market.pdf"
+        assert row["id"].startswith("art_")
+        assert row["project_id"].startswith("prj_")
+        assert row["session_id"].startswith("ses_")
+        assert row["status"] == "ready"
+        assert row["preview_url"].startswith("/api/artifacts/")
+        assert "session=websocket%3Aartifact-chat" in row["preview_url"]
+        assert "local_path" not in row
+
+        content = await _http_get(
+            f"http://127.0.0.1:29938{row['preview_url']}",
+            headers=auth,
+        )
+        assert content.status_code == 200
+        assert content.content == b"%PDF-session-artifact"
+        assert content.headers["content-type"] == "application/pdf"
+        assert content.headers["content-disposition"].startswith("inline;")
+
+        missing_session = await _http_get(
+            f"http://127.0.0.1:29938/api/artifacts/{row['id']}/content",
+            headers=auth,
+        )
+        assert missing_session.status_code == 400
+
+        wrong_session = await _http_get(
+            f"http://127.0.0.1:29938/api/artifacts/{row['id']}/content"
+            "?session=websocket%3Aother-chat",
+            headers=auth,
+        )
+        assert wrong_session.status_code == 404
+
+        diagnostic_denied = await _http_get(
+            "http://127.0.0.1:29938/api/diagnostics/logs"
+        )
+        assert diagnostic_denied.status_code == 401
+        diagnostics = await _http_get(
+            "http://127.0.0.1:29938/api/diagnostics/logs"
+            f"?artifact_id={row['id']}",
+            headers=auth,
+        )
+        assert diagnostics.status_code == 200
+        events = {
+            log["event_name"] for log in diagnostics.json()["logs"]
+        }
+        assert "artifact_content_served" in events
+        assert "artifact_content_failed" in events
+
+        traversal = await _http_get(
+            "http://127.0.0.1:29938/api/sessions/"
+            "websocket%3Aartifact-chat/artifacts/content?path=../secret.txt",
+            headers=auth,
+        )
+        assert traversal.status_code in {403, 404}
     finally:
         await channel.stop()
         await server_task
@@ -407,10 +776,12 @@ async def test_webui_skills_route_requires_token_and_hides_paths(
         assert "path" not in detail_body
         assert detail_body["requirements"] == {
             "bins": ["definitely-missing-nanobot-skill-cli"],
-            "env": ["DEFINITELY_MISSING_NANOBOT_SKILL_ENV"],
-            "missing_bins": ["definitely-missing-nanobot-skill-cli"],
-            "missing_env": ["DEFINITELY_MISSING_NANOBOT_SKILL_ENV"],
-        }
+                "env": ["DEFINITELY_MISSING_NANOBOT_SKILL_ENV"],
+                "files": [],
+                "missing_bins": ["definitely-missing-nanobot-skill-cli"],
+                "missing_env": ["DEFINITELY_MISSING_NANOBOT_SKILL_ENV"],
+                "missing_files": [],
+            }
         assert "Use the missing CLI and env var." in detail_body["raw_markdown"]
     finally:
         await channel.stop()
@@ -807,7 +1178,7 @@ async def test_webui_sidebar_state_routes_are_config_dir_scoped(
 
 
 @pytest.mark.asyncio
-async def test_session_delete_removes_file(
+async def test_session_delete_archives_and_can_restore_without_removing_files(
     bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
@@ -833,8 +1204,20 @@ async def test_session_delete_removes_file(
         )
         assert resp.status_code == 200
         assert resp.json()["deleted"] is True
-        assert not path.exists()
-        assert not webui_path.exists()
+        assert resp.json()["archived"] is True
+        assert path.exists()
+        assert webui_path.exists()
+        hidden = await _http_get(
+            "http://127.0.0.1:29903/api/sessions",
+            headers=auth,
+        )
+        assert all(row["key"] != "websocket:doomed" for row in hidden.json()["sessions"])
+        restored = await _http_get(
+            "http://127.0.0.1:29903/api/sessions/websocket:doomed/restore",
+            headers=auth,
+        )
+        assert restored.status_code == 200
+        assert restored.json()["restored"] is True
     finally:
         await channel.stop()
         await server_task
@@ -1168,7 +1551,7 @@ async def test_session_delete_can_cascade_bound_automations(
 
         assert resp.status_code == 200
         assert resp.json()["deleted"] is True
-        assert not path.exists()
+        assert path.exists()
         assert cron.list_bound_cron_jobs_for_session("websocket:doomed") == []
         assert cron.list_jobs(include_disabled=True) == []
     finally:
@@ -1252,7 +1635,7 @@ async def test_session_routes_accept_percent_encoded_websocket_keys(
         )
         assert deleted.status_code == 200
         assert deleted.json()["deleted"] is True
-        assert not path.exists()
+        assert path.exists()
     finally:
         await channel.stop()
         await server_task

@@ -14,6 +14,7 @@ from nanobot.webui.transcript import (
     fork_transcript_before_user_index,
     read_transcript_lines,
     replay_transcript_to_ui_messages,
+    webui_transcript_path,
     webui_transcript_segments_dir,
     write_session_messages_as_transcript,
 )
@@ -26,6 +27,30 @@ def test_append_and_read_roundtrip(tmp_path, monkeypatch) -> None:
     lines = read_transcript_lines(key)
     assert len(lines) == 1
     assert lines[0]["text"] == "hello"
+
+
+def test_corrupt_jsonl_tail_is_quarantined_before_future_appends(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:corrupt-tail"
+    append_transcript_object(key, {"event": "user", "text": "valid"})
+    path = webui_transcript_path(key)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("{broken-json\n")
+        handle.write('{"event":"message","text":"must-be-quarantined"}\n')
+
+    assert [row["text"] for row in read_transcript_lines(key)] == ["valid"]
+    backups = list(path.parent.glob(path.name + ".corrupt-*"))
+    assert len(backups) == 1
+    assert "must-be-quarantined" in backups[0].read_text(encoding="utf-8")
+
+    append_transcript_object(key, {"event": "message", "text": "after-repair"})
+    assert [row["text"] for row in read_transcript_lines(key)] == [
+        "valid",
+        "after-repair",
+    ]
 
 
 def test_interactive_prompt_replay_resolves_answer_state(tmp_path, monkeypatch) -> None:
@@ -493,7 +518,12 @@ def test_replay_delta_and_turn_end(tmp_path, monkeypatch) -> None:
         {"event": "reasoning_end", "chat_id": "t2"},
         {"event": "delta", "chat_id": "t2", "text": "a"},
         {"event": "stream_end", "chat_id": "t2"},
-        {"event": "turn_end", "chat_id": "t2", "latency_ms": 42},
+        {
+            "event": "turn_end",
+            "chat_id": "t2",
+            "latency_ms": 42,
+            "usage": {"prompt_tokens": 120, "completion_tokens": 34},
+        },
     ):
         append_transcript_object(key, ev)
     lines = read_transcript_lines(key)
@@ -505,6 +535,7 @@ def test_replay_delta_and_turn_end(tmp_path, monkeypatch) -> None:
     assert msgs[1]["content"] == "a"
     assert msgs[1]["reasoning"] == "think"
     assert msgs[1]["latencyMs"] == 42
+    assert msgs[1]["usage"] == {"inputTokens": 120, "outputTokens": 34}
 
 
 def test_thread_response_does_not_mark_completed_message_tool_tail_pending(
@@ -913,6 +944,76 @@ def test_replay_replaces_streamed_report_with_authoritative_attachment_message()
     assert len(assistant) == 1
     assert assistant[0]["content"] == "青岛啤酒（600600.SH）投资研究报告"
     assert assistant[0]["media"][0]["name"] == "青岛啤酒投资研究报告.html"
+
+
+def test_replay_keeps_structured_progress_after_media_message() -> None:
+    msgs = replay_transcript_to_ui_messages(
+        [
+            {"event": "user", "chat_id": "t-pdf", "text": "生成 PDF", "turn_id": "turn-pdf"},
+            {
+                "event": "message",
+                "chat_id": "t-pdf",
+                "kind": "progress",
+                "text": "",
+                "agent_ui": {
+                    "kind": "task_progress",
+                    "note": "正在转换为 PDF",
+                    "current_step_id": "pdf",
+                    "steps": [{"id": "pdf", "title": "转换为 PDF", "status": "running"}],
+                },
+                "tool_events": [{
+                    "phase": "start",
+                    "call_id": "call-pdf",
+                    "name": "convert_to_pdf",
+                    "arguments": {"path": "report.md"},
+                }],
+                "turn_id": "turn-pdf",
+            },
+            {
+                "event": "message",
+                "chat_id": "t-pdf",
+                "text": "PDF 已生成",
+                "media_urls": [{"url": "/api/media/report", "name": "report.pdf"}],
+                "turn_id": "turn-pdf",
+            },
+            {
+                "event": "message",
+                "chat_id": "t-pdf",
+                "kind": "progress",
+                "text": "",
+                "agent_ui": {
+                    "kind": "task_progress",
+                    "note": "PDF 转换完成",
+                    "steps": [{"id": "pdf", "title": "转换为 PDF", "status": "completed"}],
+                },
+                "tool_events": [{
+                    "phase": "end",
+                    "call_id": "call-pdf",
+                    "name": "convert_to_pdf",
+                    "arguments": {"path": "report.md"},
+                    "result": "ok",
+                }],
+                "turn_id": "turn-pdf",
+            },
+            {"event": "turn_end", "chat_id": "t-pdf", "turn_id": "turn-pdf"},
+        ],
+    )
+
+    progress = [
+        message
+        for message in msgs
+        if isinstance(message.get("agentUI"), dict)
+        and message["agentUI"].get("kind") == "task_progress"
+    ]
+    assert len(progress) == 2
+    assert progress[-1]["agentUI"]["steps"][0]["status"] == "completed"
+    assert progress[-1]["agentUI"]["note"] == "PDF 转换完成"
+    assert progress[-1]["toolEvents"][0]["phase"] == "end"
+    assert any(
+        message.get("role") == "assistant"
+        and message.get("media", [{}])[0].get("name") == "report.pdf"
+        for message in msgs
+    )
 
 
 def test_replay_repairs_legacy_exact_streamed_attachment_duplicate() -> None:
@@ -1634,6 +1735,139 @@ def test_replay_keeps_new_file_edit_after_reasoning_in_order(tmp_path, monkeypat
     ]
     assert len(file_edit_segments) == 2
     assert file_edit_segments[0] != file_edit_segments[1]
+
+
+def test_replay_keeps_public_narration_in_trace_not_answer(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:t-narration"
+    for event in (
+        {"event": "user", "chat_id": "t-narration", "text": "analyze"},
+        {
+            "event": "delta",
+            "chat_id": "t-narration",
+            "stream_id": "stream-1",
+            "text": "I will fetch detailed sources.",
+        },
+        {
+            "event": "stream_end",
+            "chat_id": "t-narration",
+            "stream_id": "stream-1",
+            "resuming": True,
+            "stream_kind": "narration",
+        },
+        {
+            "event": "narration_delta",
+            "chat_id": "t-narration",
+            "stream_id": "stream-1",
+            "replaces_stream_id": "stream-1",
+            "text": "I will fetch detailed sources.",
+        },
+        {
+            "event": "narration_end",
+            "chat_id": "t-narration",
+            "stream_id": "stream-1",
+            "replaces_stream_id": "stream-1",
+        },
+        {
+            "event": "message",
+            "chat_id": "t-narration",
+            "text": "Final answer.",
+        },
+        {"event": "turn_end", "chat_id": "t-narration"},
+    ):
+        append_transcript_object(key, event)
+
+    messages = replay_transcript_to_ui_messages(read_transcript_lines(key))
+
+    assert [message["role"] for message in messages] == ["user", "tool", "assistant"]
+    trace = messages[1]
+    assert trace["kind"] == "trace"
+    assert trace["content"] == ""
+    assert trace["narration"] == "I will fetch detailed sources."
+    assert messages[2]["content"] == "Final answer."
+    assert all(
+        message.get("content") != "I will fetch detailed sources."
+        for message in messages
+        if message.get("role") == "assistant"
+    )
+
+
+def test_replay_preserves_reasoning_before_narration_and_keeps_tool_hint_separate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:t-reasoning-narration"
+    for event in (
+        {"event": "user", "chat_id": "t-reasoning-narration", "text": "analyze"},
+        {
+            "event": "reasoning_delta",
+            "chat_id": "t-reasoning-narration",
+            "text": "I should inspect primary sources.",
+        },
+        {
+            "event": "delta",
+            "chat_id": "t-reasoning-narration",
+            "stream_id": "stream-1",
+            "text": "I will fetch detailed sources.",
+        },
+        {
+            "event": "stream_end",
+            "chat_id": "t-reasoning-narration",
+            "stream_id": "stream-1",
+            "resuming": True,
+            "stream_kind": "narration",
+        },
+        {
+            "event": "narration_delta",
+            "chat_id": "t-reasoning-narration",
+            "stream_id": "stream-1",
+            "replaces_stream_id": "stream-1",
+            "text": "I will fetch detailed sources.",
+        },
+        {
+            "event": "narration_end",
+            "chat_id": "t-reasoning-narration",
+            "stream_id": "stream-1",
+            "replaces_stream_id": "stream-1",
+        },
+        {
+            "event": "message",
+            "chat_id": "t-reasoning-narration",
+            "kind": "tool_hint",
+            "text": "Searched the web — market",
+        },
+        {
+            "event": "message",
+            "chat_id": "t-reasoning-narration",
+            "text": "Final answer.",
+        },
+        {"event": "turn_end", "chat_id": "t-reasoning-narration"},
+    ):
+        append_transcript_object(key, event)
+
+    messages = replay_transcript_to_ui_messages(read_transcript_lines(key))
+
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "assistant",
+    ]
+    reasoning, narration, tool_hint, answer = messages[1:]
+    assert reasoning["content"] == ""
+    assert reasoning["reasoning"] == "I should inspect primary sources."
+    assert not reasoning.get("isStreaming")
+    assert not reasoning.get("reasoningStreaming")
+    assert "streamId" not in reasoning
+    assert narration["content"] == ""
+    assert narration["narration"] == "I will fetch detailed sources."
+    assert narration["activitySegmentId"] == reasoning["activitySegmentId"]
+    assert tool_hint["content"] == "Searched the web — market"
+    assert tool_hint["traces"] == ["Searched the web — market"]
+    assert "narration" not in tool_hint
+    assert answer["content"] == "Final answer."
 
 
 def test_build_response_schema(monkeypatch, tmp_path) -> None:

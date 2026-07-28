@@ -22,7 +22,7 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, CompositeHook
-from nanobot.agent.memory import Consolidator, EXPERT_TEAM_TURN_KEY
+from nanobot.agent.memory import EXPERT_TEAM_TURN_KEY, Consolidator
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skill_scope import (
@@ -40,6 +40,7 @@ from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import (
     RuntimeEventBus,
+    RuntimeEventContext,
     RuntimeEventPublisher,
     ensure_runtime_event_publisher,
 )
@@ -49,8 +50,22 @@ from nanobot.cron.session_turns import (
     cron_history_overrides,
     is_cron_turn,
 )
+from nanobot.memories.project import ProjectMemoryPipeline, ProjectMemoryPipelineConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
+from nanobot.runtime.turn_lifecycle import (
+    FinishReason,
+    ThreadRuntimeRegistry,
+    TurnLifecycleError,
+    TurnLifecycleManager,
+    TurnStatus,
+)
+from nanobot.security.project_context import (
+    PROJECT_CONTEXT_METADATA_KEY,
+    bind_project_context,
+    project_context_from_metadata,
+    reset_project_context,
+)
 from nanobot.security.workspace_access import (
     WorkspaceScopeResolver,
     bind_workspace_scope,
@@ -64,12 +79,12 @@ from nanobot.session.goal_state import (
 )
 from nanobot.session.keys import UNIFIED_SESSION_KEY, session_key_for_channel
 from nanobot.session.manager import Session, SessionManager
+from nanobot.storage.state import StateStore
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
-from nanobot.webui.project_skills_api import project_skill_grants
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
@@ -82,6 +97,7 @@ from nanobot.webui.interactive_prompt import (
     reset_interactive_prompt_requested,
     set_interactive_prompt_requested,
 )
+from nanobot.webui.project_skills_api import project_skill_grants
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -239,6 +255,7 @@ class TurnContext:
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
     turn_latency_ms: int | None = None
+    turn_usage: dict[str, int] = field(default_factory=dict)
 
     trace: list[StateTraceEntry] = field(default_factory=list)
 
@@ -341,7 +358,9 @@ class AgentLoop:
         model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_events: RuntimeEventBus | None = None,
+        thread_runtime_registry: ThreadRuntimeRegistry | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        project_memory_config: Any | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -350,6 +369,10 @@ class AgentLoop:
         self.bus = bus
         self.runtime_events = runtime_events or RuntimeEventBus()
         self.runtime_event_publisher = RuntimeEventPublisher(self.runtime_events)
+        self.thread_runtime_registry = thread_runtime_registry or ThreadRuntimeRegistry(
+            runtime_events=self.runtime_events,
+        )
+        self.turn_lifecycle = TurnLifecycleManager(self.thread_runtime_registry)
         self.channels_config = channels_config
         self.provider = provider
         self._provider_snapshot_loader = provider_snapshot_loader
@@ -416,6 +439,7 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
+            parent_tools=self.tools,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -456,10 +480,21 @@ class AgentLoop:
             consolidation_ratio=consolidation_ratio,
             unified_session=unified_session,
         )
+        self._project_consolidators: dict[str, Consolidator] = {}
+        self.project_memory = ProjectMemoryPipeline(
+            state=StateStore(
+                workspace.expanduser().resolve(strict=False) / ".nanobot" / "state.sqlite",
+                default_workspace=workspace,
+            ),
+            provider=provider,
+            model=self.model,
+            config=ProjectMemoryPipelineConfig.from_runtime(project_memory_config),
+        )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
+            consolidator_for_session=self._consolidator_for_session,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
@@ -524,6 +559,7 @@ class AgentLoop:
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
+            project_memory_config=config.agents.defaults.dream,
             **extra,
         )
 
@@ -549,6 +585,9 @@ class AgentLoop:
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
+        for project_consolidator in self._project_consolidators.values():
+            project_consolidator.set_provider(provider, model, context_window_tokens)
+        self.project_memory.set_provider(provider, model)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
             self._runtime_model_publisher(
@@ -741,6 +780,125 @@ class AgentLoop:
     def _runtime_events(self) -> RuntimeEventPublisher:
         return ensure_runtime_event_publisher(self)
 
+    @staticmethod
+    def _ensure_runtime_turn_identity(
+        msg: InboundMessage,
+        session_key: str,
+    ) -> InboundMessage:
+        metadata = dict(msg.metadata or {})
+        runtime_turn_id = metadata.get("_runtime_turn_id")
+        if not isinstance(runtime_turn_id, str) or not runtime_turn_id.strip():
+            webui_turn_id = metadata.get("webui_turn_id")
+            runtime_turn_id = (
+                str(webui_turn_id).strip()
+                if isinstance(webui_turn_id, str) and webui_turn_id.strip()
+                else f"{session_key}:{time.time_ns()}"
+            )
+            metadata["_runtime_turn_id"] = runtime_turn_id
+        if metadata == (msg.metadata or {}):
+            return msg
+        return dataclasses.replace(msg, metadata=metadata)
+
+    @staticmethod
+    def _terminal_status_for_response(
+        response: OutboundMessage | None,
+    ) -> tuple[TurnStatus, FinishReason, str | None]:
+        stop_reason = str((response.metadata if response is not None else {}).get(
+            "_stop_reason",
+            "",
+        ))
+        if stop_reason in {"error", "tool_error"}:
+            reason = (
+                FinishReason.TOOL_ERROR
+                if stop_reason == "tool_error"
+                else FinishReason.MODEL_ERROR
+            )
+            return TurnStatus.FAILED, reason, stop_reason
+        if stop_reason == "cancelled":
+            return TurnStatus.INTERRUPTED, FinishReason.USER_INTERRUPTED, stop_reason
+        return TurnStatus.COMPLETED, FinishReason.SUCCESS, None
+
+    async def _start_runtime_turn(
+        self,
+        msg: InboundMessage,
+        session_key: str,
+        *,
+        started_at: float | None = None,
+    ) -> None:
+        project_context = msg.metadata.get(PROJECT_CONTEXT_METADATA_KEY)
+        project_id = (
+            str(project_context.get("project_id")).strip()
+            if isinstance(project_context, dict) and project_context.get("project_id")
+            else None
+        )
+        session_id = (
+            str(project_context.get("session_id")).strip()
+            if isinstance(project_context, dict) and project_context.get("session_id")
+            else None
+        )
+        await self.turn_lifecycle.start_turn(
+            context=RuntimeEventContext(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                session_key=session_key,
+                metadata=dict(msg.metadata or {}),
+            ),
+            turn_id=str(msg.metadata.get("_runtime_turn_id") or ""),
+            project_id=project_id,
+            session_id=session_id,
+            started_at=started_at,
+        )
+
+    async def _finish_runtime_turn(
+        self,
+        msg: InboundMessage,
+        session_key: str,
+        *,
+        status: TurnStatus,
+        finish_reason: FinishReason,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        turn_id = str((msg.metadata or {}).get("_runtime_turn_id") or "").strip()
+        if not turn_id:
+            logger.error("Cannot finish runtime turn without id for session {}", session_key)
+            await self.thread_runtime_registry.set_system_error(
+                session_key,
+                error_code="TURN_ID_REQUIRED",
+            )
+            return
+        try:
+            await self.turn_lifecycle.finish_turn(
+                session_key=session_key,
+                expected_turn_id=turn_id,
+                status=status,
+                finish_reason=finish_reason,
+                error_code=error_code,
+                error_message=error_message,
+            )
+        except TurnLifecycleError as exc:
+            logger.error(
+                "Runtime turn finalization failed session={} turn={} code={}: {}",
+                session_key,
+                turn_id,
+                exc.code,
+                exc,
+            )
+            await self.thread_runtime_registry.set_system_error(
+                session_key,
+                error_code=exc.code,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Runtime terminal persistence failed session={} turn={}",
+                session_key,
+                turn_id,
+            )
+            await self.thread_runtime_registry.set_system_error(
+                session_key,
+                error_code="TURN_TERMINAL_PERSIST_FAILED",
+            )
+
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         return await self._cron_turns.submit(msg)
 
@@ -806,6 +964,60 @@ class AgentLoop:
             unified_session=self._unified_session,
         )
 
+    def _memory_store_for_session(
+        self,
+        session: Session,
+        msg: InboundMessage | None = None,
+    ) -> Any | None:
+        if msg is not None:
+            scope = self.workspace_scopes.for_message(msg, session.metadata)
+            metadata = msg.metadata
+        else:
+            channel = session.key.split(":", 1)[0] if ":" in session.key else None
+            scope = self.workspace_scopes.for_turn(
+                channel=channel,
+                message_metadata=None,
+                session_metadata=session.metadata,
+            )
+            metadata = {}
+        project_id = session.metadata.get("project_id")
+        raw_context = metadata.get(PROJECT_CONTEXT_METADATA_KEY)
+        if isinstance(raw_context, dict) and isinstance(raw_context.get("project_id"), str):
+            project_id = raw_context["project_id"]
+        return self.context.memory_for_project(
+            project_id if isinstance(project_id, str) else None,
+            scope.project_path,
+        )
+
+    def _consolidator_for_session(
+        self,
+        session: Session,
+        msg: InboundMessage | None = None,
+    ) -> Consolidator | None:
+        store = self._memory_store_for_session(session, msg)
+        if store is None:
+            return None
+        if store is self.context.memory:
+            return self.consolidator
+        key = str(store.workspace.expanduser().resolve(strict=False))
+        existing = self._project_consolidators.get(key)
+        if existing is not None:
+            return existing
+        consolidator = Consolidator(
+            store=store,
+            provider=self.provider,
+            model=self.model,
+            sessions=self.sessions,
+            context_window_tokens=self.context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=self.provider.generation.max_tokens,
+            consolidation_ratio=self.consolidator.consolidation_ratio,
+            unified_session=self._unified_session,
+        )
+        self._project_consolidators[key] = consolidator
+        return consolidator
+
     async def _dispatch_command_inline(
         self,
         msg: InboundMessage,
@@ -834,6 +1046,14 @@ class AgentLoop:
         for t in tasks:
             with suppress(asyncio.CancelledError, Exception):
                 await t
+        active_turn = await self.thread_runtime_registry.active_turn(key)
+        if active_turn is not None:
+            await self.turn_lifecycle.finish_turn(
+                session_key=key,
+                expected_turn_id=active_turn.id,
+                status=TurnStatus.INTERRUPTED,
+                finish_reason=FinishReason.USER_INTERRUPTED,
+            )
         return cancelled + sub_cancelled
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
@@ -877,9 +1097,11 @@ class AgentLoop:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
-        *on_stream_end(resuming)*: called when a streaming session finishes.
-        ``resuming=True`` means tool calls follow (spinner should restart);
+        *on_stream_end(resuming, stream_kind)*: called when a stream segment finishes.
+        ``resuming=True`` means another model/tool segment follows (spinner should restart);
         ``resuming=False`` means this is the final response.
+        ``stream_kind`` classifies the completed segment as public pre-tool
+        ``narration`` or normal ``answer`` text when the callback accepts it.
 
         Returns (final_content, tools_used, messages, stop_reason, had_injections).
         """
@@ -1078,6 +1300,13 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+        project_context_token = bind_project_context(
+            project_context_from_metadata(
+                (metadata or {}).get(PROJECT_CONTEXT_METADATA_KEY),
+                session_key=active_session_key,
+                root_path=effective_scope.project_path,
+            )
+        )
         skill_scope_token = bind_allowed_workspace_skills(
             _project_skill_scope(self.workspace, effective_scope.project_path, metadata or {})
         )
@@ -1164,6 +1393,7 @@ class AgentLoop:
             ))
         finally:
             reset_allowed_workspace_skills(skill_scope_token)
+            reset_project_context(project_context_token)
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
@@ -1278,14 +1508,14 @@ class AgentLoop:
                     else None
                 )
         finally:
-            self._running = False
-            await self.close_mcp()
+            await self.shutdown()
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        msg = self._ensure_runtime_turn_identity(msg, session_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
@@ -1298,6 +1528,11 @@ class AgentLoop:
                 pending = asyncio.Queue(maxsize=20)
                 self._pending_queues[session_key] = pending
                 try:
+                    await self._start_runtime_turn(
+                        msg,
+                        session_key,
+                        started_at=time.time(),
+                    )
                     on_stream = on_stream_end = None
                     if msg.metadata.get("_wants_stream"):
                         # Split one answer into distinct stream segments.
@@ -1317,11 +1552,16 @@ class AgentLoop:
                                 metadata=meta,
                             ))
 
-                        async def on_stream_end(*, resuming: bool = False) -> None:
+                        async def on_stream_end(
+                            *,
+                            resuming: bool = False,
+                            stream_kind: str = "answer",
+                        ) -> None:
                             nonlocal stream_segment
                             meta = dict(msg.metadata or {})
                             meta["_stream_end"] = True
                             meta["_resuming"] = resuming
+                            meta["_stream_kind"] = stream_kind
                             meta["_stream_id"] = _current_stream_id()
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
@@ -1334,9 +1574,26 @@ class AgentLoop:
                         msg, on_stream=on_stream, on_stream_end=on_stream_end,
                         pending_queue=pending,
                     )
+                    continuing = turn_continuation.internal_continuation_pending(msg.metadata)
+                    if not continuing:
+                        orphaned = await self.subagents.cancel_by_session(session_key)
+                        if orphaned:
+                            logger.error(
+                                "Cancelled {} same-turn subagent(s) before final-answer "
+                                "commit for session {}",
+                                orphaned,
+                                session_key,
+                            )
                     completed_channel = msg.channel
                     completed_chat_id = msg.chat_id
                     if response is not None:
+                        if not continuing:
+                            await self.turn_lifecycle.commit_final_answer(
+                                session_key=session_key,
+                                expected_turn_id=str(
+                                    (msg.metadata or {}).get("_runtime_turn_id") or ""
+                                ),
+                            )
                         await self.bus.publish_outbound(response)
                         completed_channel = response.channel
                         completed_chat_id = response.chat_id
@@ -1345,13 +1602,30 @@ class AgentLoop:
                             channel=msg.channel, chat_id=msg.chat_id,
                             content="", metadata=msg.metadata or {},
                         ))
-                    continuing = turn_continuation.internal_continuation_pending(msg.metadata)
                     if not continuing:
+                        terminal_status, finish_reason, terminal_error = (
+                            self._terminal_status_for_response(response)
+                        )
+                        await self._finish_runtime_turn(
+                            msg,
+                            session_key,
+                            status=terminal_status,
+                            finish_reason=finish_reason,
+                            error_code=(
+                                "TURN_FAILED"
+                                if terminal_status is TurnStatus.FAILED
+                                else None
+                            ),
+                            error_message=terminal_error,
+                        )
+                        completion_metadata = dict(msg.metadata or {})
+                        if response is not None:
+                            completion_metadata.update(response.metadata or {})
                         await self._runtime_events().turn_completed(
                             channel=completed_channel,
                             chat_id=completed_chat_id,
                             session_key=session_key,
-                            metadata=msg.metadata,
+                            metadata=completion_metadata,
                         )
                     self._cron_turns.complete(msg, response=response)
                 except asyncio.CancelledError:
@@ -1384,6 +1658,23 @@ class AgentLoop:
                             session_key,
                             exc_info=True,
                         )
+                    if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        await self.subagents.cancel_by_session(session_key)
+                        await self._finish_runtime_turn(
+                            msg,
+                            session_key,
+                            status=TurnStatus.INTERRUPTED,
+                            finish_reason=FinishReason.USER_INTERRUPTED,
+                        )
+                        await self._runtime_events().turn_completed(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            session_key=session_key,
+                            metadata={
+                                **(msg.metadata or {}),
+                                "_stop_reason": "cancelled",
+                            },
+                        )
                     raise
                 except Exception as exc:
                     dispatch_failed = True
@@ -1393,11 +1684,23 @@ class AgentLoop:
                         content="Sorry, I encountered an error.",
                     ))
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
+                        await self.subagents.cancel_by_session(session_key)
+                        await self._finish_runtime_turn(
+                            msg,
+                            session_key,
+                            status=TurnStatus.FAILED,
+                            finish_reason=FinishReason.INTERNAL_ERROR,
+                            error_code="TURN_INTERNAL_ERROR",
+                            error_message=str(exc),
+                        )
                         await self._runtime_events().turn_completed(
                             channel=msg.channel,
                             chat_id=msg.chat_id,
                             session_key=session_key,
-                            metadata=msg.metadata,
+                            metadata={
+                                **(msg.metadata or {}),
+                                "_stop_reason": "error",
+                            },
                         )
                     self._cron_turns.complete(msg, error=exc)
                 finally:
@@ -1426,47 +1729,14 @@ class AgentLoop:
                                 leftover, session_key,
                             )
                     if not turn_continuation.internal_continuation_pending(msg.metadata):
-                        running_count = self.subagents.get_running_count_by_session(
-                            session_key
-                        )
-                        running_subagents = (
-                            running_count if isinstance(running_count, int) else 0
-                        )
-                        session_metadata = None
-                        try:
-                            session_metadata = self.sessions.get_or_create(
-                                session_key
-                            ).metadata
-                        except Exception:
-                            logger.debug(
-                                "Could not inspect expert-team session metadata for {}",
-                                session_key,
-                                exc_info=True,
-                            )
-                        preserve_expert_team = (
-                            not dispatch_failed
-                            and running_subagents > 0
-                            and _expert_team_binding(
-                                msg.metadata,
-                                session_metadata,
-                            ) is not None
-                        )
-                        if preserve_expert_team:
+                        orphaned = await self.subagents.cancel_by_session(session_key)
+                        if orphaned:
                             logger.warning(
-                                "Preserving {} running expert-team subagent(s) after "
-                                "an early main-turn final response in session {}",
-                                running_subagents,
+                                "Cancelled {} orphaned subagent(s) while finalizing "
+                                "session {}",
+                                orphaned,
                                 session_key,
                             )
-                        else:
-                            orphaned = await self.subagents.cancel_by_session(session_key)
-                            if orphaned:
-                                logger.warning(
-                                    "Cancelled {} orphaned subagent(s) while finalizing "
-                                    "session {}",
-                                    orphaned,
-                                    session_key,
-                                )
                         await self._runtime_events().run_status_changed(
                             msg, session_key, "idle"
                         )
@@ -1489,6 +1759,12 @@ class AgentLoop:
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
         self._mcp_stacks.clear()
         self._mcp_connected = False
+        # AnyIO's stdio MCP process context waits for the child, while asyncio
+        # completes pipe connection_lost callbacks on subsequent loop turns.
+        # Drain them now so BaseSubprocessTransport isn't finalized after the
+        # gateway event loop has already closed.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
     async def close_mcp(self) -> None:
         """Drain background work and stop the startup MCP owner task."""
@@ -1517,6 +1793,22 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    async def shutdown(self) -> None:
+        """Stop accepting work and durably interrupt every active turn."""
+        self.stop()
+        for session_key in list(self._active_tasks):
+            await self._cancel_active_tasks(session_key)
+        background = list(self._background_tasks)
+        for task in background:
+            task.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
+        self._background_tasks.clear()
+        from nanobot.agent.tools.exec_session import DEFAULT_EXEC_SESSION_MANAGER
+
+        await DEFAULT_EXEC_SESSION_MANAGER.shutdown()
+        await self.close_mcp()
+
     async def _process_system_message(
         self,
         msg: InboundMessage,
@@ -1542,10 +1834,12 @@ class AgentLoop:
         if pending:
             logger.info("Memory compact triggered for session {}", key)
 
-        await self.consolidator.maybe_consolidate_by_tokens(
-            session,
-            replay_max_messages=self._max_messages,
-        )
+        consolidator = self._consolidator_for_session(session, msg)
+        if consolidator is not None:
+            await consolidator.maybe_consolidate_by_tokens(
+                session,
+                replay_max_messages=self._max_messages,
+            )
         is_subagent = msg.sender_id == "subagent"
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
@@ -1593,17 +1887,23 @@ class AgentLoop:
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
         self._runtime_events().record_turn_latency(key, latency_ms)
+        memory_store = self._memory_store_for_session(session, msg)
         session.enforce_file_cap(
-            on_archive=partial(self.context.memory.raw_archive, session_key=key)
+            on_archive=(
+                partial(memory_store.raw_archive, session_key=key)
+                if memory_store is not None
+                else None
+            )
         )
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
-        self._schedule_background(
-            self.consolidator.maybe_consolidate_by_tokens(
-                session,
-                replay_max_messages=self._max_messages,
+        if consolidator is not None:
+            self._schedule_background(
+                consolidator.maybe_consolidate_by_tokens(
+                    session,
+                    replay_max_messages=self._max_messages,
+                )
             )
-        )
         content = final_content or "Background task completed."
         outbound_metadata: dict[str, Any] = {}
         if channel == "slack" and key.startswith("slack:") and key.count(":") >= 2:
@@ -1650,13 +1950,14 @@ class AgentLoop:
             )
 
         key = session_key or msg.session_key
+        msg = self._ensure_runtime_turn_identity(msg, key)
         t0 = time.time()
         ctx = TurnContext(
             msg=msg,
             session=None,
             session_key=key,
             state=TurnState.RESTORE,
-            turn_id=f"{key}:{time.time_ns()}",
+            turn_id=str(msg.metadata["_runtime_turn_id"]),
             turn_wall_started_at=t0,
             visible_run_started_at=turn_continuation.internal_continuation_run_started_at(
                 msg.metadata,
@@ -1735,6 +2036,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None,
         *,
         turn_latency_ms: int | None = None,
+        turn_usage: dict[str, int] | None = None,
     ) -> OutboundMessage | None:
         """Assemble the final outbound message from turn results."""
         # MessageTool suppression
@@ -1750,6 +2052,13 @@ class AgentLoop:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
+        if turn_usage:
+            meta["usage"] = {
+                str(key): int(value)
+                for key, value in turn_usage.items()
+                if isinstance(value, int | float)
+            }
+        meta["_stop_reason"] = stop_reason
 
         return OutboundMessage(
             channel=msg.channel,
@@ -1775,8 +2084,9 @@ class AgentLoop:
         # ensure it exists in case this handler is invoked independently.
         if ctx.session is None:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
-        await self._runtime_events().session_turn_started(msg, ctx.session_key)
         self.workspace_scopes.persist_message_scope(ctx.session, msg)
+        self._ensure_inherited_project_session(ctx)
+        await self._runtime_events().session_turn_started(msg, ctx.session_key)
 
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
@@ -1785,6 +2095,57 @@ class AgentLoop:
         self._consume_pending_interactive_prompt_answer(ctx)
 
         return "ok"
+
+    def _ensure_inherited_project_session(self, ctx: TurnContext) -> None:
+        """Materialize cron/child sessions that inherit an explicit project ID."""
+        if isinstance(ctx.msg.metadata.get(PROJECT_CONTEXT_METADATA_KEY), dict):
+            return
+        project_id = ctx.msg.metadata.get("project_id")
+        if not isinstance(project_id, str) or not project_id.strip():
+            return
+        from nanobot.storage.state import StateStore, StateStoreError
+
+        scope = self.workspace_scopes.for_message(ctx.msg, ctx.session.metadata)
+        try:
+            state = StateStore(
+                self.workspace / ".nanobot" / "state.sqlite",
+                default_workspace=self.workspace,
+            )
+            project = state.get_project(project_id)
+            if project is None:
+                raise StateStoreError("inherited project is not registered")
+            if (
+                Path(project.canonical_root_path).resolve(strict=False)
+                != scope.project_path.expanduser().resolve(strict=False)
+            ):
+                raise StateStoreError(
+                    "inherited project does not match the effective workspace"
+                )
+            state_session = state.bind_session(
+                ctx.session_key,
+                project.id,
+                title=str(ctx.session.metadata.get("title") or ""),
+                metadata={
+                    "project_id": project.id,
+                    "workspace_scope": scope.metadata(),
+                    "parent_project_id": ctx.msg.metadata.get("_parent_project_id"),
+                },
+                artifact_index_initialized=True,
+            )
+        except StateStoreError:
+            logger.exception(
+                "Inherited project session binding failed for session={}",
+                ctx.session_key,
+            )
+            raise
+        context_metadata = {
+            "project_id": project.id,
+            "session_id": state_session.id,
+            "session_key": ctx.session_key,
+        }
+        ctx.msg.metadata[PROJECT_CONTEXT_METADATA_KEY] = context_metadata
+        ctx.session.metadata["project_id"] = project.id
+        ctx.session.metadata["session_id"] = state_session.id
 
     def _consume_pending_interactive_prompt_answer(self, ctx: TurnContext) -> None:
         pending = normalize_interactive_prompt(
@@ -1968,10 +2329,12 @@ class AgentLoop:
 
     async def _state_build(self, ctx: TurnContext) -> str:
         if not ctx.ephemeral:
-            await self.consolidator.maybe_consolidate_by_tokens(
-                ctx.session,
-                replay_max_messages=self._max_messages,
-            )
+            consolidator = self._consolidator_for_session(ctx.session, ctx.msg)
+            if consolidator is not None:
+                await consolidator.maybe_consolidate_by_tokens(
+                    ctx.session,
+                    replay_max_messages=self._max_messages,
+                )
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
@@ -2045,6 +2408,7 @@ class AgentLoop:
         finally:
             prompt_requested = interactive_prompt_requested_in_turn()
             reset_interactive_prompt_requested(prompt_token)
+        ctx.turn_usage = dict(self._last_usage)
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
         ctx.tools_used = tools_used
@@ -2075,6 +2439,7 @@ class AgentLoop:
         self._save_turn(
             ctx.session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
+            turn_usage=ctx.turn_usage,
             expert_team_id=(
                 str(expert_team["id"])
                 if (expert_team := _expert_team_binding(ctx.msg.metadata, ctx.session.metadata))
@@ -2086,19 +2451,30 @@ class AgentLoop:
             ctx.session_key,
             ctx.turn_latency_ms,
         )
+        memory_store = None
         if not ctx.ephemeral:
+            memory_store = self._memory_store_for_session(ctx.session, ctx.msg)
+            consolidator = self._consolidator_for_session(ctx.session, ctx.msg)
             ctx.session.enforce_file_cap(
-                on_archive=partial(self.context.memory.raw_archive, session_key=ctx.session_key)
-            )
-            self._schedule_background(
-                self.consolidator.maybe_consolidate_by_tokens(
-                    ctx.session,
-                    replay_max_messages=self._max_messages,
+                on_archive=(
+                    partial(memory_store.raw_archive, session_key=ctx.session_key)
+                    if memory_store is not None
+                    else None
                 )
             )
+            if consolidator is not None:
+                self._schedule_background(
+                    consolidator.maybe_consolidate_by_tokens(
+                        ctx.session,
+                        replay_max_messages=self._max_messages,
+                    )
+                )
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
+        memory_task = self.project_memory.build_session_task(ctx.session, memory_store)
+        if memory_task is not None:
+            self._schedule_background(memory_task)
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:
@@ -2113,9 +2489,8 @@ class AgentLoop:
             ctx.had_injections,
             ctx.on_stream,
             turn_latency_ms=ctx.turn_latency_ms,
+            turn_usage=ctx.turn_usage,
         )
-        if ctx.ephemeral and ctx.outbound is not None:
-            ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
         return "ok"
 
     def _sanitize_persisted_blocks(
@@ -2165,6 +2540,7 @@ class AgentLoop:
         skip: int,
         *,
         turn_latency_ms: int | None = None,
+        turn_usage: dict[str, int] | None = None,
         expert_team_id: str | None = None,
     ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
@@ -2230,6 +2606,12 @@ class AgentLoop:
                 )
         if turn_latency_ms is not None and last_assistant_idx is not None:
             session.messages[last_assistant_idx]["latency_ms"] = int(turn_latency_ms)
+        if turn_usage and last_assistant_idx is not None:
+            session.messages[last_assistant_idx]["usage"] = {
+                str(key): int(value)
+                for key, value in turn_usage.items()
+                if isinstance(value, int | float)
+            }
         session.updated_at = datetime.now()
 
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
@@ -2388,10 +2770,21 @@ class AgentLoop:
             channel=channel, sender_id=sender_id, chat_id=chat_id,
             content=content, media=media or [], metadata=metadata,
         )
+        msg = self._ensure_runtime_turn_identity(msg, session_key)
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         try:
             async with lock:
+                if channel != "system":
+                    await self.turn_lifecycle.start_turn(
+                        context=RuntimeEventContext(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            session_key=session_key,
+                            metadata=dict(msg.metadata or {}),
+                        ),
+                        turn_id=str(msg.metadata.get("_runtime_turn_id") or ""),
+                    )
                 kwargs: dict[str, Any] = {
                     "session_key": session_key,
                     "on_progress": on_progress,
@@ -2405,10 +2798,55 @@ class AgentLoop:
                     kwargs["hooks"] = hooks
                 if tools is not None:
                     kwargs["tools"] = tools
-                return await self._process_message(
+                response = await self._process_message(
                     msg,
                     **kwargs,
                 )
+                if channel != "system":
+                    await self.subagents.cancel_by_session(session_key)
+                    if response is not None:
+                        await self.turn_lifecycle.commit_final_answer(
+                            session_key=session_key,
+                            expected_turn_id=str(
+                                (msg.metadata or {}).get("_runtime_turn_id") or ""
+                            ),
+                        )
+                    terminal_status, finish_reason, terminal_error = (
+                        self._terminal_status_for_response(response)
+                    )
+                    await self._finish_runtime_turn(
+                        msg,
+                        session_key,
+                        status=terminal_status,
+                        finish_reason=finish_reason,
+                        error_code=(
+                            "TURN_FAILED"
+                            if terminal_status is TurnStatus.FAILED
+                            else None
+                        ),
+                        error_message=terminal_error,
+                    )
+                return response
+        except asyncio.CancelledError:
+            if channel != "system":
+                await self._finish_runtime_turn(
+                    msg,
+                    session_key,
+                    status=TurnStatus.INTERRUPTED,
+                    finish_reason=FinishReason.USER_INTERRUPTED,
+                )
+            raise
+        except Exception as exc:
+            if channel != "system":
+                await self._finish_runtime_turn(
+                    msg,
+                    session_key,
+                    status=TurnStatus.FAILED,
+                    finish_reason=FinishReason.INTERNAL_ERROR,
+                    error_code="TURN_INTERNAL_ERROR",
+                    error_message=str(exc),
+                )
+            raise
         finally:
             await self._runtime_events().run_status_changed(msg, session_key, "idle")
             self._runtime_events().clear_turn(session_key)

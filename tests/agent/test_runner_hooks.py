@@ -90,6 +90,66 @@ async def test_runner_calls_hooks_in_order():
 
 
 @pytest.mark.asyncio
+async def test_runner_marks_plan_barrier_preflight_calls_hidden_from_hooks():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+    from nanobot.agent.tools.context import (
+        RequestContext,
+        bind_request_context,
+        reset_request_context,
+    )
+
+    provider = MagicMock(spec=LLMProvider)
+    call_count = {"n": 0}
+
+    async def chat_with_retry(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(id="search-cn", name="web_search", arguments={"query": "中国出口"}),
+                    ToolCallRequest(id="search-en", name="web_search", arguments={"query": "China exports"}),
+                ],
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="must not run")
+    hidden: list[set[str]] = []
+
+    class RecordingHook(AgentHook):
+        async def before_execute_tools(self, context: AgentHookContext) -> None:
+            hidden.append(set(context.hidden_tool_call_ids))
+
+    token = bind_request_context(RequestContext(
+        channel="websocket",
+        chat_id="chat-1",
+        metadata={"webui": True},
+    ))
+    try:
+        result = await AgentRunner(provider).run(AgentRunSpec(
+            initial_messages=[{"role": "user", "content": "分析中国出口"}],
+            tools=tools,
+            model="test-model",
+            max_iterations=2,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            hook=RecordingHook(),
+        ))
+    finally:
+        reset_request_context(token)
+
+    assert hidden == [{"search-cn", "search-en"}]
+    assert tools.execute.await_count == 0
+    assert [event["detail"] for event in result.tool_events] == [
+        "PLAN_REQUIRED",
+        "PLAN_REQUIRED",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     from nanobot.agent.hook import AgentHook, AgentHookContext
     from nanobot.agent.runner import AgentRunner, AgentRunSpec

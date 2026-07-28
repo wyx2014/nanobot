@@ -37,6 +37,8 @@ class _MockChannel(BaseChannel):
         self._send_mock = AsyncMock()
         self._delta_mock = AsyncMock()
         self._end_mock = AsyncMock()
+        self._narration_delta_mock = AsyncMock()
+        self._narration_end_mock = AsyncMock()
         self._file_edit_mock = AsyncMock()
 
     async def start(self):  # pragma: no cover - not exercised
@@ -53,6 +55,12 @@ class _MockChannel(BaseChannel):
 
     async def send_reasoning_end(self, chat_id, metadata=None):
         return await self._end_mock(chat_id, metadata)
+
+    async def send_narration_delta(self, chat_id, delta, metadata=None):
+        return await self._narration_delta_mock(chat_id, delta, metadata)
+
+    async def send_narration_end(self, chat_id, metadata=None):
+        return await self._narration_end_mock(chat_id, metadata)
 
     async def send_file_edit_events(self, chat_id, edits, metadata=None):
         return await self._file_edit_mock(chat_id, edits, metadata)
@@ -274,6 +282,38 @@ async def test_file_edit_events_route_to_channel_capability(manager):
 
     channel._file_edit_mock.assert_awaited_once_with(
         "c1", edits, {"_progress": True, "_file_edit_events": edits}
+    )
+    channel._send_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_narration_routes_without_reasoning_opt_in(manager):
+    channel = manager.channels["mock"]
+    channel.show_reasoning = False
+    delta = OutboundMessage(
+        channel="mock",
+        chat_id="c1",
+        content="I will inspect the report.",
+        metadata={"_progress": True, "_narration_delta": True},
+    )
+    end = OutboundMessage(
+        channel="mock",
+        chat_id="c1",
+        content="",
+        metadata={"_progress": True, "_narration_end": True},
+    )
+
+    await manager._send_once(channel, delta)
+    await manager._send_once(channel, end)
+
+    channel._narration_delta_mock.assert_awaited_once_with(
+        "c1",
+        "I will inspect the report.",
+        {"_progress": True, "_narration_delta": True},
+    )
+    channel._narration_end_mock.assert_awaited_once_with(
+        "c1",
+        {"_progress": True, "_narration_end": True},
     )
     channel._send_mock.assert_not_awaited()
 

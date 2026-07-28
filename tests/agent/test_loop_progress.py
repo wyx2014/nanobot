@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -85,7 +86,53 @@ class TestToolEventProgress:
         assert isinstance(finish["occurred_at"], int)
 
     @pytest.mark.asyncio
-    async def test_multiple_tools_receive_automatic_task_progress(self, tmp_path: Path) -> None:
+    async def test_websocket_emits_public_narration_before_tools(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1",
+            name="web_search",
+            arguments={"query": "market"},
+        )
+        calls = iter([
+            LLMResponse(
+                content="我先检索本周市场数据，再核对具体报道。",
+                tool_calls=[tool_call],
+            ),
+            LLMResponse(content="分析完成。", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.prepare_call = MagicMock(return_value=(None, {"query": "market"}, None))
+        loop.tools.execute = AsyncMock(return_value="ok")
+        progress: list[tuple[str, dict[str, Any]]] = []
+
+        async def on_progress(content: str, **kwargs: Any) -> None:
+            progress.append((content, kwargs))
+
+        final_content, _, _, _, _ = await loop._run_agent_loop(
+            [],
+            on_progress=on_progress,
+            channel="websocket",
+        )
+
+        assert final_content == "分析完成。"
+        narration = [
+            (content, kwargs)
+            for content, kwargs in progress
+            if kwargs.get("narration") or kwargs.get("narration_end")
+        ]
+        assert narration == [
+            ("我先检索本周市场数据，再核对具体报道。", {"narration": True}),
+            ("", {"narration_end": True}),
+        ]
+        assert not any(
+            content == "我先检索本周市场数据，再核对具体报道。"
+            and not kwargs.get("narration")
+            for content, kwargs in progress
+        )
+
+    @pytest.mark.asyncio
+    async def test_multiple_tools_do_not_synthesize_task_progress(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_calls = [
             ToolCallRequest(id="call-search", name="web_search", arguments={"query": "IDC market"}),
@@ -115,36 +162,24 @@ class TestToolEventProgress:
             events for _content, hint, events in progress
             if hint and events and any(event["phase"] == "start" for event in events)
         )
-        auto_start = start_events[0]
-        assert auto_start["name"] == "update_task_progress"
-        assert auto_start["phase"] == "end"
-        assert auto_start["arguments"]["note"] == "任务包含多个步骤，开始并行处理"
-        assert [step["status"] for step in auto_start["arguments"]["steps"]] == [
-            "running",
-            "running",
-        ]
-        assert [event["name"] for event in start_events[1:]] == ["web_search", "exec"]
+        assert [event["name"] for event in start_events] == ["web_search", "exec"]
+        assert all(event["phase"] == "start" for event in start_events)
 
         finish_events = next(
             events for _content, hint, events in progress
             if not hint
             and events
-            and any(event["call_id"] == auto_start["call_id"] for event in events)
+            and all(event["phase"] == "end" for event in events)
         )
-        auto_finish = next(
-            event for event in finish_events
-            if event["call_id"] == auto_start["call_id"]
+        assert [event["name"] for event in finish_events] == ["web_search", "exec"]
+        assert not any(
+            event["name"] == "update_task_progress"
+            for _content, _hint, events in progress
+            for event in events or []
         )
-        assert auto_finish["batch_id"] == auto_start["batch_id"]
-        assert auto_finish["sequence"] == auto_start["sequence"]
-        assert auto_finish["arguments"]["note"] == "工具步骤已完成，正在整理结果"
-        assert [step["status"] for step in auto_finish["arguments"]["steps"]] == [
-            "completed",
-            "completed",
-        ]
 
     @pytest.mark.asyncio
-    async def test_second_serial_tool_triggers_automatic_task_progress(
+    async def test_serial_tools_never_synthesize_task_progress(
         self,
         tmp_path: Path,
     ) -> None:
@@ -189,12 +224,12 @@ class TestToolEventProgress:
             if hint and events and any(event["phase"] == "start" for event in events)
         ]
         assert len(start_batches) == 2
-        assert all(event["name"] != "update_task_progress" for event in start_batches[0])
-        auto_plan = start_batches[1][0]
-        assert auto_plan["name"] == "update_task_progress"
-        assert (
-            auto_plan["arguments"]["note"]
-            == "任务进入多步骤处理，继续执行下一阶段"
+        assert [event["name"] for event in start_batches[0]] == ["web_search"]
+        assert [event["name"] for event in start_batches[1]] == ["exec"]
+        assert not any(
+            event["name"] == "update_task_progress"
+            for batch in start_batches
+            for event in batch
         )
 
     @pytest.mark.asyncio
@@ -253,6 +288,70 @@ class TestToolEventProgress:
         assert file_events[1]["status"] == "done"
         assert file_events[1]["approximate"] is False
         assert (file_events[1]["added"], file_events[1]["deleted"]) == (2, 1)
+
+    @pytest.mark.asyncio
+    async def test_invalid_file_edit_parameters_emit_terminal_error_event(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        loop = _make_loop(tmp_path)
+        target = tmp_path / "report.md"
+        target.write_text("published\n", encoding="utf-8")
+        invalid_params = {
+            "dry_run": False,
+            "edits": [
+                {
+                    "action": "replace",
+                    "old_text": "published",
+                    "new_text": "updated",
+                }
+            ],
+            "path": "report.md",
+        }
+        tool_call = ToolCallRequest(
+            id="call-invalid-patch",
+            name="apply_patch",
+            arguments=invalid_params,
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Recovered", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.prepare_call = MagicMock(
+            return_value=(
+                None,
+                invalid_params,
+                "Error: Invalid parameters for tool 'apply_patch': "
+                "missing required edits[0].path; unexpected parameter path",
+            ),
+        )
+        loop.tools.execute = AsyncMock(side_effect=AssertionError("tool must not run"))
+        file_events: list[dict] = []
+
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict] | None = None,
+            file_edit_events: list[dict] | None = None,
+        ) -> None:
+            if file_edit_events:
+                file_events.extend(file_edit_events)
+
+        final_content, _, _, _, _ = await loop._run_agent_loop(
+            [],
+            on_progress=on_progress,
+        )
+
+        assert final_content == "Recovered"
+        assert len(file_events) == 1
+        assert file_events[0]["call_id"] == "call-invalid-patch"
+        assert file_events[0]["path"] == "report.md"
+        assert file_events[0]["phase"] == "error"
+        assert file_events[0]["status"] == "error"
+        assert "Invalid parameters" in file_events[0]["error"]
 
     @pytest.mark.asyncio
     async def test_file_edit_snapshot_skipped_when_progress_callback_cannot_emit_file_edits(
@@ -581,6 +680,9 @@ class TestToolEventProgress:
             and not m.metadata.get("_stream_end")
             and not m.metadata.get("_turn_end")
             and not m.metadata.get("_goal_status")
+            and not m.metadata.get("_turn_lifecycle_started")
+            and not m.metadata.get("_turn_lifecycle_completed")
+            and not m.metadata.get("_thread_runtime_status_changed")
         ]
 
         assert [m.content for m in deltas] == ["Hel", "lo"]
@@ -636,6 +738,9 @@ class TestToolEventProgress:
             and not m.metadata.get("_stream_end")
             and not m.metadata.get("_turn_end")
             and not m.metadata.get("_goal_status")
+            and not m.metadata.get("_turn_lifecycle_started")
+            and not m.metadata.get("_turn_lifecycle_completed")
+            and not m.metadata.get("_thread_runtime_status_changed")
         ]
 
         assert [m.content for m in deltas] == ["partial", "full retry response"]
@@ -768,6 +873,45 @@ class TestToolEventProgress:
         assert turn_end_msgs[0].chat_id == "chat1"
         assert [m.metadata["goal_status"] for m in statuses] == ["idle"]
         assert outbound.index(error_msgs[0]) < outbound.index(turn_end_msgs[0])
+        assert outbound.index(turn_end_msgs[0]) < outbound.index(statuses[-1])
+
+    @pytest.mark.asyncio
+    async def test_websocket_dispatch_publishes_turn_end_when_cancelled(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+        _attach_webui_runtime_events(loop, bus)
+        started = asyncio.Event()
+
+        async def wait_until_cancelled(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        loop._process_message = wait_until_cancelled  # type: ignore[method-assign]
+        task = asyncio.create_task(loop._dispatch(InboundMessage(
+            channel="websocket",
+            sender_id="u1",
+            chat_id="chat1",
+            content="say hello",
+        )))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        outbound = []
+        while bus.outbound_size > 0:
+            outbound.append(await bus.consume_outbound())
+
+        turn_end_msgs = [m for m in outbound if m.metadata.get("_turn_end")]
+        assert len(turn_end_msgs) == 1
+        assert turn_end_msgs[0].metadata["_stop_reason"] == "cancelled"
+        statuses = [m for m in outbound if m.metadata.get("_goal_status")]
+        assert [m.metadata["goal_status"] for m in statuses] == ["idle"]
         assert outbound.index(turn_end_msgs[0]) < outbound.index(statuses[-1])
 
     @pytest.mark.asyncio

@@ -1,7 +1,11 @@
 import json
 
+import pytest
+
 from nanobot.security.workspace_access import default_workspace_scope
+from nanobot.security.workspace_access import WorkspaceScopeError
 from nanobot.session.manager import SessionManager
+from nanobot.storage.state import StateStore
 from nanobot.webui.workspaces import (
     WebUIWorkspaceController,
     read_webui_default_access_mode,
@@ -181,3 +185,47 @@ def test_scope_for_session_key_reads_metadata_without_full_history(
 
     assert scope.project_path == project.resolve()
     assert scope.access_mode == "full"
+
+
+def test_persist_scope_writes_stable_ids_to_first_jsonl_record_and_rejects_rebind(
+    tmp_path,
+) -> None:
+    default = tmp_path / "default"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    default.mkdir()
+    project_a.mkdir()
+    project_b.mkdir()
+    sessions = SessionManager(tmp_path / "session-state")
+    state = StateStore(
+        tmp_path / "runtime" / "state.sqlite",
+        default_workspace=default,
+    )
+    controller = WebUIWorkspaceController(
+        session_manager=sessions,
+        default_workspace=default,
+        default_restrict_to_workspace=True,
+        state_store=state,
+    )
+
+    binding = controller.persist_scope(
+        "bound-chat",
+        default_workspace_scope(project_a, restrict_to_workspace=True),
+    )
+    session = sessions.get_or_create("websocket:bound-chat")
+    session.add_message("user", "first project turn")
+    sessions.save(session)
+
+    first_record = json.loads(
+        sessions.session_path("websocket:bound-chat")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert first_record["metadata"]["project_id"] == binding["project_id"]
+    assert first_record["metadata"]["session_id"] == binding["session_id"]
+
+    with pytest.raises(WorkspaceScopeError, match="session_project_mismatch"):
+        controller.persist_scope(
+            "bound-chat",
+            default_workspace_scope(project_b, restrict_to_workspace=True),
+        )

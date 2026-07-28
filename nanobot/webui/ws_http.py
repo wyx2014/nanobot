@@ -10,22 +10,33 @@ Also houses shared HTTP utility functions used by both this module and
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import mimetypes
 import re
 import time
+import zipfile
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from loguru import logger
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
+from nanobot.agent.memory import MemoryStore
 from nanobot.command.builtin import builtin_command_palette
 from nanobot.cron.session_turns import is_bound_cron_job
 from nanobot.cron.types import CronJob, CronSchedule
+from nanobot.storage.state import (
+    SessionProjectMismatch,
+    StateStore,
+    StateStoreError,
+)
+from nanobot.storage.logs import StructuredLogRecord, StructuredLogStore
+from nanobot.storage.journal import SessionEventJournal
 from nanobot.utils.subagent_channel_display import scrub_subagent_messages_for_channel
 from nanobot.webui.file_preview import WebUIFilePreviewError, file_preview_payload
 from nanobot.webui.gateway_tokens import GatewayTokenStore, token_response_payload
@@ -74,12 +85,19 @@ from nanobot.webui.session_automations import (
     session_automations_payload,
 )
 from nanobot.webui.session_list_index import list_webui_sessions
+from nanobot.webui.session_artifacts import (
+    SessionArtifactError,
+    artifact_content_type,
+    discover_session_artifacts,
+    read_session_artifact,
+    registered_artifact_row,
+    resolve_session_artifact,
+)
 from nanobot.webui.sidebar_state import (
     read_webui_sidebar_state,
     write_webui_sidebar_state,
 )
 from nanobot.webui.skills_api import webui_skill_detail_payload, webui_skills_payload
-from nanobot.webui.thread_disk import delete_webui_thread
 from nanobot.webui.transcript import build_webui_thread_response
 from nanobot.webui.workspaces import WebUIWorkspaceController
 
@@ -174,10 +192,15 @@ class GatewayHTTPHandler:
         tokens: GatewayTokenStore,
         media: WebUIMediaGateway,
         workspaces: WebUIWorkspaceController,
+        state_store: StateStore,
+        logs_store: StructuredLogStore,
+        journal_store: SessionEventJournal,
         skills_workspace_path: Path,
         disabled_skills: set[str] | None = None,
         cron_service: CronService | None = None,
         cron_pending_job_ids: Callable[[str], set[str]] | None = None,
+        project_memory_pipeline: Any | None = None,
+        thread_runtime_registry: Any | None = None,
         log: Any = logger,
     ) -> None:
         self.config = config
@@ -190,10 +213,15 @@ class GatewayHTTPHandler:
         self.tokens = tokens
         self.media = media
         self.workspaces = workspaces
+        self.state = state_store
+        self.logs = logs_store
+        self.journal = journal_store
         self.skills_workspace_path = skills_workspace_path
         self.disabled_skills = disabled_skills or set()
         self.cron_service = cron_service
         self.cron_pending_job_ids = cron_pending_job_ids
+        self.project_memory_pipeline = project_memory_pipeline
+        self.thread_runtime_registry = thread_runtime_registry
         self._log = log
         self._runtime_surface = runtime_surface
 
@@ -219,6 +247,7 @@ class GatewayHTTPHandler:
             json_response=_http_json_response,
             error_response=_http_error,
             logger=self._log,
+            state_store=state_store,
         )
 
     def workspace_controls_available(self, connection: Any) -> bool:
@@ -390,9 +419,37 @@ class GatewayHTTPHandler:
     # -- Session routes -----------------------------------------------------
 
     async def _dispatch_session_routes(self, request: WsRequest, got: str) -> Response | None:
+        m = re.match(r"^/api/artifacts/([A-Za-z0-9_-]+)/content$", got)
+        if m:
+            return await self._handle_registered_artifact_content(request, m.group(1))
+
+        m = re.match(r"^/api/artifacts/([A-Za-z0-9_-]+)$", got)
+        if m:
+            return self._handle_registered_artifact_get(request, m.group(1))
+
+        m = re.match(r"^/api/sessions/([^/]+)/artifacts/content$", got)
+        if m:
+            return await self._handle_session_artifact_content(request, m.group(1))
+
+        m = re.match(r"^/api/sessions/([^/]+)/artifacts$", got)
+        if m:
+            return await self._handle_session_artifacts(request, m.group(1))
+
         m = re.match(r"^/api/sessions/([^/]+)/messages$", got)
         if m:
             return self._handle_session_messages(request, m.group(1))
+
+        m = re.match(r"^/api/sessions/([^/]+)/runtime-snapshot$", got)
+        if m:
+            return await self._handle_session_runtime_snapshot(request, m.group(1))
+
+        m = re.match(r"^/api/sessions/([^/]+)/turns/([^/]+)/plan$", got)
+        if m:
+            return self._handle_turn_plan(request, m.group(1), m.group(2))
+
+        m = re.match(r"^/api/sessions/([^/]+)/runtime-diagnostics$", got)
+        if m:
+            return await self._handle_session_runtime_diagnostics(request, m.group(1))
 
         m = re.match(r"^/api/sessions/([^/]+)/webui-thread$", got)
         if m:
@@ -409,6 +466,9 @@ class GatewayHTTPHandler:
         m = re.match(r"^/api/sessions/([^/]+)/delete$", got)
         if m:
             return self._handle_session_delete(request, m.group(1))
+        m = re.match(r"^/api/sessions/([^/]+)/restore$", got)
+        if m:
+            return self._handle_session_restore(request, m.group(1))
 
         return None
 
@@ -420,12 +480,482 @@ class GatewayHTTPHandler:
         payload = await asyncio.to_thread(self._sessions_list_payload)
         return _http_json_response(payload)
 
+    def _session_route_context(
+        self,
+        request: WsRequest,
+        key: str,
+    ) -> tuple[str, dict[str, Any]] | Response:
+        """Resolve an authenticated, disk-backed WebUI session route.
+
+        Runtime snapshot and diagnostics are served during the WebSocket
+        server's HTTP opening-handshake hook.  Keep all validation on the HTTP
+        handler itself; calling a method that only exists on the channel turns
+        an ordinary REST request into a failed WebSocket handshake.
+        """
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        decoded_key = _decode_api_key(key)
+        if decoded_key is None:
+            return _http_error(400, "invalid session key")
+        if not _is_webui_readable_session_key(decoded_key):
+            return _http_error(404, "session not found")
+        session_data = self.session_manager.read_session_file(decoded_key)
+        if not isinstance(session_data, dict):
+            return _http_error(404, "session not found")
+        return decoded_key, session_data
+
+    async def _handle_session_runtime_snapshot(
+        self,
+        request: WsRequest,
+        key: str,
+    ) -> Response:
+        context = self._session_route_context(request, key)
+        if isinstance(context, Response):
+            return context
+        session_key, session_data = context
+        scope = self.workspaces.scope_for_session_key(session_key)
+        try:
+            state_session = self._ensure_state_session(session_key, session_data, scope)
+        except SessionProjectMismatch:
+            return _http_error(409, "session project mismatch")
+
+        if self.thread_runtime_registry is None:
+            runtime_payload = {
+                "session_key": session_key,
+                "runtime_epoch": None,
+                "snapshot_revision": 0,
+                "thread_status": {"type": "notLoaded"},
+                "active_turn": None,
+                "latest_turn": None,
+            }
+        else:
+            snapshot = await self.thread_runtime_registry.snapshot(session_key)
+            runtime_payload = snapshot.payload()
+
+        durable_latest = self.state.latest_turn_snapshot(session_key)
+        active_turn = runtime_payload.get("active_turn")
+        if isinstance(active_turn, dict) and active_turn.get("id"):
+            active_project_id = active_turn.get("project_id")
+            active_session_id = active_turn.get("session_id")
+            if (
+                active_project_id not in {None, state_session.project_id}
+                or active_session_id not in {None, state_session.id}
+            ):
+                self._log.error(
+                    "runtime snapshot identity mismatch session={} active_turn={}",
+                    session_key,
+                    active_turn.get("id"),
+                )
+                return _http_error(409, "runtime snapshot identity mismatch")
+            plan = self.state.turn_plan_snapshot(
+                session_key=session_key,
+                turn_id=str(active_turn["id"]),
+            )
+            if plan is not None:
+                active_turn["plan"] = plan
+        # Durable history owns latest_turn. The process registry owns only
+        # active_turn and may be ahead of projection for a few milliseconds.
+        runtime_payload["latest_turn"] = durable_latest
+        latest_turn = runtime_payload.get("latest_turn")
+        if isinstance(latest_turn, dict) and latest_turn.get("id"):
+            plan = self.state.turn_plan_snapshot(
+                session_key=session_key,
+                turn_id=str(latest_turn["id"]),
+            )
+            if plan is not None:
+                latest_turn["plan"] = plan
+        runtime_payload.update(
+            {
+                "project_id": state_session.project_id,
+                "session_id": state_session.id,
+            }
+        )
+        return _http_json_response(runtime_payload)
+
+    def _handle_turn_plan(
+        self,
+        request: WsRequest,
+        key: str,
+        encoded_turn_id: str,
+    ) -> Response:
+        context = self._session_route_context(request, key)
+        if isinstance(context, Response):
+            return context
+        session_key, _session_data = context
+        turn_id = unquote(encoded_turn_id).strip()
+        if not turn_id or "/" in turn_id or len(turn_id) > 200:
+            return _http_error(400, "invalid turn id")
+        plan = self.state.turn_plan_snapshot(
+            session_key=session_key,
+            turn_id=turn_id,
+        )
+        if plan is None:
+            return _http_error(404, "turn plan not found")
+        return _http_json_response({"plan": plan})
+
+    async def _handle_session_runtime_diagnostics(
+        self,
+        request: WsRequest,
+        key: str,
+    ) -> Response:
+        snapshot_response = await self._handle_session_runtime_snapshot(request, key)
+        if snapshot_response.status_code != 200:
+            return snapshot_response
+        decoded_key = _decode_api_key(key)
+        if decoded_key is None:
+            return _http_error(400, "invalid session key")
+        snapshot = json.loads(bytes(snapshot_response.body).decode("utf-8"))
+        latest = self.state.latest_turn_snapshot(decoded_key)
+        plan = (
+            self.state.turn_plan_snapshot(
+                session_key=decoded_key,
+                turn_id=str(latest["id"]),
+            )
+            if isinstance(latest, dict) and latest.get("id")
+            else None
+        )
+        return _http_json_response(
+            {
+                "runtime_snapshot": snapshot,
+                "latest_terminal_turn": latest,
+                "latest_turn_plan": plan,
+                "projection_counts": self.state.projection_counts(decoded_key),
+                "projector_watermark": self.state.projector_watermark(decoded_key),
+                "reconciliation": (
+                    {
+                        "occurred": latest.get("finish_reason") == "gatewayRestarted",
+                        "finish_reason": latest.get("finish_reason"),
+                    }
+                    if isinstance(latest, dict)
+                    else {"occurred": False, "finish_reason": None}
+                ),
+            }
+        )
+
+    async def _handle_session_artifacts(self, request: WsRequest, key: str) -> Response:
+        context = self._session_artifact_context(request, key)
+        if isinstance(context, Response):
+            return context
+        decoded_key, session_data = context
+        scope = self.workspaces.scope_for_session_key(decoded_key)
+        try:
+            state_session = self._ensure_state_session(
+                decoded_key,
+                session_data,
+                scope,
+            )
+        except SessionProjectMismatch:
+            return _http_error(409, "session_project_mismatch")
+
+        truncated = False
+        migrated_count = 0
+        migration_failures = 0
+        if state_session.artifact_indexed_at is None:
+            legacy_payload = await asyncio.to_thread(
+                discover_session_artifacts,
+                decoded_key,
+                session_data,
+                scope=scope,
+            )
+            truncated = legacy_payload.get("truncated") is True
+            for row in legacy_payload.get("artifacts", []):
+                if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        self.state.register_artifact,
+                        decoded_key,
+                        scope.project_path / row["path"],
+                        relation_type="referenced",
+                        artifact_kind=str(row.get("kind") or "file"),
+                        mime_type=str(
+                            row.get("mime_type") or "application/octet-stream"
+                        ),
+                    )
+                    migrated_count += 1
+                except (OSError, StateStoreError):
+                    migration_failures += 1
+                    self._log.debug(
+                        "legacy artifact registration failed session={} path={}",
+                        decoded_key,
+                        row.get("path"),
+                        exc_info=True,
+                    )
+            await asyncio.to_thread(self.state.mark_artifact_indexed, decoded_key)
+
+        records = await asyncio.to_thread(
+            self.state.list_session_artifacts,
+            decoded_key,
+        )
+        await asyncio.to_thread(
+            self.logs.write,
+            level="warning" if migration_failures else "info",
+            component="artifacts",
+            event_name="artifact_list_completed",
+            message="session artifact registry loaded",
+            project_id=state_session.project_id,
+            session_id=state_session.id,
+            error_code=(
+                "LEGACY_ARTIFACT_REGISTRATION_FAILED"
+                if migration_failures
+                else None
+            ),
+            details={
+                "session_key": decoded_key,
+                "artifact_count": len(records),
+                "migrated_count": migrated_count,
+                "migration_failures": migration_failures,
+                "truncated": truncated,
+            },
+        )
+        return _http_json_response(
+            {
+                "project_id": state_session.project_id,
+                "session_id": state_session.id,
+                "artifacts": [registered_artifact_row(record) for record in records],
+                "truncated": truncated,
+            }
+        )
+
+    def _ensure_state_session(
+        self,
+        session_key: str,
+        session_data: dict[str, Any],
+        scope: Any,
+    ) -> Any:
+        existing = self.state.get_session(session_key)
+        if existing is not None:
+            project = self.state.ensure_project(
+                scope.project_path,
+                name=scope.project_name,
+            )
+            if existing.project_id != project.id:
+                raise SessionProjectMismatch(
+                    session_key,
+                    existing.project_id,
+                    project.id,
+                )
+            return existing
+        event_log_path = None
+        if self.session_manager is not None:
+            event_log_path = self.session_manager.session_path(session_key)
+        metadata = session_data.get("metadata")
+        _, state_session = self.state.ensure_session_for_project(
+            session_key,
+            scope.project_path,
+            project_name=scope.project_name,
+            event_log_path=event_log_path,
+            title=(
+                str(metadata.get("title") or "")
+                if isinstance(metadata, dict)
+                else ""
+            ),
+            metadata=metadata if isinstance(metadata, dict) else None,
+            artifact_index_initialized=False,
+        )
+        # Registering a session must remain cheap. Replaying a large legacy
+        # transcript here blocks session/artifact HTTP responses long enough
+        # for clients to disconnect during the WebSocket HTTP handshake.
+        # SessionEventJournal.append() still performs the idempotent replay
+        # before the next durable write, preserving event sequence ordering.
+        return state_session
+
+    async def _handle_session_artifact_content(
+        self,
+        request: WsRequest,
+        key: str,
+    ) -> Response:
+        context = self._session_artifact_context(request, key)
+        if isinstance(context, Response):
+            return context
+        decoded_key, session_data = context
+        query = _parse_query(request.path)
+        raw_path = _query_first(query, "path")
+        scope = self.workspaces.scope_for_session_key(decoded_key)
+        try:
+            path = await asyncio.to_thread(
+                resolve_session_artifact,
+                raw_path,
+                session_key=decoded_key,
+                session_data=session_data,
+                scope=scope,
+            )
+            body = await asyncio.to_thread(
+                read_session_artifact,
+                path,
+                root=scope.project_path,
+            )
+        except SessionArtifactError as e:
+            return _http_error(e.status, e.message)
+
+        download = _query_first(query, "download") in {"1", "true", "yes"}
+        disposition = "attachment" if download else "inline"
+        encoded_name = quote(path.name, safe="")
+        extra_headers = [
+            ("Cache-Control", "no-store"),
+            ("Content-Disposition", f"{disposition}; filename*=UTF-8''{encoded_name}"),
+            ("X-Content-Type-Options", "nosniff"),
+        ]
+        if path.suffix.lower() == ".html":
+            extra_headers.append((
+                "Content-Security-Policy",
+                "default-src 'none'; connect-src 'none'; img-src data: blob:; "
+                "font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                "sandbox allow-scripts",
+            ))
+        return _http_response(
+            body,
+            content_type=artifact_content_type(path),
+            extra_headers=extra_headers,
+        )
+
+    def _handle_registered_artifact_get(
+        self,
+        request: WsRequest,
+        artifact_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        session_key = _query_first(_parse_query(request.path), "session")
+        if not session_key:
+            return _http_error(400, "missing session")
+        artifact = self.state.get_artifact(artifact_id, session_key=session_key)
+        if artifact is None:
+            return _http_error(404, "artifact not found")
+        return _http_json_response({"artifact": registered_artifact_row(artifact)})
+
+    async def _handle_registered_artifact_content(
+        self,
+        request: WsRequest,
+        artifact_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        query = _parse_query(request.path)
+        session_key = _query_first(query, "session")
+        if not session_key:
+            await asyncio.to_thread(
+                self.logs.write,
+                level="warning",
+                component="artifacts",
+                event_name="artifact_content_rejected",
+                message="artifact content request did not include a session",
+                artifact_id=artifact_id,
+                error_code="MISSING_SESSION",
+            )
+            return _http_error(400, "missing session")
+        try:
+            artifact, path = await asyncio.to_thread(
+                self.state.resolve_artifact_path,
+                artifact_id,
+                session_key=session_key,
+            )
+            project = self.state.get_project(artifact.project_id)
+            if project is None:
+                await asyncio.to_thread(
+                    self.logs.write,
+                    level="error",
+                    component="artifacts",
+                    event_name="artifact_content_failed",
+                    message="artifact project could not be resolved",
+                    project_id=artifact.project_id,
+                    session_id=artifact.session_id,
+                    artifact_id=artifact.id,
+                    error_code="PROJECT_NOT_FOUND",
+                )
+                return _http_error(404, "artifact project not found")
+            body = await asyncio.to_thread(
+                read_session_artifact,
+                path,
+                root=Path(project.canonical_root_path),
+            )
+        except (OSError, StateStoreError, SessionArtifactError) as exc:
+            await asyncio.to_thread(
+                self.logs.write,
+                level="warning",
+                component="artifacts",
+                event_name="artifact_content_failed",
+                message="artifact could not be resolved for the requested session",
+                artifact_id=artifact_id,
+                error_code="ARTIFACT_NOT_FOUND_OR_UNLINKED",
+                details={
+                    "session_key": session_key,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            return _http_error(404, "artifact not found")
+
+        download = _query_first(query, "download") in {"1", "true", "yes"}
+        disposition = "attachment" if download else "inline"
+        encoded_name = quote(path.name, safe="")
+        extra_headers = [
+            ("Cache-Control", "no-store"),
+            ("Content-Disposition", f"{disposition}; filename*=UTF-8''{encoded_name}"),
+            ("X-Content-Type-Options", "nosniff"),
+        ]
+        if path.suffix.lower() == ".html":
+            extra_headers.append((
+                "Content-Security-Policy",
+                "default-src 'none'; connect-src 'none'; img-src data: blob:; "
+                "font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                "sandbox allow-scripts",
+            ))
+        response = _http_response(
+            body,
+            content_type=artifact.mime_type,
+            extra_headers=extra_headers,
+        )
+        await asyncio.to_thread(
+            self.logs.write,
+            level="info",
+            component="artifacts",
+            event_name="artifact_content_served",
+            message="artifact content served",
+            project_id=artifact.project_id,
+            session_id=artifact.session_id,
+            artifact_id=artifact.id,
+            details={
+                "relative_path": artifact.relative_path,
+                "content_length": len(body),
+                "download": download,
+            },
+        )
+        return response
+
+    def _session_artifact_context(
+        self,
+        request: WsRequest,
+        key: str,
+    ) -> tuple[str, dict[str, Any]] | Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        decoded_key = _decode_api_key(key)
+        if decoded_key is None:
+            return _http_error(400, "invalid session key")
+        if not _is_websocket_channel_session_key(decoded_key):
+            return _http_error(404, "session not found")
+        session_data = self.session_manager.read_session_file(decoded_key)
+        if session_data is None:
+            return _http_error(404, "session not found")
+        return decoded_key, session_data
+
     def _sessions_list_payload(self) -> dict[str, Any]:
         assert self.session_manager is not None
         sessions = list_webui_sessions(self.session_manager)
         from nanobot.session.webui_turns import websocket_turn_wall_started_at
 
+        state_sessions = self.state.list_sessions(include_archived=True)
+        state_by_key = {session.session_key: session for session in state_sessions}
+        projects_by_id = {
+            project.id: project
+            for project in self.state.list_projects(include_archived=True)
+        }
         cleaned = []
+        listed_keys: set[str] = set()
         for s in sessions:
             key = s.get("key")
             if not (
@@ -433,20 +963,125 @@ class GatewayHTTPHandler:
                 and (key.startswith("websocket:") or key.startswith("cron:"))
             ):
                 continue
+            existing_state = state_by_key.get(key)
+            if existing_state is not None and existing_state.status == "archived":
+                continue
             row = {k: v for k, v in s.items() if k != "path"}
             chat_id = key.split(":", 1)[1]
             started_at = websocket_turn_wall_started_at(chat_id)
             if started_at is not None:
                 row["run_started_at"] = started_at
-            scope = self.workspaces.scope_for_session_key(key)
+            metadata_data = self.session_manager.read_session_metadata(key)
+            metadata = (
+                metadata_data.get("metadata")
+                if isinstance(metadata_data, dict)
+                else None
+            )
+            state_project = (
+                projects_by_id.get(existing_state.project_id)
+                if existing_state is not None
+                else None
+            )
+            scope = self.workspaces.scope_for_session_metadata(
+                metadata if isinstance(metadata, dict) else None,
+                state_project=state_project,
+            )
             row["workspace_scope"] = scope.payload()
-            session_data = self.session_manager.read_session_file(key)
-            metadata = session_data.get("metadata") if isinstance(session_data, dict) else None
+            if existing_state is not None:
+                state_session = existing_state
+            else:
+                # Legacy sessions are projected once.  After that SQLite owns
+                # stable identity, project binding, ordering, and title.
+                session_data = self.session_manager.read_session_file(key)
+                if not isinstance(session_data, dict):
+                    continue
+                try:
+                    state_session = self._ensure_state_session(key, session_data, scope)
+                except SessionProjectMismatch:
+                    self._log.error(
+                        "session project mismatch while listing session={}",
+                        key,
+                    )
+                    continue
+                state_by_key[key] = state_session
+            row["session_id"] = state_session.id
+            row["project_id"] = state_session.project_id
+            # Once a session is projected, SQLite owns its ordering and stable
+            # identity.  The JSONL index remains useful for preview text.
+            row["created_at"] = datetime.fromtimestamp(
+                state_session.created_at / 1_000
+            ).isoformat()
+            row["updated_at"] = datetime.fromtimestamp(
+                state_session.updated_at / 1_000
+            ).isoformat()
+            if state_session.title:
+                row["title"] = state_session.title
             if isinstance(metadata, dict):
                 expert_team = public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
                 if expert_team is not None:
                     row["expert_team"] = expert_team
             cleaned.append(row)
+            listed_keys.add(key)
+
+        # A rebuildable JSONL index must not be able to hide an otherwise
+        # valid SQLite-backed session.  Merge any projected, disk-backed rows
+        # that were absent from the index instead of making the sidebar depend
+        # on both stores being refreshed in the same request.
+        for state_session in state_sessions:
+            if state_session.status == "archived":
+                continue
+            key = state_session.session_key
+            if key in listed_keys or not (
+                key.startswith("websocket:") or key.startswith("cron:")
+            ):
+                continue
+            session_data = self.session_manager.read_session_file(key)
+            if not isinstance(session_data, dict):
+                continue
+            metadata = session_data.get("metadata")
+            scope = self.workspaces.scope_for_session_metadata(
+                metadata if isinstance(metadata, dict) else None,
+                state_project=projects_by_id.get(state_session.project_id),
+            )
+            preview = ""
+            messages = session_data.get("messages")
+            if isinstance(messages, list):
+                for message in messages:
+                    if not isinstance(message, dict) or message.get("role") != "user":
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        preview = content.strip()[:240]
+                        break
+            row = {
+                "key": key,
+                "created_at": datetime.fromtimestamp(
+                    state_session.created_at / 1_000
+                ).isoformat(),
+                "updated_at": datetime.fromtimestamp(
+                    state_session.updated_at / 1_000
+                ).isoformat(),
+                "title": state_session.title,
+                "preview": preview,
+                "workspace_scope": scope.payload(),
+                "session_id": state_session.id,
+                "project_id": state_session.project_id,
+            }
+            chat_id = key.split(":", 1)[1]
+            started_at = websocket_turn_wall_started_at(chat_id)
+            if started_at is not None:
+                row["run_started_at"] = started_at
+            if isinstance(metadata, dict):
+                expert_team = public_expert_team_binding(
+                    metadata.get(EXPERT_TEAM_SESSION_KEY)
+                )
+                if expert_team is not None:
+                    row["expert_team"] = expert_team
+            cleaned.append(row)
+        cleaned.sort(
+            key=lambda row: str(row.get("updated_at") or ""),
+            reverse=True,
+        )
         return {"sessions": cleaned}
 
     def _handle_session_messages(self, request: WsRequest, key: str) -> Response:
@@ -512,6 +1147,17 @@ class GatewayHTTPHandler:
         if data is None:
             return _http_error(404, "webui thread not found")
         data["workspace_scope"] = scope.payload()
+        if isinstance(session_data, dict):
+            try:
+                state_session = self._ensure_state_session(
+                    decoded_key,
+                    session_data,
+                    scope,
+                )
+            except SessionProjectMismatch:
+                return _http_error(409, "session_project_mismatch")
+            data["session_id"] = state_session.id
+            data["project_id"] = state_session.project_id
         metadata = session_data.get("metadata") if isinstance(session_data, dict) else None
         if isinstance(metadata, dict):
             expert_team = public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
@@ -580,9 +1226,41 @@ class GatewayHTTPHandler:
         if automation_jobs and self.cron_service is not None:
             for job in automation_jobs:
                 self.cron_service.remove_job(job.id)
-        deleted = self.session_manager.delete_session(decoded_key)
-        delete_webui_thread(decoded_key)
-        return _http_json_response({"deleted": bool(deleted)})
+        state_session = self.state.get_session(decoded_key)
+        if state_session is None:
+            session_data = self.session_manager.read_session_file(decoded_key)
+            if not isinstance(session_data, dict):
+                return _http_error(404, "session not found")
+            try:
+                state_session = self._ensure_state_session(
+                    decoded_key,
+                    session_data,
+                    self.workspaces.scope_for_session_key(decoded_key),
+                )
+            except SessionProjectMismatch:
+                return _http_error(409, "session_project_mismatch")
+        if state_session is None:
+            return _http_error(404, "session not found")
+        self.state.archive_session(decoded_key)
+        return _http_json_response({"deleted": True, "archived": True})
+
+    def _handle_session_restore(self, request: WsRequest, key: str) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        decoded_key = _decode_api_key(key)
+        if decoded_key is None:
+            return _http_error(400, "invalid session key")
+        try:
+            restored = self.state.restore_session(decoded_key)
+        except StateStoreError as exc:
+            return _http_error(404, str(exc))
+        return _http_json_response(
+            {
+                "restored": True,
+                "session_id": restored.id,
+                "project_id": restored.project_id,
+            }
+        )
 
     # -- Automation routes --------------------------------------------------
 
@@ -714,6 +1392,61 @@ class GatewayHTTPHandler:
     ) -> Response | None:
         if got == "/api/sessions":
             return await self._handle_sessions_list(request)
+        if got == "/api/projects":
+            return await self._handle_projects_list(request)
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/archive$", got)
+        if m:
+            return await self._handle_project_archive(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/restore$", got)
+        if m:
+            return await self._handle_project_restore(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/relocate$", got)
+        if m:
+            return await self._handle_project_relocate(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/export$", got)
+        if m:
+            return await self._handle_project_export(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/sessions$", got)
+        if m:
+            return await self._handle_project_sessions(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/status$", got)
+        if m:
+            return await self._handle_project_memory_status(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/consolidate$", got)
+        if m:
+            return await self._handle_project_memory_consolidate(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/clear$", got)
+        if m:
+            return await self._handle_project_memory_clear(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/reindex$", got)
+        if m:
+            return await self._handle_project_memory_reindex(request, m.group(1))
+        m = re.match(
+            r"^/api/projects/([A-Za-z0-9_-]+)/memories/([A-Za-z0-9_-]+)/forget$",
+            got,
+        )
+        if m:
+            return await self._handle_project_memory_item(
+                request,
+                m.group(1),
+                m.group(2),
+                allow_get=True,
+            )
+        m = re.match(
+            r"^/api/projects/([A-Za-z0-9_-]+)/memories/([A-Za-z0-9_-]+)$",
+            got,
+        )
+        if m:
+            return await self._handle_project_memory_item(
+                request,
+                m.group(1),
+                m.group(2),
+            )
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories$", got)
+        if m:
+            return await self._handle_project_memories(request, m.group(1))
+        if got == "/api/diagnostics/logs":
+            return await self._handle_diagnostic_logs(request)
         if got == "/api/commands":
             return self._handle_commands(request)
         if got == "/api/workspaces":
@@ -728,6 +1461,566 @@ class GatewayHTTPHandler:
         if got == "/api/webui/sidebar-state/update":
             return self._handle_webui_sidebar_state_update(request)
         return None
+
+    async def _handle_projects_list(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.session_manager is not None:
+            # Normal reads are SQLite-only.  Preserve one-time migration for
+            # legacy JSONL sessions that predate the projection database
+            # without rebuilding every session payload on each project read.
+            indexed_sessions = await asyncio.to_thread(
+                list_webui_sessions,
+                self.session_manager,
+            )
+            projected_keys = {
+                session.session_key
+                for session in await asyncio.to_thread(
+                    self.state.list_sessions,
+                    include_archived=True,
+                )
+            }
+            has_unprojected = any(
+                isinstance(row.get("key"), str)
+                and (
+                    row["key"].startswith("websocket:")
+                    or row["key"].startswith("cron:")
+                )
+                and row["key"] not in projected_keys
+                for row in indexed_sessions
+            )
+            if has_unprojected:
+                await asyncio.to_thread(self._sessions_list_payload)
+        query = _parse_query(request.path)
+        include_archived = _query_first(query, "include_archived") in {"1", "true", "yes"}
+        projects = await asyncio.to_thread(
+            self.state.list_projects,
+            include_archived=include_archived,
+        )
+        return _http_json_response(
+            {
+                "projects": [
+                    {
+                        "id": project.id,
+                        "kind": project.kind,
+                        "name": project.name,
+                        "root_path": project.root_path,
+                        "status": project.status,
+                        "created_at": project.created_at,
+                        "updated_at": project.updated_at,
+                    }
+                    for project in projects
+                ]
+            }
+        )
+
+    @staticmethod
+    def _project_payload(project: Any) -> dict[str, Any]:
+        return {
+            "id": project.id,
+            "kind": project.kind,
+            "name": project.name,
+            "root_path": project.root_path,
+            "status": project.status,
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+        }
+
+    def _require_project_mutation(self, request: WsRequest) -> Response | None:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() not in {"GET", "POST", "PUT"}:
+            return _http_error(405, "unsupported method")
+        return None
+
+    def _project_memory_store(self, project_id: str) -> MemoryStore:
+        if self.state.get_project(project_id) is None:
+            raise StateStoreError("project not found")
+        return MemoryStore(
+            self.skills_workspace_path
+            / ".nanobot"
+            / "project-memory"
+            / project_id
+        )
+
+    async def _refresh_project_memory_files_from_rows(
+        self,
+        project_id: str,
+        store: MemoryStore,
+    ) -> None:
+        rows = await asyncio.to_thread(self.state.list_project_memories, project_id)
+        structured = [row for row in rows if row.get("kind") != "long_term"]
+        if not structured:
+            await asyncio.to_thread(store.write_memory, "")
+            await asyncio.to_thread(store.write_memory_summary, "")
+            await asyncio.to_thread(store.write_raw_memories, "")
+            await asyncio.to_thread(store.sync_rollout_summaries, {})
+            await asyncio.to_thread(store.sync_memory_skills, {})
+            return
+        markdown = "# Project memory\n\n" + "\n\n".join(
+            (
+                f"## {str(row.get('title') or row.get('kind') or 'Memory')}\n\n"
+                f"{row['content']}"
+            )
+            for row in structured
+        )
+        summary = "\n".join(
+            f"- {str(row['content'])[:500]}"
+            for row in structured[:12]
+        )
+        await asyncio.to_thread(store.write_memory, markdown)
+        await asyncio.to_thread(store.write_memory_summary, summary)
+        skills = {
+            f"{row['kind']}-{row['id']}": (
+                f"# {str(row.get('title') or row.get('kind') or 'Memory')}\n\n"
+                f"- kind: `{row['kind']}`\n\n{row['content']}\n"
+            )
+            for row in structured
+            if row.get("kind") in {
+                "project_preference",
+                "workflow",
+                "failure_shield",
+                "decision_rule",
+            }
+        }
+        await asyncio.to_thread(store.sync_memory_skills, skills)
+
+    async def _handle_project_memories(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        method = str(getattr(request, "method", "GET")).upper()
+        if method == "GET":
+            try:
+                rows = await asyncio.to_thread(
+                    self.state.list_project_memories,
+                    project_id,
+                )
+                for row in rows:
+                    row["sources"] = await asyncio.to_thread(
+                        self.state.list_project_memory_sources,
+                        project_id,
+                        str(row["id"]),
+                    )
+                status = await asyncio.to_thread(
+                    self.state.project_memory_job_status,
+                    project_id,
+                )
+            except StateStoreError as exc:
+                return _http_error(404, str(exc))
+            return _http_json_response(
+                {
+                    "project_id": project_id,
+                    "memories": rows,
+                    "status": status,
+                    "retrieval": {
+                        "mode": "bounded_lexical",
+                        "deep_rag_enabled": False,
+                    },
+                }
+            )
+        if method != "DELETE":
+            return _http_error(405, "unsupported method")
+        return await self._clear_project_memories(project_id)
+
+    async def _handle_project_memory_clear(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() not in {"GET", "DELETE"}:
+            return _http_error(405, "unsupported method")
+        return await self._clear_project_memories(project_id)
+
+    async def _clear_project_memories(self, project_id: str) -> Response:
+        try:
+            store = self._project_memory_store(project_id)
+            removed = await asyncio.to_thread(
+                self.state.clear_project_memories,
+                project_id,
+            )
+            await asyncio.to_thread(store.write_memory, "")
+            await asyncio.to_thread(store.write_memory_summary, "")
+            await asyncio.to_thread(store.write_raw_memories, "")
+            await asyncio.to_thread(store.sync_rollout_summaries, {})
+            await asyncio.to_thread(store.sync_memory_skills, {})
+        except StateStoreError as exc:
+            return _http_error(404, str(exc))
+        await asyncio.to_thread(
+            self.logs.write,
+            level="warning",
+            component="project_memory",
+            event_name="project_memory_cleared",
+            message="project-derived memory was cleared; source sessions were preserved",
+            project_id=project_id,
+            details={"removed": removed},
+        )
+        return _http_json_response({"ok": True, "removed": removed})
+
+    async def _handle_project_memory_status(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() != "GET":
+            return _http_error(405, "unsupported method")
+        try:
+            payload = await asyncio.to_thread(
+                self.state.project_memory_job_status,
+                project_id,
+            )
+        except StateStoreError as exc:
+            return _http_error(404, str(exc))
+        return _http_json_response(payload)
+
+    async def _handle_project_memory_consolidate(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() not in {"GET", "POST"}:
+            return _http_error(405, "unsupported method")
+        if self.project_memory_pipeline is None:
+            return _http_error(503, "project memory pipeline is unavailable")
+        try:
+            store = self._project_memory_store(project_id)
+            refreshed = await self.project_memory_pipeline.consolidate_project(
+                project_id,
+                store,
+                force=True,
+            )
+            status = await asyncio.to_thread(
+                self.state.project_memory_job_status,
+                project_id,
+            )
+        except StateStoreError as exc:
+            return _http_error(404, str(exc))
+        return _http_json_response(
+            {"ok": True, "refreshed": refreshed, "status": status}
+        )
+
+    async def _handle_project_memory_reindex(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() != "GET":
+            return _http_error(405, "unsupported method")
+        try:
+            result = await asyncio.to_thread(
+                self.state.reindex_project_text_artifacts,
+                project_id,
+            )
+        except StateStoreError as exc:
+            return _http_error(404, str(exc))
+        await asyncio.to_thread(
+            self.logs.write,
+            level="info",
+            component="project_memory",
+            event_name="project_lexical_index_rebuilt",
+            message="project-scoped text artifact index was rebuilt",
+            project_id=project_id,
+            details=result,
+        )
+        return _http_json_response(
+            {
+                "ok": True,
+                "retrieval": {
+                    "mode": "bounded_lexical",
+                    "deep_rag_enabled": False,
+                },
+                **result,
+            }
+        )
+
+    async def _handle_project_memory_item(
+        self,
+        request: WsRequest,
+        project_id: str,
+        memory_id: str,
+        *,
+        allow_get: bool = False,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        allowed_methods = {"GET", "DELETE"} if allow_get else {"DELETE"}
+        if str(getattr(request, "method", "GET")).upper() not in allowed_methods:
+            return _http_error(405, "unsupported method")
+        removed = await asyncio.to_thread(
+            self.state.delete_project_memory,
+            project_id,
+            memory_id,
+        )
+        if not removed:
+            return _http_error(404, "project memory not found")
+        refreshed = False
+        if self.project_memory_pipeline is not None:
+            store = self._project_memory_store(project_id)
+            refreshed = await self.project_memory_pipeline.consolidate_project(
+                project_id,
+                store,
+                force=True,
+            )
+        if not refreshed:
+            store = self._project_memory_store(project_id)
+            await self._refresh_project_memory_files_from_rows(project_id, store)
+        await asyncio.to_thread(
+            self.logs.write,
+            level="warning",
+            component="project_memory",
+            event_name="project_memory_forgotten",
+            message="one project memory and its exclusive evidence were forgotten",
+            project_id=project_id,
+            details={"memory_id": memory_id, "projection_refreshed": refreshed},
+        )
+        return _http_json_response(
+            {"ok": True, "memory_id": memory_id, "refreshed": refreshed}
+        )
+
+    async def _handle_project_archive(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if error := self._require_project_mutation(request):
+            return error
+        if self.cron_service is not None:
+            active_jobs = await asyncio.to_thread(
+                self.cron_service.list_jobs,
+                include_disabled=True,
+            )
+            if any(
+                job.enabled
+                and getattr(job.payload, "project_id", None) == project_id
+                for job in active_jobs
+            ):
+                return _http_error(
+                    409,
+                    "project has active schedules; pause them before archiving",
+                )
+        try:
+            project = await asyncio.to_thread(self.state.archive_project, project_id)
+        except StateStoreError as exc:
+            status = 404 if str(exc) == "project not found" else 409
+            return _http_error(status, str(exc))
+        await asyncio.to_thread(
+            self.logs.write,
+            level="info",
+            component="projects",
+            event_name="project_archived",
+            message="project registration archived without deleting files",
+            project_id=project.id,
+        )
+        return _http_json_response({"project": self._project_payload(project)})
+
+    async def _handle_project_restore(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if error := self._require_project_mutation(request):
+            return error
+        try:
+            project = await asyncio.to_thread(self.state.restore_project, project_id)
+        except StateStoreError as exc:
+            status = 404 if str(exc) == "project not found" else 409
+            return _http_error(status, str(exc))
+        return _http_json_response({"project": self._project_payload(project)})
+
+    async def _handle_project_relocate(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if error := self._require_project_mutation(request):
+            return error
+        query = _parse_query(request.path)
+        new_path = (_query_first(query, "path") or "").strip()
+        if not new_path:
+            return _http_error(400, "missing path")
+        try:
+            project = await asyncio.to_thread(
+                self.state.relocate_project,
+                project_id,
+                new_path,
+            )
+        except StateStoreError as exc:
+            status = 404 if str(exc) == "project not found" else 409
+            return _http_error(status, str(exc))
+        await asyncio.to_thread(
+            self.logs.write,
+            level="info",
+            component="projects",
+            event_name="project_relocated",
+            message="project root was relocated while preserving identity",
+            project_id=project.id,
+            details={"new_root_path": project.root_path},
+        )
+        return _http_json_response({"project": self._project_payload(project)})
+
+    async def _handle_project_export(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        try:
+            manifest = await asyncio.to_thread(
+                self.state.project_export_manifest,
+                project_id,
+            )
+        except StateStoreError as exc:
+            return _http_error(404, str(exc))
+        project = self.state.get_project(project_id)
+        assert project is not None
+        include_files = _query_first(_parse_query(request.path), "include_files") in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        def build_archive() -> bytes:
+            output = io.BytesIO()
+            root = Path(project.canonical_root_path).resolve(strict=False)
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                )
+                archive.writestr(
+                    "state-export.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                )
+                for session in manifest["sessions"]:
+                    event_log = session.get("event_log_path")
+                    if not isinstance(event_log, str) or not event_log:
+                        continue
+                    source = Path(event_log).expanduser().resolve(strict=False)
+                    if source.is_file():
+                        archive.write(source, f"sessions/{session['id']}.jsonl")
+                memory_root = (
+                    self.skills_workspace_path
+                    / ".nanobot"
+                    / "project-memory"
+                    / project_id
+                )
+                if memory_root.is_dir():
+                    for source in memory_root.rglob("*"):
+                        if source.is_file():
+                            archive.write(
+                                source,
+                                f"memory/{source.relative_to(memory_root).as_posix()}",
+                            )
+                if include_files:
+                    seen: set[str] = set()
+                    for artifact in manifest["artifacts"]:
+                        relative = str(artifact.get("relative_path") or "")
+                        if not relative or relative in seen:
+                            continue
+                        source = (root / relative).resolve(strict=False)
+                        try:
+                            source.relative_to(root)
+                        except ValueError:
+                            continue
+                        if source.is_file():
+                            seen.add(relative)
+                            archive.write(source, f"managed-artifacts/{relative}")
+            return output.getvalue()
+
+        body = await asyncio.to_thread(build_archive)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", project.name).strip("-") or project.id
+        return _http_response(
+            body,
+            content_type="application/zip",
+            extra_headers=[
+                ("Content-Disposition", f'attachment; filename="{safe_name}-export.zip"'),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+
+    async def _handle_project_sessions(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.state.get_project(project_id) is None:
+            return _http_error(404, "project not found")
+        sessions = await asyncio.to_thread(
+            self.state.list_project_sessions,
+            project_id,
+        )
+        return _http_json_response(
+            {
+                "project_id": project_id,
+                "sessions": [
+                    {
+                        "id": session.id,
+                        "project_id": session.project_id,
+                        "session_key": session.session_key,
+                        "title": session.title,
+                        "status": session.status,
+                        "created_at": session.created_at,
+                        "updated_at": session.updated_at,
+                    }
+                    for session in sessions
+                ],
+            }
+        )
+
+    async def _handle_diagnostic_logs(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        query = _parse_query(request.path)
+        raw_limit = _query_first(query, "limit")
+        try:
+            limit = int(raw_limit) if raw_limit else 200
+        except ValueError:
+            return _http_error(400, "invalid limit")
+        records = await asyncio.to_thread(
+            self.logs.query,
+            project_id=_query_first(query, "project_id"),
+            session_id=_query_first(query, "session_id"),
+            artifact_id=_query_first(query, "artifact_id"),
+            error_code=_query_first(query, "error_code"),
+            limit=limit,
+        )
+        return _http_json_response(
+            {"logs": [self._structured_log_payload(record) for record in records]}
+        )
+
+    @staticmethod
+    def _structured_log_payload(record: StructuredLogRecord) -> dict[str, Any]:
+        return {
+            "id": record.id,
+            "timestamp": record.timestamp,
+            "level": record.level,
+            "component": record.component,
+            "event_name": record.event_name,
+            "message": record.message,
+            "request_id": record.request_id,
+            "project_id": record.project_id,
+            "session_id": record.session_id,
+            "turn_id": record.turn_id,
+            "tool_call_id": record.tool_call_id,
+            "artifact_id": record.artifact_id,
+            "error_code": record.error_code,
+            "duration_ms": record.duration_ms,
+            "details": record.details,
+        }
 
     def _handle_commands(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):

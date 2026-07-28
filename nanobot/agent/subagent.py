@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.providers.base import LLMProvider
+from nanobot.security.project_context import current_project_context
 from nanobot.security.workspace_access import (
     WorkspaceScope,
     bind_workspace_scope,
@@ -29,8 +31,8 @@ from nanobot.security.workspace_access import (
 )
 from nanobot.utils.prompt_templates import render_template
 
-
 _EXPERT_TEAM_MAX_ITERATIONS = 100
+_EXPERT_TEAM_MEMBER_TIMEOUT_S = 540
 
 
 @dataclass(slots=True)
@@ -102,6 +104,8 @@ def _friendly_tool_name(name: str) -> str:
         return "网页读取"
     if compact in {"exec", "run_shell_command"}:
         return "结构化数据查询"
+    if compact.startswith("mcp_juyuan_"):
+        return "聚源结构化数据查询"
     return "当前查询"
 
 
@@ -123,8 +127,23 @@ def _subagent_activity(name: str, arguments: Any) -> str:
     if compact in {"exec", "run_shell_command"}:
         command = str(args.get("command") or args.get("cmd") or "")
         if "ifind-finance-data" in command or "51ifind" in command:
-            return "正在查询同花顺 iFinD 结构化金融数据"
+            match = re.search(
+                r"""["']query["']\s*:\s*["']([^"']+)["']""",
+                command,
+            )
+            query = match.group(1).strip() if match else ""
+            return (
+                f"正在查询同花顺 iFinD：{query[:72]}"
+                if query
+                else "正在查询同花顺 iFinD 结构化金融数据"
+            )
         return "正在处理研究数据"
+    if compact.startswith("mcp_juyuan_"):
+        return (
+            f"正在查询聚源金融数据：{query[:72]}"
+            if query
+            else "正在查询聚源结构化金融数据"
+        )
     return f"正在执行：{name}"
 
 
@@ -144,6 +163,7 @@ class SubagentManager:
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
+        parent_tools: ToolRegistry | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -165,6 +185,7 @@ class SubagentManager:
             else defaults.max_concurrent_subagents
         )
         self.runner = AgentRunner(provider)
+        self.parent_tools = parent_tools
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
@@ -183,8 +204,9 @@ class SubagentManager:
         self,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        expert_team: dict[str, Any] | None = None,
     ) -> ToolRegistry:
-        """Build an isolated subagent tool registry via ToolLoader."""
+        """Build isolated native tools plus explicitly bound team MCP tools."""
         root = self.workspace if workspace is None else workspace
         registry = ToolRegistry()
         cfg = tools_config if tools_config is not None else self._subagent_tools_config()
@@ -198,6 +220,20 @@ class SubagentManager:
             ),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
+        raw_presets = expert_team.get("mcp_presets") if isinstance(expert_team, dict) else None
+        if self.parent_tools is not None and isinstance(raw_presets, list):
+            prefixes = {
+                f"mcp_{str(item.get('name')).strip().lower()}_"
+                for item in raw_presets
+                if isinstance(item, dict)
+                and item.get("configured") is True
+                and str(item.get("name") or "").strip()
+            }
+            for name in self.parent_tools.tool_names:
+                if any(name.startswith(prefix) for prefix in prefixes):
+                    tool = self.parent_tools.get(name)
+                    if tool is not None:
+                        registry.register(tool)
         return registry
 
     def set_provider(self, provider: LLMProvider, model: str) -> None:
@@ -219,9 +255,59 @@ class SubagentManager:
         expert_team_run_id: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
+        project_context = current_project_context()
+        if project_context is not None:
+            if workspace_scope is None:
+                return "Error: project-scoped subagents require an inherited workspace scope"
+            if (
+                workspace_scope.project_path.expanduser().resolve(strict=False)
+                != project_context.root_path.expanduser().resolve(strict=False)
+            ):
+                return "Error: subagent workspace does not match the parent project"
         task_id = str(uuid.uuid4())[:8]
+        child_session_key: str | None = None
+        state_store = None
+        if project_context is not None:
+            from nanobot.storage.state import StateStore, StateStoreError
+
+            try:
+                state_store = StateStore(
+                    self.workspace / ".nanobot" / "state.sqlite",
+                    default_workspace=self.workspace,
+                )
+                child_session_key = f"subagent:{task_id}"
+                state_store.bind_session(
+                    child_session_key,
+                    project_context.project_id,
+                    title=label or task[:80],
+                    metadata={
+                        "parent_session_key": project_context.session_key,
+                        "project_id": project_context.project_id,
+                    },
+                    artifact_index_initialized=True,
+                )
+                parent_turn_id = state_store.active_turn_id(project_context.session_key)
+                if parent_turn_id is not None:
+                    state_store.record_agent_edge(
+                        project_id=project_context.project_id,
+                        parent_session_key=project_context.session_key,
+                        child_session_key=child_session_key,
+                        parent_turn_id=parent_turn_id,
+                    )
+            except StateStoreError:
+                logger.exception("Failed to persist project-scoped subagent relationship")
+                return "Error: subagent project relationship could not be persisted"
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
+        origin = {
+            "channel": origin_channel,
+            "chat_id": origin_chat_id,
+            "session_key": session_key,
+            **(
+                {"project_id": project_context.project_id}
+                if project_context is not None
+                else {}
+            ),
+        }
 
         status = SubagentStatus(
             task_id=task_id,
@@ -250,6 +336,21 @@ class SubagentManager:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
         def _cleanup(_: asyncio.Task) -> None:
+            if state_store is not None and child_session_key is not None:
+                child_status = (
+                    "cancelled"
+                    if bg_task.cancelled()
+                    else "failed" if (
+                        bg_task.exception() is not None
+                        or status.phase == "error"
+                        or status.stop_reason in {"error", "tool_error", "timeout"}
+                    )
+                    else "completed"
+                )
+                state_store.complete_session(
+                    child_session_key,
+                    status=child_status,
+                )
             self._running_tasks.pop(task_id, None)
             self._task_statuses.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
@@ -309,7 +410,11 @@ class SubagentManager:
             if workspace_scope is not None:
                 cfg = self._subagent_tools_config()
                 cfg.restrict_to_workspace = workspace_scope.restrict_to_workspace
-            tools = self._build_tools(workspace=root, tools_config=cfg)
+            tools = self._build_tools(
+                workspace=root,
+                tools_config=cfg,
+                expert_team=expert_team,
+            )
             system_prompt = self._build_subagent_prompt(workspace=root)
             if expert_team is not None:
                 members = expert_team.get("members")
@@ -344,7 +449,7 @@ class SubagentManager:
                 else self.max_iterations
             )
             try:
-                result = await self.runner.run(AgentRunSpec(
+                run_spec = AgentRunSpec(
                     initial_messages=messages,
                     tools=tools,
                     model=self.model,
@@ -375,7 +480,15 @@ class SubagentManager:
                     session_key=sess_key,
                     workspace=root,
                     llm_timeout_s=llm_timeout,
-                ))
+                )
+                result = (
+                    await asyncio.wait_for(
+                        self.runner.run(run_spec),
+                        timeout=_EXPERT_TEAM_MEMBER_TIMEOUT_S,
+                    )
+                    if expert_team is not None
+                    else await self.runner.run(run_spec)
+                )
             finally:
                 if token is not None:
                     reset_workspace_scope(token)
@@ -500,6 +613,36 @@ class SubagentManager:
                     activity="研究完成，完整结果已交付 Team Lead",
                 )
 
+        except asyncio.TimeoutError:
+            status.phase = "error"
+            status.stop_reason = "timeout"
+            status.error = (
+                f"expert-team member exceeded {_EXPERT_TEAM_MEMBER_TIMEOUT_S} seconds"
+            )
+            await self._announce_result(
+                task_id,
+                label,
+                task,
+                (
+                    "Error: this research member exceeded its runtime deadline and was stopped. "
+                    "Treat the missing dimension as a degradable evidence gap. Use the Team Lead "
+                    "data package, configured Juyuan MCP, and completed member reports to fill it; "
+                    "do not restart the same iFinD lookup loop."
+                ),
+                origin,
+                "error",
+                origin_message_id,
+                expert_team=expert_team is not None,
+            )
+            await self._publish_team_member_update(
+                origin,
+                expert_team,
+                expert_team_run_id,
+                task_id=task_id,
+                label=label,
+                status="failed",
+                activity="运行超时，已停止重复取数；Team Lead 将使用聚源和现有证据降级补齐",
+            )
         except asyncio.CancelledError:
             if status.stop_reason != "cancelled":
                 status.phase = "done"
@@ -816,6 +959,43 @@ class SubagentManager:
                 "Do not print, copy, or expose credential/configuration contents.\n\n"
                 f"{content}"
             )
+        raw_presets = expert_team.get("mcp_presets")
+        if isinstance(raw_presets, list):
+            sections.append(
+                "# Team-bound MCP Financial Data Sources\n\n"
+                "Configured MCP sources below are activated by the team runtime and inherited from "
+                "the Team Lead. Use their exact `mcp_<name>_...` tools when those tools are present. "
+                "Do not search the filesystem for MCP configuration or credentials."
+            )
+            for preset in raw_presets:
+                if not isinstance(preset, dict):
+                    continue
+                name = str(preset.get("name") or "").strip()
+                if not name:
+                    continue
+                display = str(preset.get("display_name") or name).strip()
+                description = str(preset.get("description") or "").strip()
+                if preset.get("configured") is True:
+                    sections.append(
+                        f"## {display} (configured, team-activated)\n\n"
+                        f"Tool prefix: `mcp_{name}_`. {description}"
+                    )
+                else:
+                    sections.append(
+                        f"## {display} (not configured)\n\n"
+                        "This source is not active for the current run. Do not attempt to discover "
+                        "credentials or configuration files; use another bound structured source."
+                    )
+            sections.append(
+                "Enforce this source state machine: iFinD first when appropriate; on its first hard "
+                "failure, inner `call failed`/429/permission error, or repeated-query warning, stop "
+                "iFinD immediately and switch to an available `mcp_juyuan_...` tool. Never rotate "
+                "cosmetically different iFinD commands to evade a failure. If Juyuan is absent or "
+                "also lacks the field, use verified evidence already supplied and finish with an "
+                "explicit data gap. Cross-check important figures between working sources when "
+                "practical, and use exchange filings, company IR, regulatory disclosures, and "
+                "public web sources only for remaining gaps."
+            )
         return "\n\n".join(sections)
 
     @staticmethod
@@ -838,6 +1018,11 @@ task text:
   recoverable evidence failure. Change the query/source or use reliable search
   snippets, and continue the remaining analysis. Never repeat an identical
   external lookup more than twice.
+- Financial data source order is strict: iFinD -> configured Juyuan MCP ->
+  verified evidence already present. On the first hard iFinD failure, inner
+  `call failed`/429/permission error, or repeated-query warning, stop iFinD and
+  use an available `mcp_juyuan_...` tool. If Juyuan also fails, label the gap
+  and finish. Never rotate issuer or peer queries indefinitely.
 - Keep research bounded: prioritize a small set of authoritative sources and
   synthesize once the key claims are supported. Do not keep searching for a
   perfect source. Never fabricate unavailable data; label gaps and confidence.

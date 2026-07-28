@@ -96,6 +96,42 @@ async def test_find_files_rejects_paths_outside_workspace(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_find_files_stays_project_scoped_in_full_access_mode(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    sibling = tmp_path / "other-project"
+    project.mkdir()
+    sibling.mkdir()
+    (sibling / "SKILL.md").write_text("outside\n", encoding="utf-8")
+    tool = FindFilesTool(
+        workspace=project,
+        restrict_to_workspace=False,
+    )
+
+    result = await tool.execute(path=str(tmp_path), query="SKILL.md")
+
+    assert result.startswith("Error: Search path is outside the active project")
+    assert "project-scoped even in Full Access mode" in result
+
+
+@pytest.mark.asyncio
+async def test_find_files_stops_at_scan_entry_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(5):
+        (tmp_path / f"file-{index}.txt").write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(FindFilesTool, "_MAX_SCAN_ENTRIES", 2)
+    tool = FindFilesTool(workspace=tmp_path, allowed_dir=tmp_path)
+
+    result = await tool.execute(path=".", query="missing")
+
+    assert result.startswith("Error: Search stopped at scan entry limit (2)")
+    assert "Use a narrower path" in result
+
+
+@pytest.mark.asyncio
 async def test_grep_respects_glob_filter_and_context(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text(
@@ -302,6 +338,20 @@ async def test_search_tools_reject_paths_outside_workspace(tmp_path: Path) -> No
     grep_result = await grep_tool.execute(pattern="secret", path=str(outside))
 
     assert grep_result.startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_grep_stays_project_scoped_in_full_access_mode(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    sibling = tmp_path / "other-project"
+    project.mkdir()
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("secret\n", encoding="utf-8")
+    tool = GrepTool(workspace=project, restrict_to_workspace=False)
+
+    result = await tool.execute(pattern="secret", path=str(sibling))
+
+    assert result.startswith("Error: Search path is outside the active project")
 
 
 def test_agent_loop_registers_grep(tmp_path: Path) -> None:

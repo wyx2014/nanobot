@@ -15,6 +15,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
+from nanobot.security.project_context import PROJECT_CONTEXT_METADATA_KEY
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 
 _CRON_PARAMETERS = tool_parameters_schema(
@@ -176,6 +177,20 @@ class CronTool(Tool, ContextAware):
             return "Error: scheduled cron jobs must be created from a chat session"
         origin_channel = self._origin_channel.get()
         origin_chat_id = self._origin_chat_id.get()
+        origin_metadata = dict(self._origin_metadata.get() or {})
+        raw_project_context = origin_metadata.get(PROJECT_CONTEXT_METADATA_KEY)
+        project_id = (
+            str(raw_project_context.get("project_id"))
+            if isinstance(raw_project_context, dict)
+            and isinstance(raw_project_context.get("project_id"), str)
+            else None
+        )
+        created_session_id = (
+            str(raw_project_context.get("session_id"))
+            if isinstance(raw_project_context, dict)
+            and isinstance(raw_project_context.get("session_id"), str)
+            else None
+        )
         if not origin_channel or not origin_chat_id:
             return "Error: scheduled cron jobs must be created from a chat session"
         if tz and not cron_expr:
@@ -216,9 +231,11 @@ class CronTool(Tool, ContextAware):
             message=message,
             delete_after_run=delete_after,
             session_key=session_key,
+            project_id=project_id,
+            created_session_id=created_session_id,
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
-            origin_metadata=dict(self._origin_metadata.get() or {}),
+            origin_metadata=origin_metadata,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 

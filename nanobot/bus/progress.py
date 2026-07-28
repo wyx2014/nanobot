@@ -28,6 +28,8 @@ def build_bus_progress_callback(
         file_edit_events: list[dict[str, Any]] | None = None,
         reasoning: bool = False,
         reasoning_end: bool = False,
+        narration: bool = False,
+        narration_end: bool = False,
     ) -> None:
         meta = dict(msg.metadata or {})
         meta["_progress"] = True
@@ -36,6 +38,10 @@ def build_bus_progress_callback(
             meta["_reasoning_delta"] = True
         if reasoning_end:
             meta["_reasoning_end"] = True
+        if narration:
+            meta["_narration_delta"] = True
+        if narration_end:
+            meta["_narration_end"] = True
         if tool_events:
             meta["_tool_events"] = tool_events
         if file_edit_events:
@@ -57,6 +63,8 @@ def build_bus_progress_callback(
         file_edit_events: list[dict[str, Any]] | None = None,
         reasoning: bool = False,
         reasoning_end: bool = False,
+        narration: bool = False,
+        narration_end: bool = False,
     ) -> None:
         await _publish_progress(
             content,
@@ -65,6 +73,8 @@ def build_bus_progress_callback(
             file_edit_events=file_edit_events,
             reasoning=reasoning,
             reasoning_end=reasoning_end,
+            narration=narration,
+            narration_end=narration_end,
         )
 
     return _bus_progress

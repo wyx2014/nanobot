@@ -22,6 +22,11 @@ from nanobot.agent.tools.mcp import MCPResourceWrapper, MCPToolWrapper
 from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import load_config, save_config
 from nanobot.config.schema import MCPServerConfig
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    build_workspace_scope,
+    reset_workspace_scope,
+)
 
 
 def _mcp_notification(method: str, params: dict[str, Any] | None = None) -> SessionMessage:
@@ -52,6 +57,24 @@ def test_mcp_progress_detection_accepts_flattened_sdk_message_shape():
 
     assert mcp_runtime._is_malformed_mcp_progress_notification(malformed) is True
     assert mcp_runtime._is_malformed_mcp_progress_notification(valid) is False
+
+
+def test_mcp_file_arguments_obey_restricted_project_scope(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    scope = build_workspace_scope(project, "restricted")
+    token = bind_workspace_scope(scope)
+    try:
+        assert mcp_runtime._mcp_workspace_violation({"path": "notes/report.md"}) is None
+        assert "outside" in str(
+            mcp_runtime._mcp_workspace_violation({"path": "../other/secret.md"})
+        )
+        assert "file URL" in str(
+            mcp_runtime._mcp_workspace_violation({"source_file": "file:///tmp/secret"})
+        )
+        assert mcp_runtime._mcp_workspace_violation({"url": "https://example.com"}) is None
+    finally:
+        reset_workspace_scope(token)
 
 
 class _FakeMcpTool(Tool):

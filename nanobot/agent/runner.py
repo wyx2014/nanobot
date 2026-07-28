@@ -14,9 +14,17 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.request_user_input import InteractivePromptRequested
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.runtime.plan_policy import (
+    PLAN_TOOL_NAME,
+    PlanPolicyState,
+    complex_request_reason,
+    decide_plan_policy,
+    plan_required_result,
+)
 from nanobot.utils.file_edit_events import (
     StreamingFileEditTracker,
     build_file_edit_end_event,
@@ -52,10 +60,14 @@ from nanobot.utils.runtime import (
     build_length_recovery_message,
     ensure_nonempty_tool_result,
     is_blank_text,
+    mark_structured_finance_source_failed,
     normalize_tool_message_content,
     repeated_external_lookup_error,
     repeated_local_lookup_error,
     repeated_workspace_violation_error,
+    structured_finance_fallback_instruction,
+    structured_finance_result_failed,
+    structured_finance_source,
 )
 
 GoalContinueMessage = str | Callable[[], str | None]
@@ -414,6 +426,35 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        request_context = current_request_context()
+        request_metadata = (
+            request_context.metadata
+            if request_context is not None and isinstance(request_context.metadata, dict)
+            else {}
+        )
+        expert_team_plan = isinstance(request_metadata.get("expert_team"), dict)
+        plan_policy_enabled = bool(
+            request_context is not None
+            and request_context.channel == "websocket"
+            and request_metadata.get("webui") is True
+        )
+        latest_user_content = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+            ),
+            "",
+        )
+        plan_policy_state = PlanPolicyState(
+            plan_created=expert_team_plan or not plan_policy_enabled,
+            forced_reason=(
+                complex_request_reason(latest_user_content)
+                if plan_policy_enabled and not expert_team_plan
+                else None
+            ),
+        )
 
         for iteration in range(spec.max_iterations):
             try:
@@ -488,6 +529,20 @@ class AgentRunner:
                     },
                 )
 
+                plan_decision = decide_plan_policy(
+                    (tool_call.name for tool_call in response.tool_calls),
+                    plan_policy_state,
+                    expert_team=expert_team_plan,
+                )
+                if (
+                    plan_decision.requires_plan
+                    and not plan_policy_state.plan_created
+                ):
+                    context.hidden_tool_call_ids = {
+                        tool_call.id
+                        for tool_call in response.tool_calls
+                        if tool_call.name != PLAN_TOOL_NAME
+                    }
                 await hook.before_execute_tools(context)
 
                 results, new_events, fatal_error, interactive_prompt_requested = await self._execute_tools(
@@ -496,6 +551,8 @@ class AgentRunner:
                     external_lookup_counts,
                     workspace_violation_counts,
                     local_lookup_state,
+                    plan_policy_state,
+                    expert_team=expert_team_plan,
                 )
                 tool_events.extend(new_events)
                 blocked_repeated_external_lookup = any(
@@ -1183,11 +1240,79 @@ class AgentRunner:
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
         local_lookup_state: dict[str, Any] | None = None,
+        plan_policy_state: PlanPolicyState | None = None,
+        *,
+        expert_team: bool = False,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None, bool]:
         local_lookup_state = local_lookup_state if local_lookup_state is not None else {}
+        # Direct callers of this internal helper predate PlanPolicy and are
+        # treated as already authorized. AgentRunner._run_core always supplies
+        # the real per-turn state for WebUI turns.
+        policy_state = plan_policy_state or PlanPolicyState(plan_created=True)
+        decision = decide_plan_policy(
+            (tool_call.name for tool_call in tool_calls),
+            policy_state,
+            expert_team=expert_team,
+        )
+        barrier_active = (
+            decision.requires_plan
+            and not policy_state.plan_created
+        )
+        publishes_plan = any(
+            tool_call.name == PLAN_TOOL_NAME
+            for tool_call in tool_calls
+        )
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+        barrier_counted = False
         for batch in batches:
+            blocked = [
+                tool_call
+                for tool_call in batch
+                if (
+                    tool_call.name != PLAN_TOOL_NAME
+                    and barrier_active
+                )
+            ]
+            if blocked:
+                if not barrier_counted and not publishes_plan:
+                    policy_state.correction_count += 1
+                    barrier_counted = True
+                blocked_error = plan_required_result(decision.reason)
+                fatal = (
+                    RuntimeError(
+                        "PLAN_REQUIRED_NOT_CREATED: model repeated complex business "
+                        "tools without publishing a plan"
+                    )
+                    if policy_state.correction_count >= 2
+                    else None
+                )
+                for tool_call in batch:
+                    if tool_call.name == PLAN_TOOL_NAME:
+                        result = await self._run_tool(
+                            spec,
+                            tool_call,
+                            external_lookup_counts,
+                            workspace_violation_counts,
+                            local_lookup_state,
+                        )
+                        tool_results.append(result)
+                        if (
+                            result[2] is None
+                            and not str(result[0]).lstrip().lower().startswith("error")
+                        ):
+                            policy_state.plan_created = True
+                        continue
+                    tool_results.append((
+                        blocked_error,
+                        {
+                            "name": tool_call.name,
+                            "status": "error",
+                            "detail": "PLAN_REQUIRED",
+                        },
+                        fatal,
+                    ))
+                continue
             if spec.concurrent_tools and len(batch) > 1:
                 batch_results = await asyncio.gather(*(
                     self._run_tool(
@@ -1212,6 +1337,15 @@ class AgentRunner:
                     )
                     tool_results.append(result)
                     batch_results.append(result)
+            for tool_call, (result, _event, tool_error) in zip(batch, batch_results):
+                if tool_call.name == PLAN_TOOL_NAME:
+                    if (
+                        tool_error is None
+                        and not str(result).lstrip().lower().startswith("error")
+                    ):
+                        policy_state.plan_created = True
+                    continue
+                policy_state.business_tool_calls += 1
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
@@ -1235,6 +1369,7 @@ class AgentRunner:
         local_lookup_state: dict[str, Any],
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
+        finance_source = structured_finance_source(tool_call.name, tool_call.arguments)
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,
@@ -1270,7 +1405,35 @@ class AgentRunner:
                 prepared = prepare_call(tool_call.name, tool_call.arguments)
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
+        emit_file_edit_events = (
+            spec.progress_callback is not None
+            and on_progress_accepts_file_edit_events(spec.progress_callback)
+        )
+        progress_callback = spec.progress_callback if emit_file_edit_events else None
+        file_edit_trackers = (
+            prepare_file_edit_trackers(
+                call_id=tool_call.id,
+                tool_name=tool_call.name,
+                tool=tool,
+                workspace=spec.workspace,
+                params=params if isinstance(params, dict) else None,
+            )
+            if progress_callback is not None
+            else None
+        )
         if prep_error:
+            # A streaming provider may already have emitted a speculative
+            # file-edit start while the tool arguments were arriving. Close
+            # that activity even when schema validation prevents execution;
+            # otherwise its staging artifact survives until timeout.
+            if file_edit_trackers and progress_callback is not None:
+                await invoke_file_edit_progress(
+                    progress_callback,
+                    [
+                        build_file_edit_error_event(file_edit_tracker, prep_error)
+                        for file_edit_tracker in file_edit_trackers
+                    ],
+                )
             event = {
                 "name": tool_call.name,
                 "status": "error",
@@ -1288,22 +1451,6 @@ class AgentRunner:
             return prep_error + hint, event, (
                 RuntimeError(prep_error) if spec.fail_on_tool_error else None
             )
-        emit_file_edit_events = (
-            spec.progress_callback is not None
-            and on_progress_accepts_file_edit_events(spec.progress_callback)
-        )
-        progress_callback = spec.progress_callback if emit_file_edit_events else None
-        file_edit_trackers = (
-            prepare_file_edit_trackers(
-                call_id=tool_call.id,
-                tool_name=tool_call.name,
-                tool=tool,
-                workspace=spec.workspace,
-                params=params if isinstance(params, dict) else None,
-            )
-            if progress_callback is not None
-            else None
-        )
         if file_edit_trackers and progress_callback is not None:
             await invoke_file_edit_progress(
                 progress_callback,
@@ -1351,6 +1498,15 @@ class AgentRunner:
             )
             if handled is not None:
                 return handled
+            if finance_source is not None:
+                mark_structured_finance_source_failed(
+                    external_lookup_counts,
+                    finance_source,
+                )
+                payload = (
+                    f"{payload}\n\n"
+                    f"{structured_finance_fallback_instruction(finance_source)}"
+                )
             if spec.fail_on_tool_error:
                 return payload, event, exc
             return payload, event, None
@@ -1378,9 +1534,37 @@ class AgentRunner:
             )
             if handled is not None:
                 return handled
+            if finance_source is not None:
+                mark_structured_finance_source_failed(
+                    external_lookup_counts,
+                    finance_source,
+                )
+                result = (
+                    f"{result}\n\n"
+                    f"{structured_finance_fallback_instruction(finance_source)}"
+                )
             if spec.fail_on_tool_error:
                 return result + hint, event, RuntimeError(result)
             return result + hint, event, None
+
+        if (
+            finance_source is not None
+            and structured_finance_result_failed(finance_source, result)
+        ):
+            mark_structured_finance_source_failed(
+                external_lookup_counts,
+                finance_source,
+            )
+            instruction = structured_finance_fallback_instruction(finance_source)
+            payload = f"{result}\n\nError: {instruction}"
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": f"{finance_source} structured data source failed; switching source",
+            }
+            if spec.fail_on_tool_error:
+                return payload + hint, event, RuntimeError(instruction)
+            return payload + hint, event, None
 
         if file_edit_trackers and progress_callback is not None:
             await invoke_file_edit_progress(

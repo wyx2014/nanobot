@@ -53,6 +53,19 @@ async def test_runtime_event_bus_keeps_catch_all_subscription() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_event_bus_propagates_required_handler_failure() -> None:
+    bus = RuntimeEventBus()
+
+    async def fail_required(_event: RuntimeModelChanged) -> None:
+        raise RuntimeError("durable write failed")
+
+    bus.subscribe(fail_required, RuntimeModelChanged, required=True)
+
+    with pytest.raises(RuntimeError, match="durable write failed"):
+        await bus.publish(RuntimeModelChanged(model="m", model_preset=None))
+
+
+@pytest.mark.asyncio
 async def test_runtime_event_publisher_builds_context_from_inbound_message() -> None:
     bus = RuntimeEventBus()
     seen: list[object] = []

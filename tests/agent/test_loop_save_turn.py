@@ -379,11 +379,16 @@ def test_save_turn_stamps_latency_on_last_assistant() -> None:
         ],
         skip=0,
         turn_latency_ms=12345,
+        turn_usage={"prompt_tokens": 120, "completion_tokens": 34},
     )
 
     assert session.messages[-1]["role"] == "assistant"
     assert session.messages[-1]["content"] == "final answer"
     assert session.messages[-1]["latency_ms"] == 12345
+    assert session.messages[-1]["usage"] == {
+        "prompt_tokens": 120,
+        "completion_tokens": 34,
+    }
 
 
 def test_restore_runtime_checkpoint_rehydrates_completed_and_pending_tools() -> None:

@@ -155,6 +155,25 @@ def test_gateway_tty_signal_mode_restores_ctrl_c(monkeypatch) -> None:
         os.close(slave_fd)
 
 
+def test_gateway_tty_signal_mode_ignores_non_tty_stdin(monkeypatch) -> None:
+    try:
+        import termios
+    except ImportError:  # pragma: no cover - platform without POSIX termios
+        pytest.skip("termios unavailable")
+
+    class _PipeStdin:
+        def fileno(self) -> int:
+            return 123
+
+    def _unsupported_device(_fd: int):
+        raise termios.error(19, "Operation not supported by device")
+
+    monkeypatch.setattr(cli_commands.sys, "stdin", _PipeStdin())
+    monkeypatch.setattr(termios, "tcgetattr", _unsupported_device)
+
+    cli_commands._ensure_gateway_tty_signal_mode()
+
+
 @pytest.fixture
 def mock_paths():
     """Mock config/workspace paths for test isolation."""

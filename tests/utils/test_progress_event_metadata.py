@@ -108,7 +108,7 @@ def test_structured_file_result_is_forwarded_as_activity_evidence() -> None:
     assert event["files"] == file_result["files"]
 
 
-async def test_explicit_task_progress_suppresses_automatic_plan() -> None:
+async def test_explicit_task_progress_is_forwarded_without_synthetic_plan() -> None:
     captured = []
 
     async def on_progress(content, *, tool_hint=False, tool_events=None):
@@ -127,7 +127,10 @@ async def test_explicit_task_progress_suppresses_automatic_plan() -> None:
                 id="explicit-plan",
                 name="update_task_progress",
                 arguments={
-                    "steps": [{"id": "research", "title": "研究", "status": "running"}],
+                    "steps": [
+                        {"id": "research", "title": "完成行业研究", "status": "running"},
+                        {"id": "report", "title": "交付分析报告", "status": "pending"},
+                    ],
                 },
             ),
             ToolCallRequest(id="search", name="web_search", arguments={"query": "IDC"}),
@@ -141,3 +144,38 @@ async def test_explicit_task_progress_suppresses_automatic_plan() -> None:
     plan_events = [event for event in events if event["name"] == "update_task_progress"]
     assert len(plan_events) == 1
     assert plan_events[0]["call_id"] == "explicit-plan"
+
+
+async def test_runtime_preflight_hidden_calls_are_not_published_as_activity() -> None:
+    captured = []
+
+    async def on_progress(content, *, tool_hint=False, tool_events=None):
+        captured.append((content, tool_hint, tool_events))
+
+    hook = AgentProgressHook(
+        on_progress=on_progress,
+        chat_id="chat-1",
+        message_id="turn-1",
+    )
+    blocked = ToolCallRequest(
+        id="blocked-search",
+        name="web_search",
+        arguments={"query": "market"},
+    )
+    context = AgentHookContext(
+        iteration=0,
+        messages=[],
+        tool_calls=[blocked],
+        hidden_tool_call_ids={blocked.id},
+    )
+
+    await hook.before_execute_tools(context)
+    context.tool_results = ["Error [PLAN_REQUIRED]: create a plan first"]
+    context.tool_events = [{
+        "name": "web_search",
+        "status": "error",
+        "detail": "PLAN_REQUIRED",
+    }]
+    await hook.after_iteration(context)
+
+    assert captured == []

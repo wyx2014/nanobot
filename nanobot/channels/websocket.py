@@ -23,6 +23,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.security.project_context import PROJECT_CONTEXT_METADATA_KEY
 from nanobot.security.workspace_access import (
     WORKSPACE_SCOPE_METADATA_KEY,
     WorkspaceScopeError,
@@ -37,6 +38,7 @@ from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
 from nanobot.webui.expert_teams import (
     EXPERT_TEAM_SESSION_KEY,
     ExpertTeamError,
+    expert_team_mcp_attachments,
     normalize_expert_team_binding,
     public_expert_team_binding,
 )
@@ -51,12 +53,16 @@ from nanobot.webui.http_utils import (
 from nanobot.webui.http_utils import (
     query_first as _query_first,
 )
-from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
 from nanobot.webui.interactive_prompt import (
     INBOUND_META_INTERACTIVE_PROMPT_ANSWER,
     OUTBOUND_META_INTERACTIVE_PROMPT,
     normalize_interactive_prompt,
     normalize_interactive_prompt_answer,
+)
+from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
+from nanobot.webui.session_artifacts import (
+    explicit_artifact_row,
+    registered_artifact_row,
 )
 from nanobot.webui.transcription_ws import webui_transcription_event
 from nanobot.webui.websocket_logging import websockets_server_logger
@@ -351,6 +357,11 @@ class WebSocketChannel(BaseChannel):
         self._workspaces = gateway.workspaces
 
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
+        self._resumable_streams: dict[str, tuple[str, str]] = {}
+        # Expert-team member activity used to exist only as transient socket
+        # frames. Keep a compact run projection so status transitions can also
+        # be appended to the WebUI journal and survive chat switches/reconnects.
+        self._team_runs: dict[tuple[str, str], dict[str, Any]] = {}
 
     # -- Subscription bookkeeping -------------------------------------------
 
@@ -455,6 +466,274 @@ class WebSocketChannel(BaseChannel):
             session.metadata[EXPERT_TEAM_SESSION_KEY] = binding
             self.gateway.session_manager.save(session)
         return binding
+
+    def _start_team_run_projection(
+        self,
+        chat_id: str,
+        *,
+        run_id: str,
+        team_id: str,
+        team_name: str,
+        members: list[dict[str, Any]],
+    ) -> None:
+        staged_members = [member for member in members if member.get("phase")]
+        first_phase = staged_members[0].get("phase") if staged_members else None
+        first_phase_count = (
+            sum(1 for member in staged_members if member.get("phase") == first_phase)
+            if first_phase
+            else len(members)
+        )
+        normalized_members: list[dict[str, Any]] = []
+        for member in members:
+            member_id = str(member.get("id") or "").strip()
+            if not member_id:
+                continue
+            running = first_phase is None or member.get("phase") == first_phase
+            normalized_members.append({
+                "id": member_id,
+                "name": str(member.get("name") or member_id),
+                "framework": str(member.get("framework") or "").strip(),
+                "description": str(member.get("description") or "").strip(),
+                "phase": str(member.get("phase") or "").strip(),
+                "status": "running" if running else "pending",
+                "member_status": "running" if running else "pending",
+                "activity": (
+                    str(member.get("description") or "").strip()
+                    or "团队已启动，正在分配研究任务"
+                ),
+            })
+        self._team_runs[(chat_id, run_id)] = {
+            "team_id": team_id,
+            "team_name": team_name,
+            "members": normalized_members,
+            "revision": 0,
+            "turn_id": self.gateway.state.active_turn_id(f"websocket:{chat_id}"),
+            "stage": "members",
+            "status": "running",
+            "note": (
+                f"{len(normalized_members)} 位专家将分阶段协作，"
+                f"首阶段 {first_phase_count} 位并行研究"
+                if first_phase and first_phase_count < len(normalized_members)
+                else f"{len(normalized_members)} 位专家正在并行研究"
+            ),
+            "completed": False,
+        }
+
+    def _persist_team_run_projection(
+        self,
+        chat_id: str,
+        run_id: str,
+        *,
+        activity: str,
+    ) -> None:
+        run = self._team_runs.get((chat_id, run_id))
+        if run is None:
+            return
+        run["revision"] = int(run.get("revision") or 0) + 1
+        stage = str(run.get("stage") or "members")
+        run_status = str(run.get("status") or "running")
+        completed = stage == "delivered" and run_status == "completed"
+        steps: list[dict[str, Any]] = []
+        for member in run.get("members", []):
+            if not isinstance(member, dict):
+                continue
+            title = str(member.get("name") or member.get("id") or "")
+            framework = str(member.get("framework") or "").strip()
+            if framework:
+                title = f"{title} · {framework}"
+            member_status = str(member.get("member_status") or "")
+            steps.append({
+                "id": str(member.get("id") or ""),
+                "title": title,
+                "detail": str(member.get("activity") or member.get("description") or ""),
+                "status": str(member.get("status") or "pending"),
+                "kind": "member",
+                "stage_key": str(member.get("phase") or "members"),
+                **(
+                    {"warning": str(member.get("activity") or "成员结果已降级")}
+                    if member_status in {"failed", "cancelled"}
+                    else {}
+                ),
+            })
+        terminal_step_status = (
+            "error" if run_status == "failed"
+            else "interrupted" if run_status in {"cancelled", "interrupted"}
+            else None
+        )
+        lead_status = (
+            "completed" if stage in {"audit", "delivered"}
+            else "running" if stage == "synthesis"
+            else terminal_step_status if terminal_step_status is not None
+            else "pending"
+        )
+        audit_status = (
+            "completed" if stage == "delivered"
+            else "running" if stage == "audit"
+            else terminal_step_status if terminal_step_status is not None
+            else "pending"
+        )
+        steps.extend([
+            {
+                "id": "team-lead",
+                "title": "主笔交叉质证与汇总",
+                "detail": (
+                    "已完成成员结论的交叉质证与汇总"
+                    if stage in {"audit", "delivered"}
+                    else "正在交叉质证并汇总各成员结论"
+                    if stage == "synthesis"
+                    else "等待各位专家交付后进行交叉质证"
+                ),
+                "status": lead_status,
+                "kind": "synthesis",
+                "stage_key": "synthesis",
+            },
+            {
+                "id": "report-audit",
+                "title": "报告审校与交付",
+                "detail": (
+                    "最终报告已完成审校并交付"
+                    if completed
+                    else "正在核验关键结论并检查报告产物"
+                    if stage == "audit"
+                    else "等待交叉质证完成后核验关键结论并生成报告"
+                ),
+                "status": audit_status,
+                "kind": "audit",
+                "stage_key": "audit",
+            },
+        ])
+        active_step_ids = [
+            str(step["id"]) for step in steps if step.get("status") == "running"
+        ]
+        current_step_id = active_step_ids[0] if len(active_step_ids) == 1 else None
+        turn_id = str(
+            run.get("turn_id")
+            or self.gateway.state.active_turn_id(f"websocket:{chat_id}")
+            or ""
+        ).strip()
+        if turn_id:
+            run["turn_id"] = turn_id
+        payload = {
+            "event": "message",
+            "chat_id": chat_id,
+            "kind": "progress",
+            "text": activity,
+            "agent_ui": {
+                "kind": "task_progress",
+                "plan_id": f"plan:{turn_id or run_id}",
+                "turn_id": turn_id,
+                "plan_kind": "workflow",
+                "owner": f"expert_team:{run.get('team_id') or ''}",
+                "policy": "required",
+                "execution": "staged",
+                "status": run_status,
+                "revision": int(run["revision"]),
+                "active_step_ids": active_step_ids,
+                "steps": steps,
+                "note": str(run.get("note") or ""),
+                "current_step_id": current_step_id,
+                "stage_key": stage,
+                "team_name": str(run.get("team_name") or "专家团队"),
+                "team_id": str(run.get("team_id") or ""),
+                "team_run_id": run_id,
+            },
+        }
+        if turn_id:
+            payload["turn_id"] = turn_id
+        try:
+            self._transcripts.append(chat_id, payload)
+        except Exception:
+            self.logger.exception(
+                "failed to persist expert-team progress chat_id={} run_id={}",
+                chat_id,
+                run_id,
+            )
+
+    async def _send_turn_plan_snapshot(
+        self,
+        chat_id: str,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
+        """Broadcast the canonical SQLite plan projection for one turn."""
+        resolved_turn_id = (
+            str(turn_id or "").strip()
+            or str(
+                self.gateway.state.active_turn_id(f"websocket:{chat_id}") or ""
+            ).strip()
+        )
+        if not resolved_turn_id:
+            return
+        plan = self.gateway.state.turn_plan_snapshot(
+            session_key=f"websocket:{chat_id}",
+            turn_id=resolved_turn_id,
+        )
+        if plan is None:
+            return
+        status = str(plan.get("status") or "")
+        event = (
+            "turn_plan_terminalized"
+            if status in {"completed", "failed", "interrupted"}
+            else "turn_plan_created"
+            if int(plan.get("revision") or 0) == 1
+            else "turn_plan_updated"
+        )
+        body = {
+            "schema_version": 3,
+            "event": event,
+            "event_id": (
+                f"plan:{plan.get('id')}:revision:{plan.get('revision')}"
+            ),
+            "chat_id": chat_id,
+            "project_id": plan.get("project_id"),
+            "session_id": plan.get("session_id"),
+            "turn_id": resolved_turn_id,
+            "plan": plan,
+        }
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in list(self._subs.get(chat_id, ())):
+            await self._safe_send_to(connection, raw, label=" turn_plan ")
+
+    async def _advance_team_run_from_tool_events(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any],
+        tool_events: Any,
+    ) -> None:
+        run_id = str(metadata.get("expert_team_run_id") or "").strip()
+        run = self._team_runs.get((chat_id, run_id))
+        if run is None or not isinstance(tool_events, list):
+            return
+        successful_names = {
+            str(event.get("name") or "").strip().lower()
+            for event in tool_events
+            if isinstance(event, dict)
+            and str(event.get("status") or "") in {"ok", "completed", "succeeded"}
+        }
+        if not successful_names:
+            return
+        stage = str(run.get("stage") or "members")
+        delivery_activity = any(
+            (
+                name == "write_file"
+                or name.startswith("create_")
+                or name.startswith("render_")
+                or "audit" in name
+            )
+            for name in successful_names
+        )
+        if stage == "synthesis" and delivery_activity:
+            run["stage"] = "audit"
+            run["note"] = "主笔汇总已完成，正在进行报告审校与交付"
+            self._persist_team_run_projection(
+                chat_id,
+                run_id,
+                activity="主笔交叉质证完成，进入报告审校与交付",
+            )
+            await self._send_turn_plan_snapshot(
+                chat_id,
+                turn_id=str(run.get("turn_id") or "") or None,
+            )
 
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
@@ -772,7 +1051,13 @@ class WebSocketChannel(BaseChannel):
             )
             if scope is None:
                 return
-            self._workspaces.persist_scope(new_id, scope)
+            binding = await self._persist_workspace_scope_or_error(
+                connection,
+                new_id,
+                scope,
+            )
+            if binding is None:
+                return
             self._attach(connection, new_id)
             await self._send_event(connection, "attached", chat_id=new_id)
             await self._send_event(
@@ -782,6 +1067,7 @@ class WebSocketChannel(BaseChannel):
                 scope="metadata",
                 workspace_scope=scope.payload(),
                 expert_team=public_expert_team_binding(expert_team),
+                **binding,
             )
             await self._hydrate_after_subscribe(new_id)
             return
@@ -850,13 +1136,16 @@ class WebSocketChannel(BaseChannel):
             )
             if scope is None:
                 return
-            self._workspaces.persist_scope(cid, scope)
+            binding = await self._persist_workspace_scope_or_error(connection, cid, scope)
+            if binding is None:
+                return
             await self._send_event(
                 connection,
                 "session_updated",
                 chat_id=cid,
                 scope="metadata",
                 workspace_scope=scope.payload(),
+                **binding,
             )
             return
         if t == "transcribe_audio":
@@ -935,7 +1224,16 @@ class WebSocketChannel(BaseChannel):
             cli_apps = normalize_cli_app_mentions(envelope.get("cli_apps"))
             if cli_apps:
                 metadata["cli_apps"] = cli_apps
-            mcp_presets = normalize_mcp_preset_mentions(envelope.get("mcp_presets"))
+            requested_mcp_presets = normalize_mcp_preset_mentions(envelope.get("mcp_presets"))
+            team_mcp_presets = (
+                expert_team_mcp_attachments(expert_team)
+                if expert_team is not None and not content.strip().startswith("/")
+                else []
+            )
+            mcp_presets = normalize_mcp_preset_mentions([
+                *requested_mcp_presets,
+                *team_mcp_presets,
+            ])
             if mcp_presets:
                 metadata["mcp_presets"] = mcp_presets
             skill_scope = normalize_skill_scope(envelope.get("skill_scope"))
@@ -949,7 +1247,13 @@ class WebSocketChannel(BaseChannel):
             if interactive_prompt_answer:
                 metadata[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = interactive_prompt_answer
             metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
-            self._workspaces.persist_scope(cid, scope)
+            binding = await self._persist_workspace_scope_or_error(connection, cid, scope)
+            if binding is None:
+                return
+            metadata[PROJECT_CONTEXT_METADATA_KEY] = {
+                **binding,
+                "session_key": f"websocket:{cid}",
+            }
             image_generation = envelope.get("image_generation")
             if isinstance(image_generation, dict) and image_generation.get("enabled") is True:
                 aspect_ratio = image_generation.get("aspect_ratio")
@@ -967,14 +1271,36 @@ class WebSocketChannel(BaseChannel):
                     mcp_presets=mcp_presets or None,
                 )
             if is_team_run:
+                run_id = metadata["expert_team_run_id"]
+                team_id = expert_team["id"]
+                team_name = expert_team["name"]
+                members = expert_team.get("members", [])
+                self._start_team_run_projection(
+                    cid,
+                    run_id=run_id,
+                    team_id=team_id,
+                    team_name=team_name,
+                    members=members,
+                )
                 await self._send_event(
                     connection,
                     "team_run_started",
                     chat_id=cid,
-                    run_id=metadata["expert_team_run_id"],
-                    team_id=expert_team["id"],
-                    team_name=expert_team["name"],
-                    members=expert_team.get("members", []),
+                    run_id=run_id,
+                    team_id=team_id,
+                    team_name=team_name,
+                    members=members,
+                )
+                self._persist_team_run_projection(
+                    cid,
+                    run_id,
+                    activity=f"{team_name}已启动",
+                )
+                await self._send_turn_plan_snapshot(
+                    cid,
+                    turn_id=str(
+                        self._team_runs.get((cid, run_id), {}).get("turn_id") or ""
+                    ) or None,
                 )
             await self._handle_message(
                 sender_id=client_id,
@@ -1006,6 +1332,39 @@ class WebSocketChannel(BaseChannel):
             )
             return None
 
+    async def _persist_workspace_scope_or_error(
+        self,
+        connection: Any,
+        chat_id: str,
+        scope: Any,
+    ) -> dict[str, str] | None:
+        try:
+            return self._workspaces.persist_scope(chat_id, scope)
+        except WorkspaceScopeError as exc:
+            state_session = self.gateway.state.get_session(f"websocket:{chat_id}")
+            await asyncio.to_thread(
+                self.gateway.logs.write,
+                level="warning",
+                component="projects",
+                event_name="project_scope_rejected",
+                message="session project scope change was rejected",
+                project_id=state_session.project_id if state_session else None,
+                session_id=state_session.id if state_session else None,
+                error_code="SESSION_PROJECT_MISMATCH",
+                details={
+                    "chat_id": chat_id,
+                    "reason": exc.message,
+                },
+            )
+            await self._send_event(
+                connection,
+                "error",
+                chat_id=chat_id,
+                detail="workspace_scope_rejected",
+                reason=exc.message,
+            )
+            return None
+
     # -- Outbound WebSocket events -----------------------------------------
 
     async def stop(self) -> None:
@@ -1028,6 +1387,9 @@ class WebSocketChannel(BaseChannel):
         self._conn_chats.clear()
         self._conn_default.clear()
         self._tokens.clear()
+        self._stream_text_buffers.clear()
+        self._resumable_streams.clear()
+        self._team_runs.clear()
 
     async def _safe_send_to(self, connection: Any, raw: str, *, label: str = "") -> None:
         """Send a raw frame to one connection, cleaning up on ConnectionClosed."""
@@ -1052,6 +1414,31 @@ class WebSocketChannel(BaseChannel):
                 model_name=msg.metadata.get("model"),
                 model_preset=msg.metadata.get("model_preset"),
             )
+            return
+        if msg.metadata.get("_turn_lifecycle_started"):
+            turn = msg.metadata.get("turn")
+            if isinstance(turn, dict):
+                await self.send_turn_lifecycle_started(
+                    msg.chat_id,
+                    turn=turn,
+                    snapshot_revision=int(msg.metadata.get("snapshot_revision") or 0),
+                    metadata=msg.metadata,
+                )
+            return
+        if msg.metadata.get("_turn_lifecycle_completed"):
+            turn = msg.metadata.get("turn")
+            if isinstance(turn, dict):
+                await self.send_turn_lifecycle_completed(
+                    msg.chat_id,
+                    turn=turn,
+                    snapshot_revision=int(msg.metadata.get("snapshot_revision") or 0),
+                    metadata=msg.metadata,
+                )
+            return
+        if msg.metadata.get("_thread_runtime_status_changed"):
+            snapshot = msg.metadata.get("runtime_snapshot")
+            if isinstance(snapshot, dict):
+                await self.send_thread_runtime_status_changed(msg.chat_id, snapshot)
             return
         if msg.metadata.get("_team_member_updated"):
             member = msg.metadata.get("team_member")
@@ -1126,6 +1513,17 @@ class WebSocketChannel(BaseChannel):
                 msg.metadata,
             )
             return
+        if msg.metadata.get("_narration_end"):
+            await self.send_narration_end(msg.chat_id, msg.metadata)
+            return
+        if msg.metadata.get("_narration_delta"):
+            await self.send_narration_delta(msg.chat_id, msg.content, msg.metadata)
+            return
+        await self._advance_team_run_from_tool_events(
+            msg.chat_id,
+            msg.metadata,
+            msg.metadata.get("_tool_events"),
+        )
         interactive_prompt = normalize_interactive_prompt(msg.metadata.get(OUTBOUND_META_INTERACTIVE_PROMPT))
         agent_ui = msg.metadata.get(OUTBOUND_META_AGENT_UI)
         has_structured_payload = (
@@ -1194,10 +1592,23 @@ class WebSocketChannel(BaseChannel):
             transcript_overrides={"text": text},
         )
         raw = json.dumps(payload, ensure_ascii=False)
-        if not conns:
-            return
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" ")
+        if (
+            isinstance(agent_ui, dict)
+            and agent_ui.get("kind") == "task_progress"
+        ):
+            await self._send_turn_plan_snapshot(
+                msg.chat_id,
+                turn_id=str(agent_ui.get("turn_id") or "") or None,
+            )
+        await self._register_output_artifacts(
+            msg.chat_id,
+            tool_events=msg.metadata.get("_tool_events"),
+            media_paths=msg.media,
+            metadata=msg.metadata,
+            connections=conns,
+        )
 
     async def send_reasoning_delta(
         self,
@@ -1261,6 +1672,71 @@ class WebSocketChannel(BaseChannel):
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" reasoning_end ")
 
+    async def send_narration_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Commit public pre-tool text to the workbench activity surface.
+
+        Content deltas are provisional until the provider reveals whether tool
+        calls follow. ``replaces_stream_id`` lets rich clients move that exact
+        provisional bubble into Steps without duplicating it in the answer.
+        """
+        if not delta:
+            return
+        conns = list(self._subs.get(chat_id, ()))
+        meta = metadata or {}
+        replacement = self._resumable_streams.get(chat_id)
+        stream_id = replacement[0] if replacement is not None else meta.get("_stream_id")
+        text = self._media.rewrite_local_markdown_images(delta)
+        body: dict[str, Any] = {
+            "event": "narration_delta",
+            "chat_id": chat_id,
+            "text": text,
+        }
+        if stream_id is not None:
+            body["stream_id"] = stream_id
+            body["replaces_stream_id"] = stream_id
+        self._transcripts.prepare_and_append(
+            chat_id,
+            body,
+            metadata=meta,
+            phase="activity",
+            transcript_overrides={"text": delta},
+        )
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" narration ")
+
+    async def send_narration_end(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Close a public narration segment and release its provisional stream."""
+        conns = list(self._subs.get(chat_id, ()))
+        meta = metadata or {}
+        replacement = self._resumable_streams.pop(chat_id, None)
+        stream_id = replacement[0] if replacement is not None else meta.get("_stream_id")
+        body: dict[str, Any] = {
+            "event": "narration_end",
+            "chat_id": chat_id,
+        }
+        if stream_id is not None:
+            body["stream_id"] = stream_id
+            body["replaces_stream_id"] = stream_id
+        self._transcripts.prepare_and_append(
+            chat_id,
+            body,
+            metadata=meta,
+            phase="activity",
+        )
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" narration_end ")
+
     async def send_file_edit_events(
         self,
         chat_id: str,
@@ -1280,10 +1756,319 @@ class WebSocketChannel(BaseChannel):
             phase="activity",
         )
         raw = json.dumps(payload, ensure_ascii=False)
-        if not conns:
-            return
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" file_edit ")
+
+        try:
+            session_key = f"websocket:{chat_id}"
+            scope = self._workspaces.scope_for_session_key(session_key)
+            seen_states: set[tuple[str, str]] = set()
+            turn_id = (
+                str(metadata.get("webui_turn_id"))
+                if isinstance(metadata, dict)
+                and metadata.get("webui_turn_id")
+                else None
+            )
+            for edit in edits:
+                if not isinstance(edit, dict) or edit.get("operation") == "delete":
+                    continue
+                raw_path = edit.get("absolute_path") or edit.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                relation_type = (
+                    "modified"
+                    if edit.get("operation") not in {"create", "write"}
+                    else "generated"
+                )
+                tool_call_id = (
+                    str(edit.get("call_id"))
+                    if edit.get("call_id")
+                    else None
+                )
+                phase = str(edit.get("phase") or "")
+                status = str(edit.get("status") or "")
+                if phase == "start":
+                    record = await asyncio.to_thread(
+                        self.gateway.state.stage_artifact,
+                        session_key,
+                        raw_path,
+                        relation_type=relation_type,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
+                    )
+                elif phase == "end" and status == "done":
+                    artifact = explicit_artifact_row(
+                        raw_path,
+                        scope=scope,
+                        session_key=session_key,
+                    )
+                    if artifact is None:
+                        continue
+                    record = await asyncio.to_thread(
+                        self.gateway.state.register_artifact,
+                        session_key,
+                        scope.project_path / artifact["path"],
+                        relation_type=relation_type,
+                        artifact_kind=str(artifact.get("kind") or "file"),
+                        mime_type=str(
+                            artifact.get("mime_type") or "application/octet-stream"
+                        ),
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
+                    )
+                elif phase in {"end", "error", "cancelled"}:
+                    staged = await asyncio.to_thread(
+                        self.gateway.state.stage_artifact,
+                        session_key,
+                        raw_path,
+                        relation_type=relation_type,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
+                    )
+                    record = await asyncio.to_thread(
+                        self.gateway.state.fail_artifact,
+                        staged.id,
+                        session_key=session_key,
+                        error_code="FILE_EDIT_FAILED",
+                        error_message=str(
+                            edit.get("error")
+                            or edit.get("detail")
+                            or "file edit did not complete"
+                        ),
+                    )
+                else:
+                    continue
+                artifact = registered_artifact_row(record)
+                state_key = (record.id, record.status)
+                if state_key in seen_states:
+                    continue
+                await asyncio.to_thread(
+                    self.gateway.logs.write,
+                    level="info",
+                    component="artifacts",
+                    event_name="artifact_registered",
+                    message="file edit registered as a session artifact",
+                    project_id=record.project_id,
+                    session_id=record.session_id,
+                    artifact_id=record.id,
+                    details={
+                        "chat_id": chat_id,
+                        "relative_path": record.relative_path,
+                        "relation": artifact.get("relation"),
+                        "status": record.status,
+                    },
+                )
+                seen_states.add(state_key)
+                artifact_payload = {
+                    "event": "artifact_created",
+                    "chat_id": chat_id,
+                    "artifact": artifact,
+                }
+                self._transcripts.prepare_and_append(
+                    chat_id,
+                    artifact_payload,
+                    metadata=metadata,
+                    phase="activity",
+                )
+                artifact_raw = json.dumps(artifact_payload, ensure_ascii=False)
+                for connection in conns:
+                    await self._safe_send_to(
+                        connection,
+                        artifact_raw,
+                        label=" artifact_created ",
+                    )
+        except Exception as exc:
+            # Artifact discovery is an optional workbench enhancement. A stale
+            # workspace or filesystem race must not retry/duplicate the already
+            # delivered file_edit frame.
+            self.logger.debug(
+                "artifact_created discovery failed for chat_id={}",
+                chat_id,
+                exc_info=True,
+            )
+            await asyncio.to_thread(
+                self.gateway.logs.write,
+                level="warning",
+                component="artifacts",
+                event_name="artifact_registration_failed",
+                message="file edit could not be registered as an artifact",
+                error_code="ARTIFACT_REGISTRATION_FAILED",
+                details={
+                    "chat_id": chat_id,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+
+    async def _register_output_artifacts(
+        self,
+        chat_id: str,
+        *,
+        tool_events: Any,
+        media_paths: list[str] | None,
+        metadata: dict[str, Any] | None,
+        connections: list[Any],
+    ) -> None:
+        """Register files explicitly returned by tools or assistant media.
+
+        File-edit events cover source files written through filesystem tools,
+        while generators such as ``create_pdf`` return their output in the
+        structured tool event's ``files`` collection. Both are durable session
+        artifacts and must feed the same SQLite-backed artifact index.
+        """
+
+        candidates: dict[str, tuple[str | None, str | None]] = {}
+
+        def add_entries(entries: Any, tool_call_id: str | None) -> None:
+            if not isinstance(entries, list):
+                return
+            for entry in entries:
+                if isinstance(entry, str):
+                    raw_path = entry
+                    mime_type = None
+                elif isinstance(entry, dict):
+                    raw_path = entry.get("path")
+                    mime_type = entry.get("mime_type")
+                else:
+                    continue
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                normalized_mime = (
+                    mime_type.strip()
+                    if isinstance(mime_type, str) and mime_type.strip()
+                    else None
+                )
+                candidates.setdefault(
+                    raw_path.strip(),
+                    (normalized_mime, tool_call_id),
+                )
+
+        if isinstance(tool_events, list):
+            for event in tool_events:
+                if (
+                    not isinstance(event, dict)
+                    or event.get("phase") != "end"
+                    or event.get("error")
+                ):
+                    continue
+                call_id = (
+                    str(event.get("call_id"))
+                    if event.get("call_id")
+                    else None
+                )
+                for key in ("files", "artifacts"):
+                    add_entries(event.get(key), call_id)
+                result = event.get("result")
+                if isinstance(result, str) and result.lstrip().startswith(("{", "[")):
+                    try:
+                        result = json.loads(result)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        result = None
+                if isinstance(result, dict):
+                    for key in ("files", "artifacts"):
+                        add_entries(result.get(key), call_id)
+
+        add_entries(media_paths, None)
+        if not candidates:
+            return
+
+        session_key = f"websocket:{chat_id}"
+        if self.gateway.state.get_session(session_key) is None:
+            return
+        scope = self._workspaces.scope_for_session_key(session_key)
+        turn_id = (
+            str(metadata.get("webui_turn_id"))
+            if isinstance(metadata, dict) and metadata.get("webui_turn_id")
+            else None
+        )
+        existing_ready_ids = {
+            record.id
+            for record in await asyncio.to_thread(
+                self.gateway.state.list_session_artifacts,
+                session_key,
+            )
+            if record.status == "ready"
+        }
+
+        for raw_path, (mime_type, tool_call_id) in candidates.items():
+            try:
+                artifact = explicit_artifact_row(
+                    raw_path,
+                    scope=scope,
+                    session_key=session_key,
+                )
+                if artifact is None:
+                    continue
+                record = await asyncio.to_thread(
+                    self.gateway.state.register_artifact,
+                    session_key,
+                    scope.project_path / artifact["path"],
+                    relation_type="generated",
+                    artifact_kind=str(artifact.get("kind") or "file"),
+                    mime_type=mime_type or str(
+                        artifact.get("mime_type") or "application/octet-stream"
+                    ),
+                    turn_id=turn_id,
+                    tool_call_id=tool_call_id,
+                )
+                if record.id in existing_ready_ids:
+                    continue
+                existing_ready_ids.add(record.id)
+                registered = registered_artifact_row(record)
+                await asyncio.to_thread(
+                    self.gateway.logs.write,
+                    level="info",
+                    component="artifacts",
+                    event_name="artifact_registered",
+                    message="tool output registered as a session artifact",
+                    project_id=record.project_id,
+                    session_id=record.session_id,
+                    artifact_id=record.id,
+                    details={
+                        "chat_id": chat_id,
+                        "relative_path": record.relative_path,
+                        "relation": registered.get("relation"),
+                        "status": record.status,
+                        "tool_call_id": tool_call_id,
+                    },
+                )
+                artifact_payload = {
+                    "event": "artifact_created",
+                    "chat_id": chat_id,
+                    "artifact": registered,
+                }
+                self._transcripts.prepare_and_append(
+                    chat_id,
+                    artifact_payload,
+                    metadata=metadata,
+                    phase="activity",
+                )
+                artifact_raw = json.dumps(artifact_payload, ensure_ascii=False)
+                for connection in connections:
+                    await self._safe_send_to(
+                        connection,
+                        artifact_raw,
+                        label=" artifact_created ",
+                    )
+            except Exception as exc:
+                self.logger.debug(
+                    "tool output artifact registration failed chat_id={} file={}",
+                    chat_id,
+                    Path(raw_path).name,
+                    exc_info=True,
+                )
+                await asyncio.to_thread(
+                    self.gateway.logs.write,
+                    level="warning",
+                    component="artifacts",
+                    event_name="artifact_registration_failed",
+                    message="tool output could not be registered as an artifact",
+                    error_code="ARTIFACT_REGISTRATION_FAILED",
+                    details={
+                        "chat_id": chat_id,
+                        "file_name": Path(raw_path).name,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
 
     async def send_delta(
         self,
@@ -1300,6 +2085,16 @@ class WebSocketChannel(BaseChannel):
             if delta:
                 buffered.append(delta)
             full_text = "".join(buffered)
+            resuming = meta.get("_resuming") is True
+            stream_kind = meta.get("_stream_kind")
+            if stream_kind not in {"answer", "narration"}:
+                stream_kind = "answer"
+            body["resuming"] = resuming
+            body["stream_kind"] = stream_kind
+            if resuming and stream_kind == "narration" and full_text:
+                self._resumable_streams[chat_id] = (stream_key[1], full_text)
+            elif not resuming:
+                self._resumable_streams.pop(chat_id, None)
             rewritten = self._media.rewrite_local_markdown_images(full_text)
             if delta or rewritten != full_text:
                 body["text"] = rewritten
@@ -1335,8 +2130,21 @@ class WebSocketChannel(BaseChannel):
         """Signal that the agent has fully finished processing the current turn."""
         conns = list(self._subs.get(chat_id, ()))
         body: dict[str, Any] = {"event": "turn_end", "chat_id": chat_id}
+        stop_reason = str((metadata or {}).get("_stop_reason") or "")
+        body["finish_reason"] = (
+            "cancelled" if stop_reason == "cancelled"
+            else "error" if stop_reason in {"error", "tool_error"}
+            else "completed"
+        )
         if latency_ms is not None:
             body["latency_ms"] = int(latency_ms)
+        usage = (metadata or {}).get("usage")
+        if isinstance(usage, dict):
+            body["usage"] = {
+                str(key): int(value)
+                for key, value in usage.items()
+                if isinstance(value, int | float)
+            }
         if goal_state is not None:
             body["goal_state"] = goal_state
         self._transcripts.prepare_and_append(
@@ -1350,6 +2158,118 @@ class WebSocketChannel(BaseChannel):
             return
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" turn_end ")
+
+    async def send_turn_lifecycle_started(
+        self,
+        chat_id: str,
+        *,
+        turn: dict[str, Any],
+        snapshot_revision: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        body = {
+            "event": "turn_started",
+            "chat_id": chat_id,
+            "snapshot_revision": snapshot_revision,
+            "turn": turn,
+        }
+        if not (metadata or {}).get("_turn_lifecycle_persisted"):
+            self._transcripts.prepare_and_append(
+                chat_id,
+                body,
+                metadata=metadata,
+                phase="activity",
+            )
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in list(self._subs.get(chat_id, ())):
+            await self._safe_send_to(connection, raw, label=" turn_started ")
+
+    async def send_turn_lifecycle_completed(
+        self,
+        chat_id: str,
+        *,
+        turn: dict[str, Any],
+        snapshot_revision: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        team = (metadata or {}).get(EXPERT_TEAM_SESSION_KEY)
+        run_id = (metadata or {}).get("expert_team_run_id")
+        if isinstance(team, dict) and isinstance(run_id, str):
+            terminal_status = {
+                "completed": "completed",
+                "interrupted": "cancelled",
+                "failed": "failed",
+            }.get(str(turn.get("status") or ""), "failed")
+            await self.send_team_run_completed(
+                chat_id,
+                run_id=run_id,
+                team_id=str(team.get("id") or ""),
+                status=terminal_status,
+            )
+        enriched_turn = dict(turn)
+        plan = self.gateway.state.turn_plan_snapshot(
+            session_key=f"websocket:{chat_id}",
+            turn_id=str(turn.get("id") or ""),
+        )
+        if plan is not None:
+            enriched_turn["plan"] = plan
+            await self._send_turn_plan_snapshot(
+                chat_id,
+                turn_id=str(turn.get("id") or "") or None,
+            )
+        body = {
+            "event": "turn_completed",
+            "chat_id": chat_id,
+            "snapshot_revision": snapshot_revision,
+            "turn": enriched_turn,
+        }
+        turn_id = str(turn.get("id") or "").strip()
+        runtime_epoch = str(turn.get("runtime_epoch") or "").strip()
+        transcript_overrides = None
+        if turn_id and runtime_epoch:
+            transcript_overrides = {
+                "event_id": f"terminal_{runtime_epoch}_{turn_id}",
+            }
+        if not (metadata or {}).get("_turn_lifecycle_persisted"):
+            self._transcripts.prepare_and_append(
+                chat_id,
+                body,
+                metadata=metadata,
+                phase="complete",
+                transcript_overrides=transcript_overrides,
+            )
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in list(self._subs.get(chat_id, ())):
+            await self._safe_send_to(connection, raw, label=" turn_completed ")
+
+    async def send_thread_runtime_status_changed(
+        self,
+        chat_id: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        active_turn = snapshot.get("active_turn")
+        latest_turn = snapshot.get("latest_turn")
+        for turn in (active_turn, latest_turn):
+            if not isinstance(turn, dict) or not turn.get("id"):
+                continue
+            plan = self.gateway.state.turn_plan_snapshot(
+                session_key=f"websocket:{chat_id}",
+                turn_id=str(turn["id"]),
+            )
+            if plan is not None:
+                turn["plan"] = plan
+        body = {
+            "event": "thread_status_changed",
+            "chat_id": chat_id,
+            "snapshot_revision": int(snapshot.get("snapshot_revision") or 0),
+            "runtime_epoch": snapshot.get("runtime_epoch"),
+            "thread_status": snapshot.get("thread_status") or {"type": "notLoaded"},
+            "active_turn": active_turn,
+            "latest_turn": latest_turn,
+        }
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in list(self._subs.get(chat_id, ())):
+            await self._safe_send_to(connection, raw, label=" thread_status_changed ")
 
     async def send_goal_state(self, chat_id: str, blob: dict[str, Any]) -> None:
         """Push persisted goal-state snapshot for *chat_id* (multi-chat isolation)."""
@@ -1391,6 +2311,10 @@ class WebSocketChannel(BaseChannel):
         body: dict[str, Any] = {"event": "session_updated", "chat_id": chat_id}
         if scope:
             body["scope"] = scope
+        state_session = self.gateway.state.get_session(f"websocket:{chat_id}")
+        if state_session is not None:
+            body["session_id"] = state_session.id
+            body["project_id"] = state_session.project_id
         expert_team = self._session_expert_team(chat_id)
         if expert_team is not None:
             body["expert_team"] = expert_team
@@ -1398,28 +2322,155 @@ class WebSocketChannel(BaseChannel):
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" session_updated ")
 
-    async def send_team_run_completed(self, chat_id: str, *, run_id: str, team_id: str) -> None:
-        conns = list(self._subs.get(chat_id, ()))
-        if not conns:
+    async def send_team_run_completed(
+        self,
+        chat_id: str,
+        *,
+        run_id: str,
+        team_id: str,
+        status: str = "completed",
+    ) -> None:
+        run = self._team_runs.get((chat_id, run_id))
+        if run is None:
             return
-        raw = json.dumps({
-            "event": "team_run_completed",
-            "chat_id": chat_id,
-            "run_id": run_id,
-            "team_id": team_id,
-            "status": "completed",
-        }, ensure_ascii=False)
-        for connection in conns:
-            await self._safe_send_to(connection, raw, label=" team_run_completed ")
+        public_status = (
+            status
+            if status in {"completed", "completed_with_warnings", "failed", "cancelled"}
+            else "failed"
+        )
+        run["completed"] = public_status in {"completed", "completed_with_warnings"}
+        run["status"] = (
+            "completed"
+            if run["completed"]
+            else "cancelled"
+            if public_status == "cancelled"
+            else "failed"
+        )
+        run["stage"] = "delivered" if run["completed"] else str(
+            run.get("stage") or "members"
+        )
+        run["note"] = (
+            "研究与报告已完成"
+            if public_status == "completed"
+            else "研究与报告已完成，部分维度采用降级结果"
+            if public_status == "completed_with_warnings"
+            else "专家团队已由用户停止"
+            if public_status == "cancelled"
+            else "专家团队执行失败"
+        )
+        for member in run.get("members", []):
+            if not isinstance(member, dict):
+                continue
+            if run["completed"]:
+                member["status"] = "completed"
+                if member.get("member_status") not in {"failed", "cancelled"}:
+                    member["member_status"] = "completed"
+            elif member.get("status") in {"running", "pending"}:
+                member["status"] = (
+                    "interrupted" if public_status == "cancelled" else "error"
+                )
+            if not str(member.get("activity") or "").strip():
+                member["activity"] = (
+                    "研究任务已完成"
+                    if run["completed"]
+                    else "团队运行已停止"
+                )
+        turn_id = str(run.get("turn_id") or "").strip()
+        if turn_id:
+            persisted_plan = self.gateway.state.turn_plan_snapshot(
+                session_key=f"websocket:{chat_id}",
+                turn_id=turn_id,
+            )
+            if persisted_plan is not None:
+                run["revision"] = max(
+                    int(run.get("revision") or 0),
+                    int(persisted_plan.get("revision") or 0),
+                )
+        self._persist_team_run_projection(
+            chat_id,
+            run_id,
+            activity=(
+                f"{run.get('team_name') or '专家团队'}已完成"
+                if run["completed"]
+                else f"{run.get('team_name') or '专家团队'}已停止"
+            ),
+        )
+        await self._send_turn_plan_snapshot(
+            chat_id,
+            turn_id=str(run.get("turn_id") or "") or None,
+        )
+        conns = list(self._subs.get(chat_id, ()))
+        if conns:
+            raw = json.dumps({
+                "event": "team_run_completed",
+                "chat_id": chat_id,
+                "run_id": run_id,
+                "team_id": team_id,
+                "status": public_status,
+            }, ensure_ascii=False)
+            for connection in conns:
+                await self._safe_send_to(connection, raw, label=" team_run_completed ")
+        self._team_runs.pop((chat_id, run_id), None)
 
     async def send_team_member_updated(self, chat_id: str, member: dict[str, Any]) -> None:
+        run_id = str(member.get("run_id") or "")
+        run = self._team_runs.get((chat_id, run_id))
+        persist_transition = False
+        if run is not None:
+            member_id = str(member.get("id") or "")
+            projected_member = next(
+                (
+                    item
+                    for item in run.get("members", [])
+                    if isinstance(item, dict) and item.get("id") == member_id
+                ),
+                None,
+            )
+            if projected_member is not None:
+                incoming_status = str(member.get("status") or "running")
+                previous_status = str(projected_member.get("member_status") or "")
+                projected_member["member_status"] = incoming_status
+                projected_member["status"] = (
+                    "running" if incoming_status == "running" else "completed"
+                )
+                activity = str(member.get("activity") or "").strip()
+                if activity:
+                    projected_member["activity"] = activity
+                persist_transition = incoming_status != previous_status
+            all_members_terminal = bool(run.get("members")) and all(
+                isinstance(item, dict)
+                and str(item.get("member_status") or "")
+                in {"completed", "failed", "cancelled"}
+                for item in run.get("members", [])
+            )
+            if (
+                all_members_terminal
+                and str(run.get("stage") or "members") == "members"
+            ):
+                run["stage"] = "synthesis"
+                run["note"] = "专家研究已全部交付，主笔正在交叉质证与汇总"
+                persist_transition = True
+        if persist_transition:
+            self._persist_team_run_projection(
+                chat_id,
+                run_id,
+                activity=(
+                    str(member.get("activity") or "").strip()
+                    or f"{member.get('name') or member.get('id') or '专家'}状态已更新"
+                ),
+            )
+            if run is not None:
+                await self._send_turn_plan_snapshot(
+                    chat_id,
+                    turn_id=str(run.get("turn_id") or "") or None,
+                )
         conns = list(self._subs.get(chat_id, ()))
         if not conns:
             return
         raw = json.dumps({
             "event": "team_member_updated",
             "chat_id": chat_id,
-            "run_id": member.get("run_id"),
+            "run_id": run_id,
             "team_id": member.get("team_id"),
             "member": {
                 "id": member.get("id"),

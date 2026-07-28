@@ -219,6 +219,19 @@ class TestBundledToolContract:
         assert "## General Tool Contract" in prompt
         assert "Do not use `exec` as a universal workaround" in prompt
 
+    def test_websocket_identity_requests_public_pre_tool_narration(self, tmp_path):
+        builder = _builder(tmp_path)
+        prompt = builder.build_system_prompt(channel="websocket")
+
+        assert "make `update_task_progress` the first tool call in the first batch" in prompt
+        assert "user goals or deliverables" in prompt
+        assert "preserving the exact step ids, titles, and order" in prompt
+        assert "Every non-terminal snapshot must have exactly one `running` step" in prompt
+        assert "every step is terminal" in prompt
+        assert "one short public action sentence" in prompt
+        assert "never private reasoning or hidden chain-of-thought" in prompt
+        assert "Keep the final answer separate" in prompt
+
 
 # ---------------------------------------------------------------------------
 # _build_user_content
@@ -310,6 +323,65 @@ class TestBuildSystemPrompt:
         assert "## AGENTS.md" not in result
         assert "[Archived Context Summary]" not in result
 
+    def test_runtime_memory_is_not_injected_into_another_project(self, tmp_path):
+        builder = _builder(tmp_path)
+        builder.memory.write_memory("Inbox-only customer secret")
+        builder.memory.append_history(
+            "Prior Inbox-only discussion",
+            session_key="websocket:inbox",
+        )
+        project = tmp_path / "customer-a"
+        project.mkdir()
+
+        result = builder.build_system_prompt(
+            workspace=project,
+            session_key="websocket:project-a",
+        )
+
+        assert "Inbox-only customer secret" not in result
+        assert "Prior Inbox-only discussion" not in result
+
+    def test_project_memory_is_managed_and_isolated_by_project_id(self, tmp_path):
+        builder = _builder(tmp_path)
+        from nanobot.storage.state import StateStore
+
+        state = StateStore(
+            tmp_path / ".nanobot" / "state.sqlite",
+            default_workspace=tmp_path,
+        )
+        project_a = tmp_path / "customer-a"
+        project_b = tmp_path / "customer-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        project_a_id = state.ensure_project(project_a).id
+        project_b_id = state.ensure_project(project_b).id
+        memory_a = builder.memory_for_project(project_a_id, project_a)
+        memory_b = builder.memory_for_project(project_b_id, project_b)
+        assert memory_a is not None
+        assert memory_b is not None
+        memory_a.write_memory("Customer A private decision")
+        memory_b.write_memory("Customer B private decision")
+
+        prompt_a = builder.build_system_prompt(
+            workspace=project_a,
+            project_id=project_a_id,
+        )
+        prompt_b = builder.build_system_prompt(
+            workspace=project_b,
+            project_id=project_b_id,
+        )
+
+        assert "Customer A private decision" in prompt_a
+        assert "Customer B private decision" not in prompt_a
+        assert "Customer B private decision" in prompt_b
+        assert "Customer A private decision" not in prompt_b
+        assert str(memory_a.workspace).startswith(
+            str(tmp_path / ".nanobot" / "project-memory" / project_a_id)
+        )
+        assert state.list_project_memories(project_a_id)[0]["content"] == (
+            "Customer A private decision"
+        )
+
 
 # ---------------------------------------------------------------------------
 # build_messages
@@ -331,6 +403,48 @@ class TestBuildMessages:
         user_msg = str(messages[-1]["content"])
         assert "[Runtime Context" in user_msg
         assert "hello" in user_msg
+
+    def test_relevant_project_memory_is_progressively_loaded_with_provenance(self, tmp_path):
+        from nanobot.storage.state import StateStore
+
+        builder = _builder(tmp_path)
+        project = tmp_path / "customer-a"
+        other = tmp_path / "customer-b"
+        project.mkdir()
+        other.mkdir()
+        state = StateStore(
+            tmp_path / ".nanobot" / "state.sqlite",
+            default_workspace=tmp_path,
+        )
+        project_id = state.ensure_project(project).id
+        other_id = state.ensure_project(other).id
+        state.upsert_project_memory(
+            project_id,
+            kind="workflow",
+            title="Release verification",
+            content="Run the release smoke test before packaging.",
+            memory_key="release",
+        )
+        state.upsert_project_memory(
+            other_id,
+            kind="workflow",
+            title="Release verification",
+            content="Customer B private release process.",
+            memory_key="release",
+        )
+
+        messages = builder.build_messages(
+            [],
+            "Please run the release verification",
+            workspace=project,
+            session_metadata={"project_id": project_id},
+        )
+        system = str(messages[0]["content"])
+
+        assert "# Relevant Project Memory" in system
+        assert "[memory:mem_" in system
+        assert "Run the release smoke test before packaging." in system
+        assert "Customer B private release process." not in system
 
     def test_skill_scope_filters_workspace_skills_in_system_prompt(self, tmp_path):
         ws_skills = tmp_path / "skills"

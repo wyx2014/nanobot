@@ -70,12 +70,41 @@ class RuntimeModelChanged:
     model_preset: str | None
 
 
+@dataclass(frozen=True)
+class TurnLifecycleStarted:
+    """Authoritative ActiveTurn resource was created."""
+
+    context: RuntimeEventContext
+    turn: dict[str, Any]
+    snapshot_revision: int
+
+
+@dataclass(frozen=True)
+class TurnLifecycleCompleted:
+    """Authoritative ActiveTurn reached one immutable terminal status."""
+
+    context: RuntimeEventContext
+    turn: dict[str, Any]
+    snapshot_revision: int
+
+
+@dataclass(frozen=True)
+class ThreadRuntimeStatusChanged:
+    """A complete, revisioned Thread runtime snapshot changed."""
+
+    session_key: str
+    snapshot: dict[str, Any]
+
+
 RuntimeEvent = (
     SessionTurnStarted
     | TurnRunStatusChanged
     | TurnCompleted
     | GoalStateChanged
     | RuntimeModelChanged
+    | TurnLifecycleStarted
+    | TurnLifecycleCompleted
+    | ThreadRuntimeStatusChanged
 )
 RuntimeEventType = (
     type[SessionTurnStarted]
@@ -83,9 +112,12 @@ RuntimeEventType = (
     | type[TurnCompleted]
     | type[GoalStateChanged]
     | type[RuntimeModelChanged]
+    | type[TurnLifecycleStarted]
+    | type[TurnLifecycleCompleted]
+    | type[ThreadRuntimeStatusChanged]
 )
 RuntimeEventHandler = Callable[[Any], Awaitable[None] | None]
-_HandlerEntry = tuple[RuntimeEventType | None, RuntimeEventHandler]
+_HandlerEntry = tuple[RuntimeEventType | None, RuntimeEventHandler, bool]
 
 
 class RuntimeEventBus:
@@ -103,8 +135,17 @@ class RuntimeEventBus:
         self,
         handler: RuntimeEventHandler,
         event_type: RuntimeEventType | None = None,
+        *,
+        required: bool = False,
     ) -> Callable[[], None]:
-        entry = (event_type, handler)
+        """Register an event handler.
+
+        A required handler participates in the publisher's commit boundary:
+        its failure is re-raised after logging.  This is intentionally reserved
+        for durable lifecycle writes; ordinary UI/telemetry subscribers remain
+        best-effort and cannot break the agent loop.
+        """
+        entry = (event_type, handler, required)
         self._handlers.append(entry)
 
         def _unsubscribe() -> None:
@@ -114,7 +155,7 @@ class RuntimeEventBus:
         return _unsubscribe
 
     async def publish(self, event: RuntimeEvent) -> None:
-        for event_type, handler in list(self._handlers):
+        for event_type, handler, required in list(self._handlers):
             if event_type is not None and not isinstance(event, event_type):
                 continue
             try:
@@ -123,6 +164,8 @@ class RuntimeEventBus:
                     await result
             except Exception:
                 logger.exception("runtime event handler failed for {}", type(event).__name__)
+                if required:
+                    raise
 
     def publish_nowait(self, event: RuntimeEvent) -> None:
         try:

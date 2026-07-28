@@ -381,6 +381,55 @@ async def test_expert_team_member_retries_once_before_degrading(tmp_path):
     assert mgr._announce_result.await_args.args[5] == "ok"
 
 
+@pytest.mark.asyncio
+async def test_expert_team_member_timeout_degrades_without_retry(tmp_path):
+    from nanobot.agent.subagent import SubagentManager, SubagentStatus
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    mgr._announce_result = AsyncMock()
+
+    async def never_finishes(_spec):
+        await asyncio.sleep(1)
+
+    mgr.runner.run = AsyncMock(side_effect=never_finishes)
+    status = SubagentStatus(
+        task_id="team-timeout",
+        label="financial-analyst",
+        task_description="research financials",
+        started_at=time.monotonic(),
+    )
+
+    with patch("nanobot.agent.subagent._EXPERT_TEAM_MEMBER_TIMEOUT_S", 0.01):
+        await mgr._run_subagent(
+            "team-timeout",
+            "research financials",
+            "financial-analyst",
+            {
+                "channel": "websocket",
+                "chat_id": "c1",
+                "session_key": "websocket:c1",
+            },
+            status,
+            expert_team={"id": "asset-research-team", "members": []},
+            expert_team_run_id="run-1",
+        )
+
+    assert mgr.runner.run.await_count == 1
+    assert status.phase == "error"
+    assert status.stop_reason == "timeout"
+    assert mgr._announce_result.await_args.args[5] == "error"
+    assert "Juyuan MCP" in mgr._announce_result.await_args.args[3]
+
+
 def test_expert_team_report_quality_rejects_max_iteration_placeholder():
     from nanobot.agent.subagent import SubagentManager
 

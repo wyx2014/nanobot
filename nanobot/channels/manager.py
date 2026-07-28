@@ -65,6 +65,8 @@ class ChannelManager:
         webui_static_dist: bool = True,
         webui_runtime_surface: str = "browser",
         webui_runtime_capabilities: dict[str, Any] | None = None,
+        webui_project_memory_pipeline: Any | None = None,
+        webui_thread_runtime_registry: Any | None = None,
     ):
         self.config = config
         self.bus = bus
@@ -77,6 +79,8 @@ class ChannelManager:
         self._webui_static_dist = webui_static_dist
         self._webui_runtime_surface = webui_runtime_surface
         self._webui_runtime_capabilities = dict(webui_runtime_capabilities or {})
+        self._webui_project_memory_pipeline = webui_project_memory_pipeline
+        self._webui_thread_runtime_registry = webui_thread_runtime_registry
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
@@ -136,6 +140,8 @@ class ChannelManager:
                         runtime_capabilities_overrides=self._webui_runtime_capabilities,
                         cron_service=self._cron_service,
                         cron_pending_job_ids=self._webui_cron_pending_job_ids,
+                        project_memory_pipeline=self._webui_project_memory_pipeline,
+                        thread_runtime_registry=self._webui_thread_runtime_registry,
                         logger=logger,
                     )
                     kwargs["gateway"] = gateway
@@ -329,6 +335,15 @@ class ChannelManager:
                         await self._send_with_retry(channel, msg)
                     continue
 
+                if (
+                    msg.metadata.get("_narration_delta")
+                    or msg.metadata.get("_narration_end")
+                ):
+                    channel = self.channels.get(msg.channel)
+                    if channel is not None:
+                        await self._send_with_retry(channel, msg)
+                    continue
+
                 if msg.metadata.get("_progress"):
                     is_tool_hint = bool(msg.metadata.get("_tool_hint"))
                     has_websocket_tool_events = (
@@ -401,7 +416,11 @@ class ChannelManager:
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
-        if msg.metadata.get("_reasoning_end"):
+        if msg.metadata.get("_narration_end"):
+            await channel.send_narration_end(msg.chat_id, msg.metadata)
+        elif msg.metadata.get("_narration_delta"):
+            await channel.send_narration_delta(msg.chat_id, msg.content, msg.metadata)
+        elif msg.metadata.get("_reasoning_end"):
             await channel.send_reasoning_end(msg.chat_id, msg.metadata)
         elif msg.metadata.get("_reasoning_delta"):
             await channel.send_reasoning_delta(msg.chat_id, msg.content, msg.metadata)

@@ -435,6 +435,10 @@ class SessionManager:
         """Get the file path for a session."""
         return self.sessions_dir / f"{self.safe_key(key)}.jsonl"
 
+    def session_path(self, key: str) -> Path:
+        """Return the durable JSONL path for a session key."""
+        return self._get_session_path(key)
+
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
         return self.legacy_sessions_dir / f"{self.safe_key(key)}.jsonl"

@@ -46,6 +46,10 @@ data_sources:
     required: true
     assignments:
       business-analyst: 公司摘要与主营构成
+mcp_presets:
+  - name: juyuan
+    display_name: 聚源金融数据 MCP
+    description: configured source
 members:
   - { id: business-analyst, name: 商业分析师, phase: research, phase_label: 第一阶段, playbook: playbooks/business-analyst.md }
 workflows:
@@ -58,6 +62,7 @@ workflows:
 def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> None:
     _write_team(tmp_path)
     monkeypatch.setenv("NANOBOT_EXPERT_TEAMS_DIR", str(tmp_path))
+    monkeypatch.setattr(expert_teams, "_configured_mcp_names", lambda: {"juyuan"})
     expert_teams._load_team.cache_clear()
 
     payload = expert_teams.expert_teams_payload()
@@ -76,6 +81,20 @@ def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> 
         "instructions": "member playbook instructions",
     }]
     assert binding["data_sources"][0]["skill"] == "ifind-finance-data"
+    assert binding["mcp_presets"] == [{
+        "name": "juyuan",
+        "display_name": "聚源金融数据 MCP",
+        "required": False,
+        "configured": True,
+        "description": "configured source",
+    }]
+    assert expert_teams.expert_team_mcp_attachments(binding) == [{
+        "name": "juyuan",
+        "display_name": "聚源金融数据 MCP",
+        "transport": "mcp",
+        "configured": True,
+        "source": "expert_team",
+    }]
     assert binding["completion"] == {
         "required_tools": ["write_file", "create_docx", "create_pdf"],
         "required_artifacts": ["html", "docx", "pdf"],
@@ -83,6 +102,7 @@ def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> 
     }
     detail = expert_teams.expert_team_detail_payload("asset-research-team")
     assert detail["data_sources"][0]["priority"] == "primary"
+    assert detail["mcp_presets"][0]["configured"] is True
 
     prompt = expert_teams.expert_team_system_prompt({"expert_team": binding})
     assert "adapter instructions" in prompt

@@ -11,6 +11,7 @@ from websockets.http11 import Response
 
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronRunRecord, CronSchedule
+from nanobot.storage.state import StateStore
 
 QueryParams = dict[str, list[str]]
 
@@ -147,6 +148,7 @@ class WebUIScheduleRouter:
         json_response: Callable[[dict[str, Any]], Response],
         error_response: Callable[[int, str | None], Response],
         logger: Any,
+        state_store: StateStore | None = None,
     ) -> None:
         self.cron = cron_service
         self._check_api_token = check_api_token
@@ -154,6 +156,7 @@ class WebUIScheduleRouter:
         self._json_response = json_response
         self._error_response = error_response
         self.logger = logger
+        self.state = state_store
 
     async def dispatch(self, request: WsRequest, path: str) -> Response | None:
         if not path.startswith("/api/schedule/"):
@@ -164,6 +167,7 @@ class WebUIScheduleRouter:
             return self._error_response(503, "cron service unavailable")
 
         if path == "/api/schedule/tasks":
+            self._sync_state()
             return self._json_response(_payload(self.cron))
         if path == "/api/schedule/tasks/create":
             return self._create(request)
@@ -195,6 +199,21 @@ class WebUIScheduleRouter:
             }
         }
 
+    def _project_id(self, query: QueryParams) -> str | None:
+        workspace_path = _first(query, "workspace_path").strip()
+        if self.state is None:
+            return None
+        return self.state.ensure_project(
+            workspace_path or self.state.default_workspace
+        ).id
+
+    def _sync_state(self) -> None:
+        if self.state is None or self.cron is None:
+            return
+        self.state.sync_project_schedules(
+            self.cron.list_jobs(include_disabled=True)
+        )
+
     def _create(self, request: WsRequest) -> Response:
         query = self._query(request)
         name = _first(query, "name").strip()
@@ -212,11 +231,13 @@ class WebUIScheduleRouter:
                 channel="websocket",
                 to="direct",
                 origin_metadata=self._meta(query, meta_schedule),
+                project_id=self._project_id(query),
             )
             if not enabled:
                 self.cron.enable_job(job.id, False)
         except ValueError as exc:
             return self._error_response(400, str(exc))
+        self._sync_state()
         return self._json_response(_payload(self.cron))
 
     def _update(self, request: WsRequest) -> Response:
@@ -237,6 +258,7 @@ class WebUIScheduleRouter:
                 schedule=schedule,
                 message=_message(prompt, skill_name),
                 origin_metadata=self._meta(query, meta_schedule),
+                project_id=self._project_id(query),
             )
         except ValueError as exc:
             return self._error_response(400, str(exc))
@@ -245,6 +267,7 @@ class WebUIScheduleRouter:
         if result == "protected":
             return self._error_response(403, "system task cannot be updated")
         self.cron.enable_job(job_id, enabled)
+        self._sync_state()
         return self._json_response(_payload(self.cron))
 
     def _delete(self, request: WsRequest) -> Response:
@@ -256,6 +279,7 @@ class WebUIScheduleRouter:
             return self._error_response(404, "task not found")
         if result == "protected":
             return self._error_response(403, "system task cannot be removed")
+        self._sync_state()
         return self._json_response(_payload(self.cron))
 
     def _enable(self, request: WsRequest, enabled: bool) -> Response:
@@ -265,6 +289,7 @@ class WebUIScheduleRouter:
         job = self.cron.enable_job(job_id, enabled)
         if job is None:
             return self._error_response(404, "task not found")
+        self._sync_state()
         return self._json_response(_payload(self.cron))
 
     async def _run(self, request: WsRequest) -> Response:
@@ -284,6 +309,7 @@ class WebUIScheduleRouter:
 
         task.add_done_callback(_log_failure)
         await asyncio.sleep(0)
+        self._sync_state()
         return self._json_response(_payload(self.cron))
 
     def _mark_run_viewed(self, request: WsRequest) -> Response:

@@ -19,7 +19,10 @@ from nanobot.bus.runtime_events import (
     RuntimeEventContext,
     RuntimeModelChanged,
     SessionTurnStarted,
+    ThreadRuntimeStatusChanged,
     TurnCompleted,
+    TurnLifecycleCompleted,
+    TurnLifecycleStarted,
     TurnRunStatusChanged,
 )
 from nanobot.cron.session_turns import CRON_HISTORY_META
@@ -236,6 +239,7 @@ class WebuiTurnCoordinator:
     bus: MessageBus
     sessions: SessionManager
     schedule_background: Callable[[Awaitable[None]], None]
+    transcripts: Any | None = None
     _title_contexts: dict[str, LLMRuntime] = field(default_factory=dict)
 
     def subscribe(self, runtime_events: RuntimeEventBus) -> Callable[[], None]:
@@ -260,6 +264,19 @@ class WebuiTurnCoordinator:
             runtime_events.subscribe(
                 self._handle_runtime_model_changed,
                 RuntimeModelChanged,
+            ),
+            runtime_events.subscribe(
+                self._handle_turn_lifecycle_started,
+                TurnLifecycleStarted,
+            ),
+            runtime_events.subscribe(
+                self._handle_turn_lifecycle_completed,
+                TurnLifecycleCompleted,
+                required=self.transcripts is not None,
+            ),
+            runtime_events.subscribe(
+                self._handle_thread_runtime_status_changed,
+                ThreadRuntimeStatusChanged,
             ),
         ]
 
@@ -343,6 +360,103 @@ class WebuiTurnCoordinator:
             )
         )
 
+    async def _handle_turn_lifecycle_started(
+        self,
+        event: TurnLifecycleStarted,
+    ) -> None:
+        if not self._is_websocket_event(event.context):
+            return
+        persisted = False
+        if self.transcripts is not None:
+            self.transcripts.prepare_and_append(
+                event.context.chat_id,
+                {
+                    "event": "turn_started",
+                    "chat_id": event.context.chat_id,
+                    "snapshot_revision": event.snapshot_revision,
+                    "turn": dict(event.turn),
+                },
+                metadata=event.context.metadata,
+                phase="activity",
+            )
+            persisted = True
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=event.context.channel,
+                chat_id=event.context.chat_id,
+                content="",
+                metadata={
+                    **event.context.metadata,
+                    "_turn_lifecycle_started": True,
+                    "_turn_lifecycle_persisted": persisted,
+                    "turn": dict(event.turn),
+                    "snapshot_revision": event.snapshot_revision,
+                },
+            )
+        )
+
+    async def _handle_turn_lifecycle_completed(
+        self,
+        event: TurnLifecycleCompleted,
+    ) -> None:
+        if not self._is_websocket_event(event.context):
+            return
+        persisted = False
+        if self.transcripts is not None:
+            turn_id = str(event.turn.get("id") or "").strip()
+            runtime_epoch = str(event.turn.get("runtime_epoch") or "").strip()
+            overrides = (
+                {"event_id": f"terminal_{runtime_epoch}_{turn_id}"}
+                if turn_id and runtime_epoch
+                else None
+            )
+            self.transcripts.prepare_and_append(
+                event.context.chat_id,
+                {
+                    "event": "turn_completed",
+                    "chat_id": event.context.chat_id,
+                    "snapshot_revision": event.snapshot_revision,
+                    "turn": dict(event.turn),
+                },
+                metadata=event.context.metadata,
+                phase="complete",
+                transcript_overrides=overrides,
+            )
+            persisted = True
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=event.context.channel,
+                chat_id=event.context.chat_id,
+                content="",
+                metadata={
+                    **event.context.metadata,
+                    "_turn_lifecycle_completed": True,
+                    "_turn_lifecycle_persisted": persisted,
+                    "turn": dict(event.turn),
+                    "snapshot_revision": event.snapshot_revision,
+                },
+            )
+        )
+
+    async def _handle_thread_runtime_status_changed(
+        self,
+        event: ThreadRuntimeStatusChanged,
+    ) -> None:
+        if not event.session_key.startswith("websocket:"):
+            return
+        chat_id = event.session_key.split(":", 1)[1]
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel="websocket",
+                chat_id=chat_id,
+                content="",
+                metadata={
+                    "_thread_runtime_status_changed": True,
+                    "runtime_snapshot": dict(event.snapshot),
+                },
+            )
+        )
+
     def capture_title_context(
         self,
         session_key: str,
@@ -374,6 +488,11 @@ class WebuiTurnCoordinator:
         if msg.channel != "websocket":
             return
 
+        # Turn completion is authoritative even if the separate idle status
+        # message is still queued behind it.  Clearing this before publishing
+        # ``turn_end`` prevents an immediate session-list refresh from
+        # reporting the completed turn as active.
+        _WEBSOCKET_TURN_WALL_STARTED_AT.pop(str(msg.chat_id or "").strip(), None)
         turn_metadata: dict[str, Any] = {**msg.metadata, "_turn_end": True}
         if latency_ms is not None:
             turn_metadata["latency_ms"] = int(latency_ms)

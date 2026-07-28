@@ -177,6 +177,8 @@ class SDKStreamingHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         for call in context.tool_calls:
+            if call.id in context.hidden_tool_call_ids:
+                continue
             await self._emitter.emit(StreamEvent(
                 type=STREAM_EVENT_TOOL_STARTED,
                 name=call.name,
@@ -205,6 +207,8 @@ class SDKStreamingHook(AgentHook):
             return
         for index, raw_event in enumerate(context.tool_events):
             call = context.tool_calls[index] if index < len(context.tool_calls) else None
+            if call is not None and call.id in context.hidden_tool_call_ids:
+                continue
             event = dict(raw_event)
             status = event.get("status")
             name = str(event.get("name") or (call.name if call else ""))

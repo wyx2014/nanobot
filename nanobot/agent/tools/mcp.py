@@ -16,7 +16,8 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.security.workspace_access import current_tool_workspace
+from nanobot.security.project_context import current_project_context
+from nanobot.security.workspace_access import current_tool_workspace, current_workspace_scope
 from nanobot.bus.events import (
     INBOUND_META_RUNTIME_CONTROL,
     RUNTIME_CONTROL_ACK,
@@ -241,6 +242,59 @@ _SKIP_ARTIFACT_DIRS: frozenset[str] = frozenset((
     ".git", "node_modules", ".venv", "venv", "__pycache__",
 ))
 
+_MCP_PATH_KEYS = {
+    "path", "file", "filename", "directory", "folder", "cwd", "root",
+    "workspace", "source_path", "target_path", "output_path", "input_path",
+}
+
+
+def _mcp_workspace_violation(arguments: Mapping[str, Any]) -> str | None:
+    """Apply the active restricted workspace boundary to MCP file arguments."""
+    scope = current_workspace_scope()
+    if scope is None or not scope.restrict_to_workspace:
+        return None
+    project_context = current_project_context()
+    root = scope.project_path.expanduser().resolve(strict=False)
+    if (
+        project_context is not None
+        and project_context.root_path.expanduser().resolve(strict=False) != root
+    ):
+        return "MCP workspace does not match the active project identity"
+
+    def visit(value: Any, key: str | None = None) -> str | None:
+        if isinstance(value, Mapping):
+            for child_key, child_value in value.items():
+                violation = visit(child_value, str(child_key).lower())
+                if violation:
+                    return violation
+            return None
+        if isinstance(value, list):
+            for child in value:
+                violation = visit(child, key)
+                if violation:
+                    return violation
+            return None
+        path_key = (
+            key in _MCP_PATH_KEYS
+            or bool(key and key.endswith(("_path", "_file", "_dir", "_directory")))
+        )
+        if not path_key or not isinstance(value, str) or not value.strip():
+            return None
+        raw = value.strip()
+        if raw.lower().startswith("file:"):
+            return f"MCP file URL is not allowed for argument '{key}'"
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return f"MCP path argument '{key}' is outside the active project"
+        return None
+
+    return visit(arguments)
+
 
 def _artifact_snapshot(root: str | None) -> dict[Path, tuple[int, int]]:
     if not root:
@@ -446,6 +500,10 @@ class MCPToolWrapper(_MCPWrapperBase):
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
+
+        if violation := _mcp_workspace_violation(kwargs):
+            logger.warning("MCP tool '{}' blocked by project scope: {}", self._name, violation)
+            return f"(MCP tool call blocked: {violation})"
 
         retried_transient = False
         refreshed_session = False

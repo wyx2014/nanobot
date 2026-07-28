@@ -233,6 +233,16 @@ def _resolve_apply_patch_paths(
         if path is not None and path not in seen:
             seen.add(path)
             resolved.append(path)
+    # Invalid model-generated calls occasionally put ``path`` at the top
+    # level instead of on each edit. The tool must still reject that schema,
+    # but tracking the intended path lets the runtime close any speculative
+    # streaming file-edit activity with an error event.
+    if not resolved:
+        raw_path = params.get("path")
+        if isinstance(raw_path, str) and raw_path.strip():
+            path = _resolve_raw_file_edit_path(tool, workspace, raw_path)
+            if path is not None:
+                resolved.append(path)
     return resolved
 
 

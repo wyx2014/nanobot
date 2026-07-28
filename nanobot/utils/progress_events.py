@@ -134,41 +134,6 @@ def build_tool_event_finish_payloads(
     return payloads
 
 
-def build_automatic_task_progress_event(
-    *,
-    call_id: str,
-    steps: list[dict[str, str]],
-    note: str,
-    current_step_id: str | None,
-    sequence: int,
-    batch_id: str,
-) -> dict[str, Any]:
-    """Build a completed synthetic event carrying a runtime-generated plan snapshot."""
-    arguments: dict[str, Any] = {
-        "steps": steps,
-        "note": note,
-    }
-    if current_step_id:
-        arguments["current_step_id"] = current_step_id
-    return {
-        "version": 1,
-        # This is a UI snapshot, not an executable tool call. Keep the phase
-        # terminal so transcript pending-call detection never treats it as work.
-        "phase": "end",
-        "call_id": call_id,
-        "name": "update_task_progress",
-        "sequence": sequence,
-        "batch_id": batch_id,
-        "occurred_at": _unix_millis(),
-        "display": {"category": "plan", "importance": "primary"},
-        "arguments": arguments,
-        "result": "Task progress updated",
-        "error": None,
-        "files": [],
-        "embeds": [],
-    }
-
-
 def build_tool_event_display(name: str, arguments: dict[str, Any]) -> dict[str, str]:
     """Return stable presentation hints without coupling clients to tool names."""
     compact = name.lower()

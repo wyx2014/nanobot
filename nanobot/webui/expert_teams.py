@@ -12,6 +12,7 @@ import yaml
 
 EXPERT_TEAM_SESSION_KEY = "expert_team"
 _TEAM_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_MCP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class ExpertTeamError(ValueError):
@@ -164,6 +165,71 @@ def _data_sources(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _configured_mcp_names() -> set[str]:
+    """Return configured MCP server names without exposing their settings."""
+    try:
+        from nanobot.config.loader import load_config
+
+        return {str(name).strip().lower() for name in load_config().tools.mcp_servers}
+    except Exception:
+        return set()
+
+
+def _mcp_presets(raw: Any) -> list[dict[str, Any]]:
+    """Normalize MCP presets declared by an expert-team package."""
+    if not isinstance(raw, list):
+        return []
+    configured = _configured_mcp_names()
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw[:8]:
+        if isinstance(item, str):
+            name = item.strip().lower()
+            display_name = name
+            description = ""
+            required = False
+        elif isinstance(item, Mapping):
+            name = str(item.get("name") or "").strip().lower()
+            display_name = str(item.get("display_name") or name).strip()
+            description = str(item.get("description") or "").strip()
+            required = item.get("required") is True
+        else:
+            continue
+        if not name or _MCP_NAME_RE.fullmatch(name) is None or name in seen:
+            continue
+        seen.add(name)
+        out.append({
+            "name": name,
+            "display_name": display_name or name,
+            "required": required,
+            "configured": name in configured,
+            "description": description,
+        })
+    return out
+
+
+def expert_team_mcp_attachments(binding: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Return configured team MCP presets as safe turn attachments."""
+    if not isinstance(binding, Mapping):
+        return []
+    raw = binding.get("mcp_presets")
+    if not isinstance(raw, list):
+        return []
+    return [
+        {
+            "name": str(item["name"]),
+            "display_name": str(item.get("display_name") or item["name"]),
+            "transport": "mcp",
+            "configured": True,
+            "source": "expert_team",
+        }
+        for item in raw
+        if isinstance(item, Mapping)
+        and item.get("configured") is True
+        and isinstance(item.get("name"), str)
+    ]
+
+
 def _completion(runtime: Mapping[str, Any]) -> dict[str, Any] | None:
     raw = runtime.get("completion")
     if not isinstance(raw, Mapping):
@@ -216,6 +282,7 @@ def _summary(team_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
         "member_count": len(members),
         "workflow_count": len(workflows),
         "data_source_count": len(_data_sources(manifest.get("data_sources"))),
+        "mcp_preset_count": len(_mcp_presets(manifest.get("mcp_presets"))),
         "tags": [str(tag) for tag in manifest.get("tags", []) if str(tag).strip()],
         "requested_concurrency": max(1, min(4, int(runtime.get("requested_concurrency") or 1))),
     }
@@ -258,6 +325,7 @@ def expert_team_detail_payload(team_id: str) -> dict[str, Any]:
         "members": _members(manifest.get("members")),
         "workflows": _workflows(manifest.get("workflows")),
         "data_sources": _data_sources(manifest.get("data_sources")),
+        "mcp_presets": _mcp_presets(manifest.get("mcp_presets")),
         "optional_dependencies": optional,
         "source_available": source_root.is_dir(),
     }
@@ -295,6 +363,7 @@ def normalize_expert_team_binding(raw: Any) -> dict[str, Any] | None:
             for member in _members(manifest.get("members"), source_root)
         ],
         "data_sources": _data_sources(manifest.get("data_sources")),
+        "mcp_presets": _mcp_presets(manifest.get("mcp_presets")),
         **({"completion": completion} if completion is not None else {}),
     }
 

@@ -60,11 +60,21 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(
+        self,
+        workspace: Path,
+        max_history_entries: int = _DEFAULT_MAX_HISTORY,
+        *,
+        on_memory_write: Callable[[str], None] | None = None,
+    ):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
+        self.memory_summary_file = self.memory_dir / "memory_summary.md"
+        self.raw_memories_file = self.memory_dir / "raw_memories.md"
+        self.rollout_summaries_dir = self.memory_dir / "rollout_summaries"
+        self.memory_skills_dir = self.memory_dir / "skills"
         self.history_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
@@ -75,6 +85,7 @@ class MemoryStore:
         self._malformed_entry_logged = False  # rate-limit bad history shape warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
+        self._on_memory_write = on_memory_write
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
         ])
@@ -219,8 +230,74 @@ class MemoryStore:
     def read_memory(self) -> str:
         return self.read_file(self.memory_file)
 
-    def write_memory(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+    def write_memory(self, content: str, *, notify: bool = True) -> None:
+        self._write_text_atomic(self.memory_file, content)
+        if notify and self._on_memory_write is not None:
+            try:
+                self._on_memory_write(content)
+            except Exception:
+                logger.exception("Failed to update project memory projection")
+
+    def read_memory_summary(self) -> str:
+        return self.read_file(self.memory_summary_file)
+
+    def write_memory_summary(self, content: str) -> None:
+        self._write_text_atomic(self.memory_summary_file, content)
+
+    def write_raw_memories(self, content: str) -> None:
+        self._write_text_atomic(self.raw_memories_file, content)
+
+    def write_rollout_summary(self, slug: str, content: str) -> Path:
+        safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", slug).strip("-._")[:120]
+        if not safe_slug:
+            raise ValueError("rollout summary slug is empty")
+        self.rollout_summaries_dir.mkdir(parents=True, exist_ok=True)
+        path = self.rollout_summaries_dir / f"{safe_slug}.md"
+        self._write_text_atomic(path, content)
+        return path
+
+    def sync_rollout_summaries(self, summaries: dict[str, str]) -> None:
+        """Atomically refresh the selected project rollout summary projection."""
+        self.rollout_summaries_dir.mkdir(parents=True, exist_ok=True)
+        expected: set[Path] = set()
+        for slug, content in summaries.items():
+            expected.add(self.write_rollout_summary(slug, content))
+        for path in self.rollout_summaries_dir.glob("*.md"):
+            if path not in expected:
+                path.unlink(missing_ok=True)
+
+    def sync_memory_skills(self, skills: dict[str, str]) -> None:
+        """Refresh reusable, memory-derived project skill snippets."""
+        self.memory_skills_dir.mkdir(parents=True, exist_ok=True)
+        expected: set[Path] = set()
+        for slug, content in skills.items():
+            safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", slug).strip("-._")[:120]
+            if not safe_slug:
+                continue
+            path = self.memory_skills_dir / f"{safe_slug}.md"
+            self._write_text_atomic(path, content)
+            expected.add(path)
+        for path in self.memory_skills_dir.glob("*.md"):
+            if path not in expected:
+                path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _write_text_atomic(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     # -- SOUL.md -------------------------------------------------------------
 
@@ -241,7 +318,8 @@ class MemoryStore:
     # -- context injection (used by context.py) ------------------------------
 
     def get_memory_context(self) -> str:
-        long_term = self.read_memory()
+        long_term = self.read_memory_summary() or self.read_memory()
+        long_term = truncate_text_to_tokens(long_term, 3_000)
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
     # -- history.jsonl — append-only, JSONL format ---------------------------

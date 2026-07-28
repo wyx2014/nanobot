@@ -105,6 +105,55 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
 
 
 @pytest.mark.asyncio
+async def test_stream_end_classifies_tool_content_as_narration(tmp_path):
+    loop = _make_loop(tmp_path)
+    tool_call = ToolCallRequest(
+        id="call-1",
+        name="web_search",
+        arguments={"query": "market"},
+    )
+    responses = iter([
+        LLMResponse(content="I will verify the market data.", tool_calls=[tool_call]),
+        LLMResponse(content="Final answer.", tool_calls=[]),
+    ])
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        response = next(responses)
+        await on_content_delta(response.content)
+        return response
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.tools.prepare_call = MagicMock(return_value=(None, {"query": "market"}, None))
+    loop.tools.execute = AsyncMock(return_value="ok")
+    endings: list[tuple[bool, str]] = []
+
+    async def on_stream(_delta: str) -> None:
+        return None
+
+    async def on_stream_end(
+        *,
+        resuming: bool = False,
+        stream_kind: str = "answer",
+    ) -> None:
+        endings.append((resuming, stream_kind))
+
+    async def on_progress(_content: str, **_kwargs) -> None:
+        return None
+
+    final_content, _, _, _, _ = await loop._run_agent_loop(
+        [],
+        on_stream=on_stream,
+        on_stream_end=on_stream_end,
+        on_progress=on_progress,
+        channel="websocket",
+    )
+
+    assert final_content == "Final answer."
+    assert endings == [(True, "narration"), (False, "answer")]
+
+
+@pytest.mark.asyncio
 async def test_loop_stream_filter_hides_partial_trailing_think_prefix(tmp_path):
     loop = _make_loop(tmp_path)
     deltas: list[str] = []

@@ -161,11 +161,51 @@ class _ExecSession:
         )
 
     async def kill(self) -> None:
-        if self.process.returncode is not None:
+        await self._close_input()
+        if self.process.returncode is None:
+            with suppress(ProcessLookupError):
+                self.process.kill()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        await self._finish_readers()
+
+    async def close(self) -> None:
+        """Terminate, reap, and drain every pipe owned by this session."""
+        await self._close_input()
+        if self.process.returncode is None:
+            with suppress(ProcessLookupError):
+                self.process.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                with suppress(ProcessLookupError):
+                    self.process.kill()
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        await self._finish_readers()
+
+    async def _close_input(self) -> None:
+        if self.process.stdin is None:
             return
-        self.process.kill()
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        self.process.stdin.close()
+        with suppress(Exception):
+            await self.process.stdin.wait_closed()
+
+    async def _finish_readers(self) -> None:
+        readers = (self._stdout_task, self._stderr_task)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*readers, return_exceptions=True),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            for task in readers:
+                task.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+        # asyncio subprocess transports finish closing pipe callbacks on the
+        # next loop iterations.  Do this before asyncio.run() closes the loop.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
     async def _wait_for_buffered_output(self) -> None:
         deadline = time.monotonic() + OUTPUT_DRAIN_GRACE_S
@@ -295,6 +335,19 @@ class ExecSessionManager:
         for session_id in stale:
             session = self._sessions.pop(session_id)
             await session.kill()
+
+    async def shutdown(self) -> None:
+        """Close all live sessions before their event loop is torn down."""
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        if sessions:
+            await asyncio.gather(
+                *(session.close() for session in sessions),
+                return_exceptions=True,
+            )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
     async def _spawn(
         self,

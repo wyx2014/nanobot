@@ -2,11 +2,14 @@
 
 import base64
 import json
-import re
 import mimetypes
 import platform
+import re
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from loguru import logger
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skill_scope import allowed_workspace_skills_from_scope, explicit_skills_from_scope
@@ -151,6 +154,8 @@ class ContextBuilder:
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
+        self._project_memories: dict[str, MemoryStore] = {}
+        self._project_state: Any | None = None
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -164,9 +169,11 @@ class ContextBuilder:
         unified_session: bool = False,
         skill_scope: Mapping[str, Any] | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        project_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
+        memory_store = self.memory_for_project(project_id, root)
         allowed_workspace_skills = allowed_workspace_skills_from_scope(skill_scope)
         disallowed_markers = self._disallowed_workspace_skill_markers(allowed_workspace_skills)
         parts = [self._get_identity(channel=channel, workspace=root)]
@@ -177,11 +184,12 @@ class ContextBuilder:
 
         parts.append(render_template("agent/tool_contract.md"))
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            memory = _filter_disallowed_skill_text(memory, disallowed_markers)
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if memory_store is not None:
+            memory = memory_store.get_memory_context()
+            if memory and not self._is_template_content(memory_store.read_memory(), "memory/MEMORY.md"):
+                memory = _filter_disallowed_skill_text(memory, disallowed_markers)
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
 
         available_skills = {
             entry["name"]
@@ -209,9 +217,9 @@ class ContextBuilder:
         if team_prompt:
             parts.append(team_prompt)
 
-        if include_memory_recent_history:
-            entries = self.memory.read_recent_history_for_prompt(
-                since_cursor=self.memory.get_last_dream_cursor(),
+        if include_memory_recent_history and memory_store is not None:
+            entries = memory_store.read_recent_history_for_prompt(
+                since_cursor=memory_store.get_last_dream_cursor(),
                 session_key=session_key,
                 unified_session=unified_session,
             )
@@ -233,6 +241,192 @@ class ContextBuilder:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
         return "\n\n---\n\n".join(parts)
+
+    def memory_for_project(
+        self,
+        project_id: str | None,
+        workspace: Path | None,
+    ) -> MemoryStore | None:
+        """Resolve a project-owned memory store without falling back across projects."""
+        root = (workspace or self.workspace).expanduser().resolve(strict=False)
+        runtime_root = self.workspace.expanduser().resolve(strict=False)
+        if root == runtime_root:
+            return self.memory
+        normalized_id = (project_id or "").strip()
+        if not re.fullmatch(r"prj_[a-f0-9]{32}", normalized_id):
+            return None
+        existing = self._project_memories.get(normalized_id)
+        if existing is not None:
+            return existing
+        from nanobot.storage.state import StateStore, StateStoreError
+
+        state = StateStore(
+            runtime_root / ".nanobot" / "state.sqlite",
+            default_workspace=runtime_root,
+        )
+        self._project_state = state
+        project = state.get_project(normalized_id)
+        if project is None:
+            return None
+        if Path(project.canonical_root_path).resolve(strict=False) != root:
+            return None
+        managed_root = (
+            runtime_root
+            / ".nanobot"
+            / "project-memory"
+            / normalized_id
+        )
+
+        def project_memory_changed(content: str) -> None:
+            try:
+                state.upsert_project_memory(
+                    normalized_id,
+                    kind="long_term",
+                    content=content,
+                )
+            except StateStoreError:
+                logger.warning(
+                    "Project memory projection rejected for project_id={}",
+                    normalized_id,
+                )
+
+        store = MemoryStore(
+            managed_root,
+            on_memory_write=project_memory_changed,
+        )
+        current_memory = store.read_memory()
+        if current_memory and not state.list_project_memories(normalized_id):
+            project_memory_changed(current_memory)
+        self._project_memories[normalized_id] = store
+        return store
+
+    def _project_retrieval_context(
+        self,
+        project_id: str | None,
+        workspace: Path,
+        query: str,
+    ) -> str:
+        """Retrieve indexed chunks only after project ID/root verification."""
+        normalized_id = (project_id or "").strip()
+        if not normalized_id or not query.strip():
+            return ""
+        # memory_for_project performs the identity/root check and initializes
+        # the shared StateStore handle.
+        if self.memory_for_project(normalized_id, workspace) is None:
+            return ""
+        state = self._project_state
+        if state is None:
+            return ""
+        terms = [
+            term.strip(".,!?;:()[]{}\"'").lower()
+            for term in query.split()
+        ]
+        terms = [term for term in terms if len(term) >= 2][:5]
+        if not terms:
+            return ""
+        rows = state.search_project_chunks(
+            normalized_id,
+            " ".join(terms),
+            limit=6,
+        )
+        if not rows:
+            # Multi-term AND search can be too narrow; the longest term is a
+            # deterministic scoped fallback, never a cross-project lookup.
+            rows = state.search_project_chunks(
+                normalized_id,
+                max(terms, key=len),
+                limit=6,
+            )
+        if not rows:
+            return ""
+        excerpts = "\n\n".join(
+            f"[{row['relative_path']}#{int(row['ordinal']) + 1}]\n{row['text']}"
+            for row in rows
+        )
+        return "# Project Documents\n\n" + truncate_text_to_tokens(excerpts, 3_000)
+
+    def _project_memory_retrieval_context(
+        self,
+        project_id: str | None,
+        workspace: Path,
+        query: str,
+    ) -> str:
+        """Retrieve a few project memories after the summary routing layer."""
+        normalized_id = (project_id or "").strip()
+        if not normalized_id or not query.strip():
+            return ""
+        memory_store = self.memory_for_project(normalized_id, workspace)
+        if memory_store is None:
+            return ""
+        state = self._project_state
+        if state is None:
+            return ""
+        terms = re.findall(
+            r"[A-Za-z0-9_./-]{2,}|[\u4e00-\u9fff]{2,8}",
+            query,
+        )[:5]
+        if not terms:
+            return ""
+        rows = state.search_project_memories(
+            normalized_id,
+            " ".join(terms),
+            limit=4,
+        )
+        if not rows:
+            return ""
+        memory_ids = [str(row["id"]) for row in rows]
+        threading.Thread(
+            target=state.record_project_memory_usage,
+            args=(normalized_id, memory_ids),
+            daemon=True,
+            name="nanobot-project-memory-usage",
+        ).start()
+        excerpts = []
+        for row in rows:
+            sources = str(row.get("source_session_ids") or "")
+            source_note = f" source_sessions={sources}" if sources else ""
+            title = str(row.get("title") or row.get("kind") or "memory")
+            excerpts.append(
+                f"[memory:{row['id']}{source_note}] {title}\n{row['content']}"
+            )
+        source_summaries = state.project_memory_source_summaries(
+            normalized_id,
+            memory_ids,
+            limit=2,
+        )
+        if source_summaries:
+            excerpts.append(
+                "# Supporting Rollout Summaries\n\n"
+                + "\n\n".join(
+                    (
+                        f"[session:{row['source_session_key']} stage1:{row['id']}]\n"
+                        f"{row['rollout_summary']}"
+                    )
+                    for row in source_summaries
+                )
+            )
+        for path in sorted(memory_store.memory_skills_dir.glob("*.md")):
+            try:
+                skill_text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            lowered = skill_text.lower()
+            if not any(term.lower() in lowered for term in terms):
+                continue
+            excerpts.append(
+                f"# Relevant Memory-Derived Project Skill\n\n"
+                f"[memory-skill:{path.stem}]\n{skill_text}"
+            )
+            break
+        body = "\n\n".join(excerpts)
+        return (
+            "# Relevant Project Memory\n\n"
+            "Historical project memory may be stale. Verify drift-prone facts against "
+            "current project files or tools before relying on it. If the final answer "
+            "materially relies on one of these memories, preserve its `[memory:...]` "
+            "source marker so the UI can trace the source session.\n\n"
+            + truncate_text_to_tokens(body, 2_000)
+        )
 
     def _disallowed_workspace_skill_markers(self, allowed_workspace_skills: set[str] | None) -> tuple[str, ...]:
         if allowed_workspace_skills is None:
@@ -339,8 +533,17 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
-        skill_scope = None
+        project_id = None
+        if isinstance(session_metadata, Mapping):
+            raw_project_id = session_metadata.get("project_id")
+            if isinstance(raw_project_id, str):
+                project_id = raw_project_id
         if isinstance(msg_metadata := getattr(inbound_message, "metadata", None), Mapping):
+            raw_context = msg_metadata.get("_project_context")
+            if isinstance(raw_context, Mapping) and isinstance(raw_context.get("project_id"), str):
+                project_id = str(raw_context["project_id"])
+        skill_scope = None
+        if isinstance(msg_metadata, Mapping):
             skill_scope = msg_metadata.get("skill_scope")
         allowed_workspace_skills = allowed_workspace_skills_from_scope(
             skill_scope if isinstance(skill_scope, Mapping) else None
@@ -392,10 +595,29 @@ class ContextBuilder:
                     unified_session=unified_session,
                     skill_scope=skill_scope if isinstance(skill_scope, Mapping) else None,
                     session_metadata=session_metadata,
+                    project_id=project_id,
                 ),
             },
             *history,
         ]
+        memory_retrieval = self._project_memory_retrieval_context(
+            project_id,
+            root,
+            current_message,
+        )
+        document_retrieval = self._project_retrieval_context(
+            project_id,
+            root,
+            current_message,
+        )
+        retrieval = "\n\n---\n\n".join(
+            item for item in (memory_retrieval, document_retrieval) if item
+        )
+        if retrieval:
+            messages[0] = {
+                **messages[0],
+                "content": f"{messages[0]['content']}\n\n---\n\n{retrieval}",
+            }
         if messages[-1].get("role") == current_role:
             last = dict(messages[-1])
             last["content"] = self._merge_message_content(last.get("content"), merged)

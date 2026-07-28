@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import os
 import re
+import time
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, TypeVar
 
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
+from nanobot.security.workspace_access import current_tool_workspace
+from nanobot.security.workspace_policy import is_path_within
 
 _DEFAULT_HEAD_LIMIT = 250
 _DEFAULT_FILE_HEAD_LIMIT = 200
@@ -100,6 +105,24 @@ def _matches_query(rel_path: str, query: str | None) -> bool:
 class _SearchTool(_FsTool):
     _IGNORE_DIRS = set(ListDirTool._IGNORE_DIRS)
 
+    def _search_scope_error(self, target: Path) -> str | None:
+        """Keep broad discovery inside the active project or built-in Skills."""
+        access = current_tool_workspace(
+            self._workspace,
+            restrict_to_workspace=self._restrict_to_workspace,
+            sandbox_restricts_workspace=self._sandbox_restricts_workspace,
+        )
+        if access.project_path is None:
+            return None
+        allowed_roots = [access.project_path, BUILTIN_SKILLS_DIR]
+        if any(is_path_within(target, root) for root in allowed_roots):
+            return None
+        return (
+            "Error: Search path is outside the active project. Broad find/grep discovery "
+            "is project-scoped even in Full Access mode. Use the Skill registry for Skills "
+            "or read an explicitly requested external file by its exact path."
+        )
+
     def _display_path(self, target: Path, root: Path) -> str:
         workspace = self._display_workspace()
         if workspace:
@@ -122,6 +145,8 @@ class _SearchTool(_FsTool):
 class FindFilesTool(_SearchTool):
     """Find files by path fragment, glob, or type."""
     _scopes = {"core", "subagent"}
+    _MAX_SCAN_ENTRIES = 50_000
+    _MAX_SCAN_SECONDS = 5.0
 
     @property
     def name(self) -> str:
@@ -203,6 +228,52 @@ class FindFilesTool(_SearchTool):
             for filename in sorted(filenames):
                 yield current / filename
 
+    def _collect_matches(
+        self,
+        target: Path,
+        *,
+        query: str | None,
+        glob: str | None,
+        file_type: str | None,
+        include_dirs: bool,
+    ) -> tuple[list[tuple[str, float]], int, str | None]:
+        root = target if target.is_dir() else target.parent
+        matches: list[tuple[str, float]] = []
+        scanned = 0
+        started = time.monotonic()
+        stop_reason: str | None = None
+
+        for candidate in self._iter_paths(target, include_dirs=include_dirs):
+            scanned += 1
+            if scanned > self._MAX_SCAN_ENTRIES:
+                stop_reason = f"scan entry limit ({self._MAX_SCAN_ENTRIES})"
+                break
+            if time.monotonic() - started > self._MAX_SCAN_SECONDS:
+                stop_reason = f"scan time limit ({self._MAX_SCAN_SECONDS:g}s)"
+                break
+            if candidate.is_dir() and not include_dirs:
+                continue
+            rel_path = candidate.relative_to(root).as_posix()
+            display_path = self._display_path(candidate, root)
+            name = candidate.name
+
+            if glob and not _match_glob(rel_path, name, glob):
+                continue
+            if candidate.is_file() and not _matches_type(name, file_type):
+                continue
+            if candidate.is_dir() and file_type:
+                continue
+            if not _matches_query(display_path, query):
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            suffix = "/" if candidate.is_dir() else ""
+            matches.append((display_path + suffix, mtime))
+
+        return matches, scanned, stop_reason
+
     async def execute(
         self,
         path: str = ".",
@@ -217,6 +288,8 @@ class FindFilesTool(_SearchTool):
     ) -> str:
         try:
             target = self._resolve(path or ".")
+            if scope_error := self._search_scope_error(target):
+                return scope_error
             if not target.exists():
                 return f"Error: Path not found: {path}"
             if not (target.is_dir() or target.is_file()):
@@ -230,30 +303,14 @@ class FindFilesTool(_SearchTool):
                 if head_limit is None
                 else None if head_limit == 0 else head_limit
             )
-            root = target if target.is_dir() else target.parent
-            matches: list[tuple[str, float]] = []
-
-            for candidate in self._iter_paths(target, include_dirs=include_dirs):
-                if candidate.is_dir() and not include_dirs:
-                    continue
-                rel_path = candidate.relative_to(root).as_posix()
-                display_path = self._display_path(candidate, root)
-                name = candidate.name
-
-                if glob and not _match_glob(rel_path, name, glob):
-                    continue
-                if candidate.is_file() and not _matches_type(name, type):
-                    continue
-                if candidate.is_dir() and type:
-                    continue
-                if not _matches_query(display_path, query):
-                    continue
-                try:
-                    mtime = candidate.stat().st_mtime
-                except OSError:
-                    mtime = 0.0
-                suffix = "/" if candidate.is_dir() else ""
-                matches.append((display_path + suffix, mtime))
+            matches, scanned, stop_reason = await asyncio.to_thread(
+                self._collect_matches,
+                target,
+                query=query,
+                glob=glob,
+                file_type=type,
+                include_dirs=include_dirs,
+            )
 
             if sort == "modified":
                 matches.sort(key=lambda item: (-item[1], item[0]))
@@ -263,12 +320,22 @@ class FindFilesTool(_SearchTool):
             paths = [item[0] for item in matches]
             paged, truncated = _paginate(paths, limit, offset)
             if not paged:
+                if stop_reason:
+                    return (
+                        f"Error: Search stopped at {stop_reason} after {scanned} entries. "
+                        "Use a narrower path, query, or glob."
+                    )
                 return "No files found"
 
             result = "\n".join(paged)
             note = _pagination_note(limit, offset, truncated)
             if note:
                 result += "\n\n" + note
+            if stop_reason:
+                result += (
+                    f"\n\n(scan stopped at {stop_reason} after {scanned} entries; "
+                    "narrow the search path for complete results)"
+                )
             return result
         except PermissionError as e:
             return f"Error: {e}"
@@ -424,6 +491,8 @@ class GrepTool(_SearchTool):
     ) -> str:
         try:
             target = self._resolve(path or ".")
+            if scope_error := self._search_scope_error(target):
+                return scope_error
             if not target.exists():
                 return f"Error: Path not found: {path}"
             if not (target.is_dir() or target.is_file()):

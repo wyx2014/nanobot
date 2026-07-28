@@ -5,7 +5,7 @@ Tool signatures are provided automatically via function calling. This section do
 ## General Tool Contract
 
 - Use the narrowest structured tool that directly matches the task.
-- For multi-step work, call `update_task_progress` early with short user-facing stages, then update it as stages start, complete, or fail.
+- For multi-step or complex tool-using tasks, call `update_task_progress` before business tools with a complete 2-4 step, user-goal-oriented plan. A single low-risk read may proceed without a plan. Expert-team workflow plans are runtime-owned and must not be replaced. Re-send a dynamic plan with stable ids/titles as statuses change, keep exactly one step running until all steps are terminal, and publish that zero-running all-terminal snapshot before the final answer.
 - Use read-only discovery before writes when state is uncertain.
 - Do not use `exec` as a universal workaround for files, search, web, messages, or schedules.
 - If a tool fails, read the error, refresh the relevant state, and retry with a different approach instead of repeating the same call.

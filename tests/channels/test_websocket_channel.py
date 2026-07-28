@@ -365,14 +365,29 @@ async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> 
     assert msg.metadata["webui_turn_id"] == "turn-1"
     assert msg.metadata["_wants_stream"] is True
     lines = read_transcript_lines("websocket:chat-1")
-    assert lines == [{
+    assert len(lines) == 1
+    assert {
+        key: lines[0][key]
+        for key in (
+            "event",
+            "chat_id",
+            "text",
+            "turn_id",
+            "turn_phase",
+            "turn_seq",
+        )
+    } == {
         "event": "user",
         "chat_id": "chat-1",
         "text": "hello",
         "turn_id": "turn-1",
         "turn_phase": "user",
         "turn_seq": 1,
-    }]
+    }
+    assert lines[0]["event_id"].startswith("evt_")
+    assert lines[0]["event_seq"] >= 1
+    assert lines[0]["project_id"].startswith("prj_")
+    assert lines[0]["session_id"].startswith("ses_")
 
 
 @pytest.mark.asyncio
@@ -491,6 +506,61 @@ async def test_webui_message_envelope_appends_user_transcript(
             "cli_apps": [{"name": "codex"}],
             "mcp_presets": [{"name": "browser"}],
         }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expert_team_auto_attaches_configured_mcp_preset(
+    bus: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    team = {
+        "id": "asset-research-team",
+        "name": "资产投研团队",
+        "members": [],
+        "mcp_presets": [{"name": "juyuan", "configured": True}],
+    }
+    monkeypatch.setattr(
+        "nanobot.channels.websocket.normalize_expert_team_binding",
+        lambda _raw: team,
+    )
+    monkeypatch.setattr(
+        "nanobot.channels.websocket.expert_team_mcp_attachments",
+        lambda _team: [{"name": "juyuan", "display_name": "聚源金融数据 MCP"}],
+    )
+
+    def normalize(raw: Any) -> list[dict[str, Any]]:
+        rows = raw if isinstance(raw, list) else []
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            name = str(row.get("name") or "")
+            if name and name not in seen:
+                seen.add(name)
+                out.append(dict(row))
+        return out
+
+    monkeypatch.setattr("nanobot.channels.websocket.normalize_mcp_preset_mentions", normalize)
+    channel = _ch(bus)
+    conn = MagicMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "message",
+            "chat_id": "chat-team",
+            "content": "研究一家公司",
+            "expert_team": {"id": "asset-research-team"},
+            "mcp_presets": [{"name": "playwright"}],
+        },
+    )
+
+    msg = bus.publish_inbound.await_args.args[0]
+    assert [item["name"] for item in msg.metadata["mcp_presets"]] == [
+        "playwright",
+        "juyuan",
     ]
 
 
@@ -1074,7 +1144,7 @@ async def test_send_progress_includes_structured_tool_events() -> None:
         },
     ))
 
-    payload = json.loads(mock_ws.send.await_args.args[0])
+    payload = json.loads(mock_ws.send.await_args_list[0].args[0])
     assert payload["event"] == "message"
     assert payload["kind"] == "tool_hint"
     assert payload["turn_id"] == "turn-1"
@@ -1096,9 +1166,78 @@ async def test_send_progress_includes_structured_tool_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_file_edit_progress_uses_file_edit_event() -> None:
+async def test_send_registers_structured_tool_output_files_as_artifacts(
+    tmp_path: Path,
+) -> None:
     bus = MagicMock()
-    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
+    project = tmp_path / "project"
+    report = project / "reports" / "market.pdf"
+    report.parent.mkdir(parents=True)
+    report.write_bytes(b"%PDF-generated-report")
+    gateway = _basic_handler(bus, workspace_path=project)
+    project_record = gateway.state.ensure_project(project)
+    gateway.state.bind_session("websocket:chat-1", project_record.id)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=gateway,
+    )
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+    file_row = {
+        "path": str(report),
+        "name": report.name,
+        "mime_type": "application/pdf",
+        "size": report.stat().st_size,
+    }
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={
+            "_progress": True,
+            "webui_turn_id": "turn-1",
+            "_tool_events": [
+                {
+                    "version": 1,
+                    "phase": "end",
+                    "call_id": "call-pdf",
+                    "name": "create_pdf",
+                    "arguments": {"output_path": str(report)},
+                    "result": {"files": [file_row]},
+                    "error": None,
+                    "files": [file_row],
+                    "embeds": [],
+                }
+            ],
+        },
+    ))
+
+    [artifact] = gateway.state.list_session_artifacts("websocket:chat-1")
+    assert artifact.relative_path == "reports/market.pdf"
+    assert artifact.mime_type == "application/pdf"
+    assert artifact.relation_type == "generated"
+    wire_events = [
+        json.loads(call.args[0])["event"]
+        for call in mock_ws.send.await_args_list
+    ]
+    assert wire_events == ["message", "artifact_created"]
+
+
+@pytest.mark.asyncio
+async def test_send_file_edit_progress_uses_file_edit_event(tmp_path: Path) -> None:
+    bus = MagicMock()
+    project = tmp_path / "project"
+    project.mkdir()
+    gateway = _basic_handler(bus, workspace_path=project)
+    project_record = gateway.state.ensure_project(project)
+    gateway.state.bind_session("websocket:chat-1", project_record.id)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=gateway,
+    )
     mock_ws = AsyncMock()
     channel._attach(mock_ws, "chat-1")
 
@@ -1124,7 +1263,7 @@ async def test_send_file_edit_progress_uses_file_edit_event() -> None:
         },
     ))
 
-    payload = json.loads(mock_ws.send.await_args.args[0])
+    payload = json.loads(mock_ws.send.await_args_list[0].args[0])
     assert payload == {
         "event": "file_edit",
         "chat_id": "chat-1",
@@ -1141,6 +1280,128 @@ async def test_send_file_edit_progress_uses_file_edit_event() -> None:
                 "status": "editing",
             }
         ],
+    }
+    artifact_payload = json.loads(mock_ws.send.await_args_list[1].args[0])
+    assert artifact_payload["event"] == "artifact_created"
+    assert artifact_payload["artifact"]["status"] == "staging"
+    assert artifact_payload["artifact"]["path"] == "src/app.py"
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={
+            "_progress": True,
+            "_file_edit_events": [
+                {
+                    "version": 1,
+                    "phase": "error",
+                    "call_id": "call-1",
+                    "tool": "write_file",
+                    "path": "src/app.py",
+                    "added": 0,
+                    "deleted": 0,
+                    "approximate": False,
+                    "status": "error",
+                    "error": "invalid parameters",
+                }
+            ],
+        },
+    ))
+
+    [failed] = gateway.state.list_session_artifacts("websocket:chat-1")
+    assert failed.status == "failed"
+    failed_payload = json.loads(mock_ws.send.await_args_list[-1].args[0])
+    assert failed_payload["event"] == "artifact_created"
+    assert failed_payload["artifact"]["id"] == artifact_payload["artifact"]["id"]
+    assert failed_payload["artifact"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_public_narration_reclassifies_each_provisional_stream() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    for index, text in enumerate(("First action.", "Second action."), start=1):
+        metadata = {
+            "_stream_id": f"stream-{index}",
+            "_stream_end": False,
+        }
+        await channel.send_delta("chat-1", text, metadata)
+        await channel.send_delta(
+            "chat-1",
+            "",
+            {
+                "_stream_id": f"stream-{index}",
+                "_stream_end": True,
+                "_resuming": True,
+                "_stream_kind": "narration",
+            },
+        )
+        await channel.send_narration_delta("chat-1", text)
+        await channel.send_narration_end("chat-1")
+
+    payloads = _sent_ws_payloads(mock_ws)
+    stream_ends = [payload for payload in payloads if payload["event"] == "stream_end"]
+    narrations = [
+        payload for payload in payloads if payload["event"] == "narration_delta"
+    ]
+    assert [
+        (payload["stream_id"], payload["resuming"], payload["stream_kind"])
+        for payload in stream_ends
+    ] == [
+        ("stream-1", True, "narration"),
+        ("stream-2", True, "narration"),
+    ]
+    assert [
+        (payload["text"], payload["replaces_stream_id"])
+        for payload in narrations
+    ] == [
+        ("First action.", "stream-1"),
+        ("Second action.", "stream-2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_pre_tool_content_does_not_create_narration_replacement() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send_delta(
+        "chat-1",
+        "",
+        {
+            "_stream_id": "empty-stream",
+            "_stream_end": True,
+            "_resuming": True,
+            "_stream_kind": "narration",
+        },
+    )
+    await channel.send_narration_end("chat-1")
+
+    payloads = _sent_ws_payloads(mock_ws)
+    assert payloads[0] == {
+        "event": "stream_end",
+        "chat_id": "chat-1",
+        "resuming": True,
+        "stream_kind": "narration",
+        "stream_id": "empty-stream",
+    }
+    assert payloads[1] == {
+        "event": "narration_end",
+        "chat_id": "chat-1",
     }
 
 
@@ -1432,6 +1693,117 @@ async def test_stream_transcript_persists_without_subscribers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_expert_team_progress_persists_without_subscribers() -> None:
+    from nanobot.webui.transcript import build_webui_thread_response
+
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    channel._start_team_run_projection(
+        "chat-1",
+        run_id="run-1",
+        team_id="asset-research-team",
+        team_name="资产投研团队",
+        members=[
+            {
+                "id": "business-analyst",
+                "name": "商业分析师",
+                "description": "分析商业模式",
+            },
+            {
+                "id": "financial-analyst",
+                "name": "财务分析师",
+                "description": "分析财务与估值",
+            },
+        ],
+    )
+    channel._persist_team_run_projection(
+        "chat-1",
+        "run-1",
+        activity="资产投研团队已启动",
+    )
+
+    await channel.send_team_member_updated(
+        "chat-1",
+        {
+            "run_id": "run-1",
+            "team_id": "asset-research-team",
+            "id": "business-analyst",
+            "name": "商业分析师",
+            "status": "completed",
+            "activity": "研究完成，结果已交付",
+        },
+    )
+    await channel.send_team_run_completed(
+        "chat-1",
+        run_id="run-1",
+        team_id="asset-research-team",
+    )
+
+    body = build_webui_thread_response("websocket:chat-1")
+    assert body is not None
+    progress = [
+        message["agentUI"]
+        for message in body["messages"]
+        if isinstance(message.get("agentUI"), dict)
+        and message["agentUI"].get("team_run_id") == "run-1"
+    ]
+    assert len(progress) == 3
+    assert progress[1]["steps"][0]["status"] == "completed"
+    assert all(step["status"] == "completed" for step in progress[-1]["steps"])
+
+
+@pytest.mark.asyncio
+async def test_expert_team_all_members_terminal_advances_runtime_to_synthesis() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    channel._start_team_run_projection(
+        "chat-plan-stage",
+        run_id="run-stage",
+        team_id="asset-research-team",
+        team_name="资产投研团队",
+        members=[
+            {"id": "business", "name": "商业分析师"},
+            {"id": "finance", "name": "财务分析师"},
+        ],
+    )
+
+    await channel.send_team_member_updated(
+        "chat-plan-stage",
+        {
+            "run_id": "run-stage",
+            "team_id": "asset-research-team",
+            "id": "business",
+            "name": "商业分析师",
+            "status": "completed",
+        },
+    )
+    assert channel._team_runs[("chat-plan-stage", "run-stage")]["stage"] == "members"
+
+    await channel.send_team_member_updated(
+        "chat-plan-stage",
+        {
+            "run_id": "run-stage",
+            "team_id": "asset-research-team",
+            "id": "finance",
+            "name": "财务分析师",
+            "status": "completed",
+        },
+    )
+
+    run = channel._team_runs[("chat-plan-stage", "run-stage")]
+    assert run["stage"] == "synthesis"
+    assert "主笔" in run["note"]
+
+
+@pytest.mark.asyncio
 async def test_send_turn_end_emits_turn_end_event() -> None:
     bus = MagicMock()
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
@@ -1445,10 +1817,17 @@ async def test_send_turn_end_emits_turn_end_event() -> None:
         metadata={"_turn_end": True},
     ))
 
-    assert _sent_ws_payloads(mock_ws) == [
-        {"event": "turn_end", "chat_id": "chat-1"},
-        {"event": "session_updated", "chat_id": "chat-1", "scope": "thread"},
-    ]
+    payloads = _sent_ws_payloads(mock_ws)
+    assert payloads[0] == {
+        "event": "turn_end",
+        "chat_id": "chat-1",
+        "finish_reason": "completed",
+    }
+    assert payloads[1]["event"] == "session_updated"
+    assert payloads[1]["chat_id"] == "chat-1"
+    assert payloads[1]["scope"] == "thread"
+    assert payloads[1]["session_id"].startswith("ses_")
+    assert payloads[1]["project_id"].startswith("prj_")
 
 
 @pytest.mark.asyncio
@@ -1465,10 +1844,41 @@ async def test_send_turn_end_includes_latency_ms_when_present() -> None:
         metadata={"_turn_end": True, "latency_ms": 1500},
     ))
 
-    assert _sent_ws_payloads(mock_ws) == [
-        {"event": "turn_end", "chat_id": "chat-1", "latency_ms": 1500},
-        {"event": "session_updated", "chat_id": "chat-1", "scope": "thread"},
-    ]
+    payloads = _sent_ws_payloads(mock_ws)
+    assert payloads[0] == {
+        "event": "turn_end",
+        "chat_id": "chat-1",
+        "finish_reason": "completed",
+        "latency_ms": 1500,
+    }
+    assert payloads[1]["scope"] == "thread"
+    assert payloads[1]["session_id"].startswith("ses_")
+    assert payloads[1]["project_id"].startswith("prj_")
+
+
+@pytest.mark.asyncio
+async def test_send_turn_end_includes_token_usage_when_present() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={
+            "_turn_end": True,
+            "usage": {"prompt_tokens": 120, "completion_tokens": 34, "total_tokens": 154},
+        },
+    ))
+
+    payloads = _sent_ws_payloads(mock_ws)
+    assert payloads[0]["usage"] == {
+        "prompt_tokens": 120,
+        "completion_tokens": 34,
+        "total_tokens": 154,
+    }
 
 
 @pytest.mark.asyncio
@@ -1486,10 +1896,16 @@ async def test_send_turn_end_includes_goal_state_when_present() -> None:
         metadata={"_turn_end": True, "goal_state": blob},
     ))
 
-    assert _sent_ws_payloads(mock_ws) == [
-        {"event": "turn_end", "chat_id": "chat-1", "goal_state": blob},
-        {"event": "session_updated", "chat_id": "chat-1", "scope": "thread"},
-    ]
+    payloads = _sent_ws_payloads(mock_ws)
+    assert payloads[0] == {
+        "event": "turn_end",
+        "chat_id": "chat-1",
+        "finish_reason": "completed",
+        "goal_state": blob,
+    }
+    assert payloads[1]["scope"] == "thread"
+    assert payloads[1]["session_id"].startswith("ses_")
+    assert payloads[1]["project_id"].startswith("prj_")
 
 
 @pytest.mark.asyncio
@@ -1683,7 +2099,10 @@ async def test_send_session_updated_emits_session_updated_event() -> None:
 
     mock_ws.send.assert_awaited_once()
     body = json.loads(mock_ws.send.await_args.args[0])
-    assert body == {"event": "session_updated", "chat_id": "chat-1"}
+    assert body["event"] == "session_updated"
+    assert body["chat_id"] == "chat-1"
+    assert body["session_id"].startswith("ses_")
+    assert body["project_id"].startswith("prj_")
 
 
 @pytest.mark.asyncio
@@ -1702,7 +2121,11 @@ async def test_send_session_updated_includes_scope_when_present() -> None:
 
     mock_ws.send.assert_awaited_once()
     body = json.loads(mock_ws.send.await_args.args[0])
-    assert body == {"event": "session_updated", "chat_id": "chat-1", "scope": "metadata"}
+    assert body["event"] == "session_updated"
+    assert body["chat_id"] == "chat-1"
+    assert body["scope"] == "metadata"
+    assert body["session_id"].startswith("ses_")
+    assert body["project_id"].startswith("prj_")
 
 
 @pytest.mark.asyncio
@@ -2372,7 +2795,11 @@ async def test_end_to_end_server_pushes_streaming_deltas_to_client(bus: MagicMoc
             ))
 
             turn_end = json.loads(await client.recv())
-            assert turn_end == {"event": "turn_end", "chat_id": chat_id}
+            assert turn_end == {
+                "event": "turn_end",
+                "chat_id": chat_id,
+                "finish_reason": "completed",
+            }
     finally:
         await channel.stop()
         await server_task
@@ -2833,7 +3260,7 @@ def test_parse_envelope_rejects_legacy_and_garbage() -> None:
     assert _parse_envelope('{"type":123}') is None
 
 
-def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
+def test_sessions_list_includes_active_run_started_at(monkeypatch, tmp_path) -> None:
     from websockets.datastructures import Headers
     from websockets.http11 import Request
 
@@ -2842,6 +3269,12 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
 
     bus = MagicMock()
     session_manager = MagicMock()
+    session_manager.read_session_file.side_effect = lambda key: (
+        {"metadata": {}, "messages": []}
+        if key == "websocket:chat-1"
+        else None
+    )
+    session_manager.read_session_metadata.return_value = {"metadata": {}}
     sessions = [
         {
             "key": "websocket:chat-1",
@@ -2861,7 +3294,11 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
     channel = WebSocketChannel(
         {"enabled": True, "allowFrom": ["*"]},
         bus,
-        gateway=_basic_handler(bus, session_manager=session_manager),
+        gateway=_basic_handler(
+            bus,
+            session_manager=session_manager,
+            workspace_path=tmp_path,
+        ),
     )
     channel.gateway.tokens.api_tokens["tok"] = time.monotonic() + 300.0
 
@@ -2875,19 +3312,22 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch) -> None:
 
     assert resp.status_code == 200
     body = json.loads(resp.body.decode())
-    workspace_scope = body["sessions"][0].pop("workspace_scope")
+    session_row = body["sessions"][0]
+    workspace_scope = session_row.pop("workspace_scope")
     assert workspace_scope["project_path"] == str(channel.gateway.media.workspace_path)
     assert workspace_scope["access_mode"] in {"restricted", "full"}
-    assert body["sessions"] == [
-        {
-            "key": "websocket:chat-1",
-            "created_at": "2026-05-19T10:00:00Z",
-            "updated_at": "2026-05-19T10:01:00Z",
-            "title": "Running",
-            "preview": "work",
-            "run_started_at": 1_700_000_000.0,
-        }
-    ]
+    assert session_row.pop("session_id").startswith("ses_")
+    assert session_row.pop("project_id").startswith("prj_")
+    assert session_row["created_at"]
+    assert session_row["updated_at"]
+    session_row.pop("created_at")
+    session_row.pop("updated_at")
+    assert session_row == {
+        "key": "websocket:chat-1",
+        "title": "Running",
+        "preview": "work",
+        "run_started_at": 1_700_000_000.0,
+    }
 
 
 @pytest.mark.parametrize(

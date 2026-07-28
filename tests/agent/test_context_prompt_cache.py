@@ -317,14 +317,13 @@ def test_default_soul_template_contains_execution_rules() -> None:
     assert "multi-step tasks" in soul
 
 
-def test_channel_format_hint_telegram(tmp_path) -> None:
-    """Telegram channel should get messaging-app format hint."""
+def test_channel_format_hint_not_injected_for_removed_channel_guidance(tmp_path) -> None:
+    """Removed channel-specific guidance should not be injected."""
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
     prompt = builder.build_system_prompt(channel="telegram")
-    assert "Format Hint" in prompt
-    assert "messaging app" in prompt
+    assert "Format Hint" not in prompt
 
 
 def test_channel_format_hint_whatsapp(tmp_path) -> None:
@@ -368,7 +367,7 @@ def test_build_messages_passes_channel_to_system_prompt(tmp_path) -> None:
 
     messages = builder.build_messages(
         history=[], current_message="hi",
-        channel="telegram", chat_id="123",
+        channel="qq", chat_id="123",
     )
     system = messages[0]["content"]
     assert "Format Hint" in system
@@ -384,6 +383,8 @@ def test_system_prompt_keeps_message_tool_out_of_current_chat_replies(tmp_path) 
     assert "Do not use the 'message' tool for normal replies in the current chat" in prompt
     assert "When 'generate_image' creates images" in prompt
     assert "call 'message' with the artifact paths in the 'media' parameter" in prompt
+    assert "omit `channel` and `chat_id` so delivery stays in the current conversation" in prompt
+    assert "channel=\"telegram\"" not in prompt
     assert "Wait for the tool results, then answer once" in prompt
 
 

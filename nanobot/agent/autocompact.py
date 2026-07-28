@@ -18,10 +18,16 @@ class AutoCompact:
     _RECENT_SUFFIX_MESSAGES = 8
     _INTERNAL_SESSION_PREFIXES = ("dream:",)
 
-    def __init__(self, sessions: SessionManager, consolidator: Consolidator,
-                 session_ttl_minutes: int = 0):
+    def __init__(
+        self,
+        sessions: SessionManager,
+        consolidator: Consolidator,
+        session_ttl_minutes: int = 0,
+        consolidator_for_session: Callable[[Session], Consolidator | None] | None = None,
+    ):
         self.sessions = sessions
         self.consolidator = consolidator
+        self._consolidator_for_session = consolidator_for_session
         self._ttl = session_ttl_minutes
         self._archiving: set[str] = set()
         self._summaries: dict[str, tuple[str, datetime]] = {}
@@ -61,7 +67,19 @@ class AutoCompact:
             self._archiving.discard(key)
             return
         try:
-            summary = await self.consolidator.compact_idle_session(
+            session = self.sessions.get_or_create(key)
+            consolidator = (
+                self._consolidator_for_session(session)
+                if self._consolidator_for_session is not None
+                else self.consolidator
+            )
+            if consolidator is None:
+                logger.warning(
+                    "Auto-compact skipped for {} because project memory is unresolved",
+                    key,
+                )
+                return
+            summary = await consolidator.compact_idle_session(
                 key, self._RECENT_SUFFIX_MESSAGES,
             )
             if summary and summary != "(nothing)":

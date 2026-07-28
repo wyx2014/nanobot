@@ -141,6 +141,23 @@ class BaseChannel(ABC):
         """
         return
 
+    async def send_narration_delta(
+        self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Deliver public pre-tool action narration.
+
+        Narration is safe, user-facing text and must not contain private model
+        reasoning. Rich workbench channels can move a provisional answer stream
+        into their activity/steps surface when this event arrives.
+        """
+        return
+
+    async def send_narration_end(
+        self, chat_id: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Close the current public narration segment."""
+        return
+
     async def send_file_edit_events(
         self,
         chat_id: str,

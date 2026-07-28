@@ -14,6 +14,7 @@ from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.openai_responses.parsing import parse_response_output
+from nanobot.runtime.plan_policy import PlanPolicyState
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
@@ -133,6 +134,91 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
     assert shared_events.index("end:read_a") < shared_events.index("start:write_a")
     assert shared_events.index("end:read_b") < shared_events.index("start:write_a")
     assert shared_events[-2:] == ["start:write_a", "end:write_a"]
+
+
+@pytest.mark.asyncio
+async def test_runner_plan_barrier_blocks_complex_business_tools() -> None:
+    tools = ToolRegistry()
+    shared_events: list[str] = []
+    tools.register(_DelayTool(
+        "write_file",
+        delay=0,
+        read_only=False,
+        shared_events=shared_events,
+    ))
+    state = PlanPolicyState(forced_reason="explicit_complex_request")
+
+    results, events, fatal, _interactive = await AgentRunner(MagicMock())._execute_tools(
+        AgentRunSpec(
+            initial_messages=[],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        ),
+        [ToolCallRequest(id="write-1", name="write_file", arguments={})],
+        {},
+        {},
+        plan_policy_state=state,
+    )
+
+    assert shared_events == []
+    assert results[0].startswith("Error [PLAN_REQUIRED]")
+    assert events == [{
+        "name": "write_file",
+        "status": "error",
+        "detail": "PLAN_REQUIRED",
+    }]
+    assert fatal is None
+    assert state.correction_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_plan_barrier_requires_retry_after_plan_in_same_response() -> None:
+    tools = ToolRegistry()
+    shared_events: list[str] = []
+    tools.register(_DelayTool(
+        "update_task_progress",
+        delay=0,
+        read_only=False,
+        shared_events=shared_events,
+    ))
+    tools.register(_DelayTool(
+        "web_search",
+        delay=0,
+        read_only=True,
+        shared_events=shared_events,
+    ))
+    state = PlanPolicyState(forced_reason="explicit_complex_request")
+
+    results, events, fatal, _interactive = await AgentRunner(MagicMock())._execute_tools(
+        AgentRunSpec(
+            initial_messages=[],
+            tools=tools,
+            model="test-model",
+            max_iterations=1,
+            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+            concurrent_tools=True,
+        ),
+        [
+            ToolCallRequest(id="plan-1", name="update_task_progress", arguments={}),
+            ToolCallRequest(id="search-1", name="web_search", arguments={}),
+        ],
+        {},
+        {},
+        plan_policy_state=state,
+    )
+
+    assert shared_events == [
+        "start:update_task_progress",
+        "end:update_task_progress",
+    ]
+    assert events[0]["status"] == "ok"
+    assert events[1]["detail"] == "PLAN_REQUIRED"
+    assert results[1].startswith("Error [PLAN_REQUIRED]")
+    assert fatal is None
+    assert state.plan_created is True
+    assert state.correction_count == 0
 
 
 @pytest.mark.asyncio
@@ -450,3 +536,68 @@ async def test_runner_finalizes_after_consecutive_identical_local_reads():
         and "repeated local tool call blocked" in str(msg.get("content"))
     ]
     assert len(blocked_results) == 3
+
+
+@pytest.mark.asyncio
+async def test_runner_switches_from_failed_ifind_to_juyuan():
+    provider = MagicMock()
+    calls = {"n": 0}
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return LLMResponse(
+                content="query iFinD",
+                tool_calls=[ToolCallRequest(
+                    id="ifind-1",
+                    name="exec",
+                    arguments={
+                        "command": (
+                            "cd /workspace/skills/ifind-finance-data && "
+                            "node scripts/call-node.js stock get_stock_info "
+                            """'{"query":"新易盛 300502.SZ"}'"""
+                        )
+                    },
+                )],
+                usage={},
+            )
+        if calls["n"] == 2:
+            tool_result = next(
+                msg["content"]
+                for msg in reversed(messages)
+                if msg.get("role") == "tool"
+            )
+            assert "mcp_juyuan_" in tool_result
+            return LLMResponse(
+                content="switch to Juyuan",
+                tool_calls=[ToolCallRequest(
+                    id="juyuan-1",
+                    name="mcp_juyuan_AShareFinancialReportReview",
+                    arguments={"query": "新易盛 300502.SZ 财务"},
+                )],
+                usage={},
+            )
+        return LLMResponse(content="report completed", tool_calls=[], usage={})
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(side_effect=[
+        '{"ok":true,"status_code":200,"data":{"text":"call failed: status 429"}}',
+        '{"code":0,"results":[{"revenue":"248.42亿元"}]}',
+    ])
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "research 新易盛"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        fail_on_tool_error=False,
+    ))
+
+    assert result.final_content == "report completed"
+    assert [call.args[0] for call in tools.execute.await_args_list] == [
+        "exec",
+        "mcp_juyuan_AShareFinancialReportReview",
+    ]

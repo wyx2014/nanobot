@@ -29,6 +29,8 @@ class CronPayload:
     to: str | None = None  # e.g. phone number
     channel_meta: dict[str, Any] = field(default_factory=dict)
     session_key: str | None = None  # original session key for correct session recording
+    project_id: str | None = None
+    created_session_id: str | None = None
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)

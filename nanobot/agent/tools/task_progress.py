@@ -15,21 +15,28 @@ _STATUSES = ("pending", "running", "completed", "error")
 @tool_parameters(
     tool_parameters_schema(
         description=(
-            "Report user-facing task progress for multi-step work. Use this when a task has "
-            "clear stages such as research, writing, verification, formatting, code changes, "
-            "or report generation. Keep labels short and non-technical. When the stage changes, "
-            "include a brief public note explaining what is happening next."
+            "Publish the complete user-facing plan for a tool-using task. Make this the first "
+            "tool call before business tools, normally with 2-4 outcome-oriented steps. "
+            "Expert-team workflows are runtime-owned and ignore this tool. Re-send the full "
+            "ordered list on every update, preserving every id and title. Every non-terminal snapshot "
+            "must have exactly one running step; only a final all-terminal snapshot may have none."
         ),
         steps=ArraySchema(
             ObjectSchema(
-                id=StringSchema("Stable step id, e.g. research or draft"),
-                title=StringSchema("Short user-facing stage title"),
+                id=StringSchema("Stable step id; never change it within the task"),
+                title=StringSchema(
+                    "Short user goal or deliverable; never a tool name or implementation action"
+                ),
                 status=StringSchema("Step status", enum=_STATUSES),
                 required=["id", "title", "status"],
             ),
-            description="Ordered task stages.",
-            min_items=1,
-            max_items=8,
+            description=(
+                "The complete ordered plan, not a delta and not a tool-call log. Use "
+                "2-4 steps. Use exactly one "
+                "running step until all steps are completed or error."
+            ),
+            min_items=2,
+            max_items=4,
         ),
         note=StringSchema(
             "Optional short public progress note for the user. Do not include private reasoning."
@@ -49,6 +56,7 @@ class TaskProgressTool(Tool, ContextAware):
         self._channel = "websocket"
         self._chat_id = ""
         self._metadata: dict[str, Any] = {}
+        self._plans: dict[str, tuple[tuple[tuple[str, str], ...], int]] = {}
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
@@ -66,10 +74,16 @@ class TaskProgressTool(Tool, ContextAware):
     @property
     def description(self) -> str:
         return (
-            "Update the visible task progress panel for the current conversation. "
-            "Call early for multi-step tasks, then update statuses as work advances. "
-            "Use short stage names that users understand; do not expose tool names. "
-            "Use note for a concise public transition update, never private reasoning."
+            "Publish the visible task plan for the current conversation. For every multi-step or "
+            "complex task expected to call tools, call this first in the first tool batch, before "
+            "any business tool. A single low-risk read may remain planless. "
+            "Provide the complete ordered plan on every call using 2-4 stable steps. Expert-team "
+            "workflow plans are runtime-owned and must not be replaced here. Steps must describe user goals "
+            "or deliverables, never implementation actions such as searching, reading, calling a "
+            "tool, or running a command. Keep ids and titles unchanged across updates, and use "
+            "exactly one running step in every non-terminal snapshot. Zero running steps is valid "
+            "only when every step is terminal (completed or error), immediately before the final "
+            "answer. Use note only for concise public narration, never private reasoning."
         )
 
     @property
@@ -83,37 +97,95 @@ class TaskProgressTool(Tool, ContextAware):
         current_step_id: str = "",
         **_: Any,
     ) -> str:
+        expert_team = self._metadata.get("expert_team")
+        if isinstance(expert_team, dict) and expert_team:
+            # Expert-team plans are created and advanced by the runtime
+            # coordinator.  Treat model-authored updates as an acknowledged
+            # no-op so an older prompt cannot create a competing plan.
+            return (
+                "Workflow plan is runtime-owned; the proposed model plan was "
+                "ignored and the expert-team workflow remains active"
+            )
+        max_steps = 4
+        if not isinstance(steps, list) or not 2 <= len(steps) <= max_steps:
+            return (
+                f"Error: steps must contain the complete 2-{max_steps} item task plan"
+            )
+
         normalized: list[dict[str, str]] = []
-        for index, step in enumerate(steps[:8], start=1):
+        for index, step in enumerate(steps, start=1):
             if not isinstance(step, dict):
-                continue
+                return f"Error: step {index} must be an object"
             title = str(step.get("title") or "").strip()
             if not title:
-                continue
+                return f"Error: step {index} must have a title"
             status = str(step.get("status") or "pending").strip()
             if status not in _STATUSES:
-                status = "pending"
+                return f"Error: step {index} has an invalid status"
             step_id = str(step.get("id") or f"step-{index}").strip() or f"step-{index}"
             normalized.append({"id": step_id, "title": title, "status": status})
 
-        if not normalized:
-            return "Error: steps must contain at least one valid item"
+        step_ids = [step["id"] for step in normalized]
+        if len(set(step_ids)) != len(step_ids):
+            return "Error: every task-plan step id must be unique"
+        running_steps = [step for step in normalized if step["status"] == "running"]
+        has_non_terminal_step = any(
+            step["status"] in {"pending", "running"} for step in normalized
+        )
+        if has_non_terminal_step and len(running_steps) != 1:
+            return "Error: a non-terminal task plan must have exactly one running step"
         if not self._send_callback or not self._chat_id:
             return "Error: task progress is unavailable in this runtime"
 
         public_note = " ".join(str(note or "").split()).strip()[:240]
         current_id = str(current_step_id or "").strip()
         valid_step_ids = {step["id"] for step in normalized}
+        if current_id and current_id not in valid_step_ids:
+            return "Error: current_step_id must match a task-plan step id"
+        if current_id:
+            current_status = next(
+                step["status"] for step in normalized if step["id"] == current_id
+            )
+            if current_status != "running":
+                return "Error: current_step_id must identify the running step"
+        elif running_steps:
+            current_id = running_steps[0]["id"]
 
         metadata = dict(self._metadata)
         metadata["_progress"] = True
+        turn_id = str(
+            metadata.get("_runtime_turn_id")
+            or metadata.get("webui_turn_id")
+            or f"{self._channel}:{self._chat_id}"
+        ).strip()
+        signature = tuple((step["id"], step["title"]) for step in normalized)
+        previous = self._plans.get(turn_id)
+        if previous is not None and previous[0] != signature:
+            return "Error: task-plan ids, order, and titles are immutable within a turn"
+        revision = (previous[1] if previous is not None else 0) + 1
+        self._plans[turn_id] = (signature, revision)
         agent_ui: dict[str, Any] = {
             "kind": "task_progress",
+            "plan_id": f"plan:{turn_id}",
+            "turn_id": turn_id,
+            "plan_kind": "dynamic",
+            "owner": "agent",
+            "policy": "required",
+            "execution": "serial",
+            "status": (
+                "failed"
+                if any(step["status"] == "error" for step in normalized)
+                else "completed"
+                if all(step["status"] == "completed" for step in normalized)
+                else "running"
+            ),
+            "revision": revision,
+            "active_step_ids": [step["id"] for step in running_steps],
             "steps": normalized,
         }
         if public_note:
             agent_ui["note"] = public_note
-        if current_id in valid_step_ids:
+        if current_id:
             agent_ui["current_step_id"] = current_id
         metadata[OUTBOUND_META_AGENT_UI] = agent_ui
         await self._send_callback(

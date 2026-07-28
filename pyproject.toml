@@ -136,6 +136,7 @@ include = [
     "nanobot/**/*.py",
     "nanobot/templates/**/*.md",
     "nanobot/skills/**/*.md",
+    "nanobot/skills/**/*.js",
     "nanobot/skills/**/*.sh",
     "nanobot/web/dist/**/*",
 ]

@@ -14,6 +14,7 @@ from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronJobExecutionResult
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
+from nanobot.security.project_context import PROJECT_CONTEXT_METADATA_KEY
 from nanobot.utils.prompt_templates import render_template
 
 
@@ -83,6 +84,26 @@ async def run_bound_cron_job(
         turn_seed=run_session_key,
         source_label=job.name,
     )
+    raw_project_context = metadata.get(PROJECT_CONTEXT_METADATA_KEY)
+    origin_project_id = (
+        raw_project_context.get("project_id")
+        if isinstance(raw_project_context, dict)
+        else None
+    )
+    if (
+        job.payload.project_id
+        and origin_project_id
+        and origin_project_id != job.payload.project_id
+    ):
+        raise ValueError(
+            f"cron job {job.id} project identity does not match its origin metadata"
+        )
+    if job.payload.project_id:
+        metadata["project_id"] = job.payload.project_id
+        metadata["_parent_project_id"] = job.payload.project_id
+    # A cron run is a new child session. Never reuse the parent's session ID
+    # as the active ProjectContext identity for that child.
+    metadata.pop(PROJECT_CONTEXT_METADATA_KEY, None)
     metadata[CRON_TRIGGER_META] = {
         "job_id": job.id,
         "job_name": job.name,

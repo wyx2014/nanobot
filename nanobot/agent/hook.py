@@ -21,6 +21,11 @@ class AgentHookContext:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     tool_results: list[Any] = field(default_factory=list)
     tool_events: list[dict[str, str]] = field(default_factory=list)
+    # Tool calls rejected by a runtime preflight (for example the dynamic-plan
+    # barrier) still need tool-result messages so the model can self-correct,
+    # but they never actually started and must not be projected as user-visible
+    # activity.
+    hidden_tool_call_ids: set[str] = field(default_factory=set)
     streamed_content: bool = False
     streamed_reasoning: bool = False
     final_content: str | None = None

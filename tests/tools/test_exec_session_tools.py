@@ -380,6 +380,27 @@ def test_list_exec_sessions_reports_running_commands(tmp_path):
     assert "Session terminated." in cleanup
 
 
+def test_exec_session_manager_shutdown_reaps_running_process(tmp_path):
+    async def run() -> tuple[int | None, list]:
+        manager = ExecSessionManager()
+        tool = ExecTool(working_dir=str(tmp_path), timeout=60, session_manager=manager)
+        initial = await tool.execute(
+            command=_python_command("import time; time.sleep(60)"),
+            yield_time_ms=0,
+        )
+        sid = _session_id(initial)
+        session = manager._sessions[sid]
+
+        await manager.shutdown()
+
+        return session.process.returncode, await manager.list()
+
+    returncode, remaining = asyncio.run(run())
+
+    assert returncode is not None
+    assert remaining == []
+
+
 def test_list_exec_sessions_reports_empty_state():
     result = asyncio.run(ListExecSessionsTool(manager=ExecSessionManager()).execute())
 

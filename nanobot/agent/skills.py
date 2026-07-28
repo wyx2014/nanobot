@@ -107,11 +107,25 @@ class SkillsLoader:
         Returns:
             Formatted skills content.
         """
-        parts = [
-            f"### Skill: {name}\n\n{self._strip_frontmatter(markdown)}"
-            for name in skill_names
-            if (markdown := self.load_skill(name))
-        ]
+        entries = {
+            entry["name"]: entry
+            for entry in self.list_skills(filter_unavailable=False)
+        }
+        parts: list[str] = []
+        for name in skill_names:
+            entry = entries.get(name)
+            markdown = self.load_skill(name)
+            if entry is None or not markdown:
+                continue
+            skill_dir = Path(entry["path"]).parent
+            parts.append(
+                f"### Skill: {name}\n\n"
+                f"- Registry source: `{entry['source']}`\n"
+                f"- Skill directory: `{skill_dir}`\n"
+                "- This path is already resolved by the Skill registry. Use it directly; "
+                "do not search the filesystem for another copy.\n\n"
+                f"{self._strip_frontmatter(markdown)}"
+            )
         return "\n\n---\n\n".join(parts)
 
     def build_skills_summary(

@@ -61,10 +61,15 @@ _FILE_EDIT_TOOL_NAMES: frozenset[str] = frozenset({
 _TURN_DISPLAY_EVENTS: frozenset[str] = frozenset({
     "reasoning_delta",
     "reasoning_end",
+    "narration_delta",
+    "narration_end",
     "delta",
     "stream_end",
     "message",
     "file_edit",
+    "artifact_created",
+    "turn_started",
+    "turn_completed",
     "turn_end",
 })
 
@@ -161,22 +166,62 @@ def _record_json_line(record: dict[str, Any]) -> str:
 def _read_transcript_file(path: Path) -> list[dict[str, Any]]:
     lines_out: list[dict[str, Any]] = []
     try:
-        with open(path, encoding="utf-8") as f:
-            for line_no, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("bad jsonl at {} line {}", path, line_no)
-                    continue
-                if isinstance(obj, dict):
-                    lines_out.append(obj)
+        raw_lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     except OSError as e:
         logger.warning("read transcript failed {}: {}", path, e)
         return []
+    valid_raw: list[str] = []
+    for line_no, raw_line in enumerate(raw_lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            valid_raw.append(raw_line)
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            _quarantine_corrupt_transcript_tail(
+                path,
+                valid_raw=valid_raw,
+                corrupt_tail=raw_lines[line_no - 1:],
+                line_no=line_no,
+            )
+            break
+        valid_raw.append(raw_line)
+        if isinstance(obj, dict):
+            lines_out.append(obj)
     return lines_out
+
+
+def _quarantine_corrupt_transcript_tail(
+    path: Path,
+    *,
+    valid_raw: list[str],
+    corrupt_tail: list[str],
+    line_no: int,
+) -> None:
+    """Preserve a damaged JSONL tail and atomically keep the valid prefix."""
+    suffix = f".corrupt-{time.time_ns()}"
+    backup = path.with_name(path.name + suffix)
+    temp = path.with_name(path.name + f".repair-{uuid.uuid4().hex}.tmp")
+    try:
+        backup.write_text("".join(corrupt_tail), encoding="utf-8")
+        with temp.open("w", encoding="utf-8") as handle:
+            handle.write("".join(valid_raw))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        logger.error(
+            "bad jsonl at {} line {}; corrupt tail moved to {}",
+            path,
+            line_no,
+            backup,
+        )
+    except OSError:
+        logger.exception("failed to quarantine corrupt transcript tail at {}", path)
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _records_bytes(records: list[dict[str, Any]]) -> int:
@@ -615,8 +660,9 @@ def webui_message_source(metadata: dict[str, Any] | None) -> dict[str, str] | No
 class WebUITranscriptRecorder:
     """Prepare and persist WebUI wire events without leaking UI rules into channels."""
 
-    def __init__(self, log: Any = logger) -> None:
+    def __init__(self, log: Any = logger, journal: Any | None = None) -> None:
         self._log = log
+        self._journal = journal
         self._turn_sequences: dict[tuple[str, str], int] = {}
 
     def client_turn_metadata(self, value: Any) -> dict[str, str]:
@@ -698,11 +744,20 @@ class WebUITranscriptRecorder:
         *,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        session_key = self._session_key_for_append(chat_id, metadata)
         try:
             dup = json.loads(json.dumps(event, ensure_ascii=False))
-            append_transcript_object(self._session_key_for_append(chat_id, metadata), dup)
+            if (
+                self._journal is not None
+                and self._journal.state.get_session(session_key) is not None
+            ):
+                self._journal.append(session_key, dup)
+            else:
+                append_transcript_object(session_key, dup)
         except (OSError, ValueError, TypeError) as e:
             self._log.warning("webui transcript append failed: {}", e)
+            if self._journal is not None:
+                raise
 
     def _next_turn_seq(self, chat_id: str, turn_id: str) -> int:
         key = (chat_id, turn_id)
@@ -1278,6 +1333,7 @@ def replay_transcript_to_ui_messages(
     _ts_base = int(time.time() * 1000)
     closed_turn_ids: set[str] = set()
     replay_turn_aliases: dict[str, str] = {}
+    narration_parts: dict[str, list[str]] = {}
 
     def _new_id(prefix: str, idx: int) -> str:
         return f"{prefix}-{idx}-{uuid.uuid4().hex[:8]}"
@@ -1339,6 +1395,92 @@ def replay_transcript_to_ui_messages(
         if active_file_edit_segment_id:
             active_activity_segment_id = None
             active_file_edit_segment_id = None
+
+    def absorb_narration(
+        rec: dict[str, Any],
+        chunk: str,
+        idx: int,
+    ) -> None:
+        nonlocal active_activity_segment_id, buffer_message_id, buffer_parts
+        stream_id = rec.get("replaces_stream_id") or rec.get("stream_id")
+        stream_key = str(stream_id or f"turn:{rec.get('turn_id') or idx}")
+        narration_parts.setdefault(stream_key, []).append(chunk)
+        combined = "".join(narration_parts[stream_key])
+        turn_fields = _turn_fields(rec, "activity")
+        preserved_activity_segment_id: str | None = None
+
+        # Remove the provisional assistant answer that produced this text.
+        # It was streamed before the provider revealed the following tool call.
+        for message_index in range(len(messages) - 1, -1, -1):
+            candidate = messages[message_index]
+            if candidate.get("role") == "user":
+                break
+            if candidate.get("role") != "assistant" or candidate.get("kind") == "trace":
+                continue
+            candidate_stream = candidate.get("streamId")
+            if (
+                (stream_id and candidate_stream == stream_id)
+                or (
+                    _same_turn(candidate, turn_fields)
+                    and str(candidate.get("content") or "") == combined
+                )
+            ):
+                candidate_segment = candidate.get("activitySegmentId")
+                if isinstance(candidate_segment, str) and candidate_segment:
+                    preserved_activity_segment_id = candidate_segment
+                if str(candidate.get("reasoning") or "").strip():
+                    retained = {
+                        **candidate,
+                        "content": "",
+                        "isStreaming": False,
+                        "reasoningStreaming": False,
+                    }
+                    retained.pop("streamId", None)
+                    messages[message_index] = retained
+                else:
+                    messages.pop(message_index)
+                if buffer_message_id == candidate.get("id"):
+                    buffer_message_id = None
+                    buffer_parts = []
+                break
+
+        if preserved_activity_segment_id is not None:
+            active_activity_segment_id = preserved_activity_segment_id
+        segment = preserved_activity_segment_id or _ensure_activity_segment()
+        for message_index in range(len(messages) - 1, -1, -1):
+            candidate = messages[message_index]
+            if candidate.get("role") == "user":
+                break
+            if (
+                candidate.get("kind") == "trace"
+                and candidate.get("narrationStreamId") == stream_key
+            ):
+                traces = list(candidate.get("traces") or [])
+                if traces:
+                    traces[-1] = combined
+                else:
+                    traces = [combined]
+                messages[message_index] = {
+                    **candidate,
+                    "content": "",
+                    "traces": traces,
+                    "narration": combined,
+                    **turn_fields,
+                }
+                return
+
+        messages.append({
+            "id": _new_id("tr", idx),
+            "role": "tool",
+            "kind": "trace",
+            "content": "",
+            "traces": [combined],
+            "narration": combined,
+            "narrationStreamId": stream_key,
+            "activitySegmentId": segment,
+            **turn_fields,
+            "createdAt": _ts_base + idx,
+        })
 
     def attach_reasoning_chunk(
         prev: list[dict[str, Any]],
@@ -1487,6 +1629,26 @@ def replay_transcript_to_ui_messages(
                     "latencyMs": latency_ms,
                     "isStreaming": False,
                 }
+                return
+
+    def stamp_usage(raw_usage: Any) -> None:
+        if not isinstance(raw_usage, dict):
+            return
+        input_tokens = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens", 0))
+        output_tokens = raw_usage.get("completion_tokens", raw_usage.get("output_tokens", 0))
+        if not isinstance(input_tokens, int | float):
+            input_tokens = 0
+        if not isinstance(output_tokens, int | float):
+            output_tokens = 0
+        usage = {
+            "inputTokens": max(0, int(input_tokens)),
+            "outputTokens": max(0, int(output_tokens)),
+        }
+        if not usage["inputTokens"] and not usage["outputTokens"]:
+            return
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant" and messages[i].get("kind") != "trace":
+                messages[i] = {**messages[i], "usage": usage}
                 return
 
     def record_prompt_index(prompt: dict[str, Any] | None) -> None:
@@ -1800,6 +1962,11 @@ def replay_transcript_to_ui_messages(
                             "role": "assistant",
                             "content": "",
                             "isStreaming": True,
+                            **(
+                                {"streamId": rec["stream_id"]}
+                                if isinstance(rec.get("stream_id"), str)
+                                else {}
+                            ),
                             **_turn_fields(rec, "answer"),
                             "createdAt": _ts_base + idx,
                         },
@@ -1812,6 +1979,11 @@ def replay_transcript_to_ui_messages(
                         **m,
                         "content": combined,
                         "isStreaming": True,
+                        **(
+                            {"streamId": rec["stream_id"]}
+                            if isinstance(rec.get("stream_id"), str)
+                            else {}
+                        ),
                         **_turn_fields(rec, "answer"),
                     }
                     break
@@ -1832,6 +2004,11 @@ def replay_transcript_to_ui_messages(
                             "role": "assistant",
                             "content": final_text,
                             "isStreaming": True,
+                            **(
+                                {"streamId": rec["stream_id"]}
+                                if isinstance(rec.get("stream_id"), str)
+                                else {}
+                            ),
                             **_turn_fields(rec, "answer"),
                             "createdAt": _ts_base + idx,
                         },
@@ -1843,11 +2020,32 @@ def replay_transcript_to_ui_messages(
                                 **m,
                                 "content": final_text,
                                 "isStreaming": True,
+                                **(
+                                    {"streamId": rec["stream_id"]}
+                                    if isinstance(rec.get("stream_id"), str)
+                                    else {}
+                                ),
                                 **_turn_fields(rec, "answer"),
                             }
                             break
             buffer_message_id = None
             buffer_parts = []
+            continue
+
+        if ev == "narration_delta":
+            if suppress_until_turn_end:
+                continue
+            chunk = rec.get("text")
+            if not isinstance(chunk, str) or not chunk:
+                continue
+            close_file_edit_phase_before_activity()
+            absorb_narration(rec, chunk, idx)
+            continue
+
+        if ev == "narration_end":
+            stream_id = rec.get("replaces_stream_id") or rec.get("stream_id")
+            if stream_id is not None:
+                narration_parts.pop(str(stream_id), None)
             continue
 
         if ev == "reasoning_delta":
@@ -1867,13 +2065,18 @@ def replay_transcript_to_ui_messages(
             continue
 
         if ev == "message":
-            if suppress_until_turn_end and rec.get("kind") in (
-                "tool_hint",
-                "progress",
-                "reasoning",
-            ):
-                continue
             kind = rec.get("kind")
+            agent_ui = rec.get("agent_ui")
+            structured_events = _normalize_tool_events(rec.get("tool_events"))
+            if suppress_until_turn_end:
+                if kind == "reasoning":
+                    continue
+                if (
+                    kind in ("tool_hint", "progress")
+                    and not isinstance(agent_ui, dict)
+                    and not structured_events
+                ):
+                    continue
             if kind == "reasoning":
                 line = rec.get("text")
                 if not isinstance(line, str) or not line:
@@ -1883,8 +2086,6 @@ def replay_transcript_to_ui_messages(
                 close_reasoning(messages)
                 continue
             if kind in ("tool_hint", "progress"):
-                agent_ui = rec.get("agent_ui")
-                structured_events = _normalize_tool_events(rec.get("tool_events"))
                 visible_structured_events = _filter_covered_file_edit_tool_events(messages, structured_events)
                 structured = tool_trace_lines_from_events(visible_structured_events)
                 text = rec.get("text")
@@ -1907,6 +2108,7 @@ def replay_transcript_to_ui_messages(
                     last
                     and last.get("kind") == "trace"
                     and not last.get("isStreaming")
+                    and not last.get("narration")
                     and not (
                         isinstance(agent_ui, dict)
                         and agent_ui.get("kind") == "task_progress"
@@ -1985,7 +2187,7 @@ def replay_transcript_to_ui_messages(
                 suppress_until_turn_end = True
             continue
 
-        if ev == "turn_end":
+        if ev in {"turn_completed", "turn_end"}:
             suppress_until_turn_end = False
             active_activity_segment_id = None
             active_file_edit_segment_id = None
@@ -1998,10 +2200,68 @@ def replay_transcript_to_ui_messages(
             for i, m in enumerate(messages):
                 if m.get("isStreaming"):
                     messages[i] = {**m, "isStreaming": False}
+                agent_ui = m.get("agentUI")
+                if (
+                    ev == "turn_completed"
+                    and isinstance(agent_ui, dict)
+                    and agent_ui.get("kind") == "task_progress"
+                    and (
+                        not isinstance(turn_id, str)
+                        or not turn_id
+                        or m.get("turnId") in {None, turn_id}
+                    )
+                ):
+                    turn = rec.get("turn")
+                    terminal_status = (
+                        str(turn.get("status") or "")
+                        if isinstance(turn, dict)
+                        else ""
+                    )
+                    steps = agent_ui.get("steps")
+                    if isinstance(steps, list):
+                        finalized_steps = [
+                            {
+                                **step,
+                                "status": (
+                                    (
+                                        "skipped"
+                                        if step.get("status") == "pending"
+                                        else "completed"
+                                    )
+                                    if terminal_status == "completed"
+                                    and isinstance(step, dict)
+                                    and step.get("status") in {"pending", "running"}
+                                    else (
+                                        (
+                                            "interrupted"
+                                            if terminal_status == "interrupted"
+                                            else "skipped"
+                                            if step.get("status") == "pending"
+                                            else "error"
+                                        )
+                                        if isinstance(step, dict)
+                                        and step.get("status") in {"pending", "running"}
+                                        else step.get("status")
+                                    )
+                                ),
+                            }
+                            if isinstance(step, dict)
+                            else step
+                            for step in steps
+                        ]
+                        messages[i] = {
+                            **messages[i],
+                            "agentUI": {
+                                **agent_ui,
+                                "steps": finalized_steps,
+                                "current_step_id": None,
+                            },
+                        }
             prune_reasoning_only()
             lat = rec.get("latency_ms")
             if isinstance(lat, (int, float)) and lat >= 0:
                 stamp_latency(int(lat))
+            stamp_usage(rec.get("usage"))
             buffer_message_id = None
             buffer_parts = []
             continue
@@ -2016,6 +2276,7 @@ def replay_transcript_to_ui_messages(
             messages[i] = {**m, "content": augment_assistant_text(m["content"])}
         m.pop("isStreaming", None)
         m.pop("reasoningStreaming", None)
+        m.pop("narrationStreamId", None)
     return messages
 
 
@@ -2032,7 +2293,7 @@ def has_pending_tool_calls(lines: list[dict[str, Any]]) -> bool:
     """Return True when the selected transcript tail looks like an unfinished turn."""
     for rec in reversed(lines):
         ev = rec.get("event")
-        if ev == "turn_end":
+        if ev in {"turn_completed", "turn_end"}:
             return False
         if ev == "user":
             return False
@@ -2043,7 +2304,10 @@ def has_pending_tool_calls(lines: list[dict[str, Any]]) -> bool:
             "stream_end",
             "reasoning_delta",
             "reasoning_end",
+            "narration_delta",
+            "narration_end",
             "file_edit",
+            "artifact_created",
         }:
             return True
         if ev in {WEBUI_FORK_MARKER_EVENT}:

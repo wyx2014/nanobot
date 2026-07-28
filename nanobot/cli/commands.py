@@ -97,6 +97,59 @@ EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 _REASONING_SENTENCE_ENDINGS = (".", "!", "?", "。", "！", "？")
 _REASONING_FLUSH_CHARS = 60
 
+
+def _ensure_gateway_tty_signal_mode() -> None:
+    """Restore normal terminal signal handling before the gateway event loop."""
+    if os.name != "posix":
+        return
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[3] |= termios.ISIG | termios.ICANON | termios.ECHO
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except (AttributeError, OSError, ValueError, termios.error):
+        return
+
+
+def _install_gateway_shutdown_handlers(
+    loop: asyncio.AbstractEventLoop,
+    shutdown_event: asyncio.Event,
+    service_tasks: list[asyncio.Task[Any]],
+    notify: Callable[[str], Any],
+) -> Callable[[], None]:
+    """Turn SIGINT/SIGTERM into one graceful stop and one forced cancellation."""
+    received = 0
+    installed: list[signal.Signals] = []
+
+    def request_shutdown() -> None:
+        nonlocal received
+        received += 1
+        if received == 1:
+            notify("\nShutting down... Press Ctrl+C again to force.")
+            shutdown_event.set()
+            return
+        for task in service_tasks:
+            task.cancel()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, request_shutdown)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+        installed.append(signum)
+
+    def restore() -> None:
+        for signum in installed:
+            with suppress(Exception):
+                loop.remove_signal_handler(signum)
+
+    return restore
+
+
 _HEARTBEAT_PREAMBLE = (
     "[Your response will be delivered directly to the user's messaging app. "
     "Output ONLY the final user-facing message. Never reference internal "
@@ -985,12 +1038,6 @@ def _run_gateway(
         provider_signature=provider_snapshot.signature,
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
     )
-    WebuiTurnCoordinator(
-        bus=bus,
-        sessions=session_manager,
-        schedule_background=lambda coro: agent._schedule_background(coro),
-    ).subscribe(runtime_events)
-
     from nanobot.bus.events import OutboundMessage
     from nanobot.session.keys import session_key_for_channel
 
@@ -1193,7 +1240,21 @@ def _run_gateway(
         webui_static_dist=webui_static_dist,
         webui_runtime_surface=webui_runtime_surface,
         webui_runtime_capabilities=webui_runtime_capabilities,
+        webui_project_memory_pipeline=agent.project_memory,
+        webui_thread_runtime_registry=getattr(agent, "thread_runtime_registry", None),
     )
+    channel_map = getattr(channels, "channels", {})
+    websocket_channel = (
+        channel_map.get("websocket")
+        if isinstance(channel_map, dict)
+        else None
+    )
+    WebuiTurnCoordinator(
+        bus=bus,
+        sessions=session_manager,
+        schedule_background=lambda coro: agent._schedule_background(coro),
+        transcripts=getattr(websocket_channel, "_transcripts", None),
+    ).subscribe(runtime_events)
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -1317,29 +1378,82 @@ def _run_gateway(
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
     async def run():
+        shutdown_event = asyncio.Event()
+        service_tasks: list[asyncio.Task[Any]] = []
+        transient_tasks: list[asyncio.Task[Any]] = []
+        shutdown_waiter: asyncio.Task[bool] | None = None
+        services_done: asyncio.Future[list[Any]] | None = None
+        restore_signal_handlers: Callable[[], None] = lambda: None
         try:
             await cron.start()
-            tasks = [
-                agent.run(),
-                channels.start_all(),
-            ]
+            service_tasks.extend([
+                asyncio.create_task(agent.run(), name="nanobot-agent-loop"),
+                asyncio.create_task(
+                    channels.start_all(),
+                    name="nanobot-channel-manager",
+                ),
+            ])
             if health_server_enabled:
-                tasks.append(_health_server(config.gateway.host, port))
+                service_tasks.append(asyncio.create_task(
+                    _health_server(config.gateway.host, port),
+                    name="nanobot-health-server",
+                ))
             if open_browser_url:
-                tasks.append(_open_browser_when_ready())
-            await asyncio.gather(*tasks)
+                transient_tasks.append(asyncio.create_task(
+                    _open_browser_when_ready(),
+                    name="nanobot-open-browser",
+                ))
+            _ensure_gateway_tty_signal_mode()
+            restore_signal_handlers = _install_gateway_shutdown_handlers(
+                asyncio.get_running_loop(),
+                shutdown_event,
+                service_tasks,
+                console.print,
+            )
+            shutdown_waiter = asyncio.create_task(
+                shutdown_event.wait(),
+                name="nanobot-shutdown-signal",
+            )
+            services_done = asyncio.gather(*service_tasks, *transient_tasks)
+            done, _pending = await asyncio.wait(
+                [services_done, shutdown_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if services_done in done:
+                await services_done
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        except asyncio.CancelledError:
+            pass
         except Exception:
             import traceback
 
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
-            await agent.close_mcp()
-            cron.stop()
+            restore_signal_handlers()
+            if shutdown_waiter is not None:
+                shutdown_waiter.cancel()
             agent.stop()
+            cron.stop()
             await channels.stop_all()
+            for task in (*service_tasks, *transient_tasks):
+                task.cancel()
+            if service_tasks or transient_tasks:
+                await asyncio.gather(
+                    *service_tasks,
+                    *transient_tasks,
+                    return_exceptions=True,
+                )
+            if services_done is not None:
+                if not services_done.done():
+                    services_done.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await services_done
+            # Let subprocess pipe connection_lost callbacks queued by MCP and
+            # exec cleanup run before asyncio.run() closes this event loop.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
             # Flush all cached sessions to durable storage before exit.
             # This prevents data loss on filesystems with write-back
             # caching (rclone VFS, NFS, FUSE mounts, etc.).

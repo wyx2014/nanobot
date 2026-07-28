@@ -44,6 +44,29 @@ class TestMemoryStoreBasicIO:
         assert "Long-term Memory" in ctx
         assert "important fact" in ctx
 
+    def test_memory_summary_takes_precedence_and_rollout_projection_is_synced(self, store):
+        store.write_memory("full handbook")
+        store.write_memory_summary("compact navigation")
+        store.write_raw_memories("raw inputs")
+        store.sync_rollout_summaries(
+            {
+                "session-a": "summary A",
+                "session-b": "summary B",
+            }
+        )
+
+        assert "compact navigation" in store.get_memory_context()
+        assert "full handbook" not in store.get_memory_context()
+        assert store.raw_memories_file.read_text(encoding="utf-8") == "raw inputs"
+        assert {
+            path.name for path in store.rollout_summaries_dir.glob("*.md")
+        } == {"session-a.md", "session-b.md"}
+
+        store.sync_rollout_summaries({"session-b": "updated B"})
+        assert {
+            path.name for path in store.rollout_summaries_dir.glob("*.md")
+        } == {"session-b.md"}
+
 
 class TestHistoryWithCursor:
     def test_append_history_returns_cursor(self, store):

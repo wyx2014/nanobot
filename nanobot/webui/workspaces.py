@@ -19,8 +19,11 @@ from nanobot.security.workspace_access import (
     default_workspace_scope,
     validate_workspace_scope_payload,
 )
+from nanobot.storage.state import SessionProjectMismatch, StateStore
 
 WEBUI_WORKSPACE_STATE_SCHEMA_VERSION = 1
+PROJECT_ID_METADATA_KEY = "project_id"
+SESSION_ID_METADATA_KEY = "session_id"
 _MAX_STATE_FILE_BYTES = 128 * 1024
 _DEFAULT_ACCESS_MODES = {"default", "full"}
 _LEGACY_RESTRICTED_DEFAULT_ACCESS_MODE = "restricted"
@@ -168,10 +171,12 @@ class WebUIWorkspaceController:
         session_manager: Any | None,
         default_workspace: Path,
         default_restrict_to_workspace: bool,
+        state_store: StateStore | None = None,
     ) -> None:
         self._sessions = session_manager
         self._default_workspace = default_workspace
         self._default_restrict_to_workspace = default_restrict_to_workspace
+        self._state = state_store
 
     def default_scope(self) -> WorkspaceScope:
         return default_scope_for_webui(
@@ -179,15 +184,34 @@ class WebUIWorkspaceController:
             self._default_restrict_to_workspace,
         )
 
-    def scope_for_session_key(self, session_key: str) -> WorkspaceScope:
-        if self._sessions is None:
-            return self.default_scope()
-        metadata_reader = getattr(self._sessions, "read_session_metadata", None)
-        if callable(metadata_reader):
-            data = metadata_reader(session_key)
-        else:
-            data = self._sessions.read_session_file(session_key)
-        metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+    def scope_for_session_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        state_project: Any | None = None,
+    ) -> WorkspaceScope:
+        """Resolve a workspace scope from already-loaded projection data.
+
+        Session list routes call this in a loop.  Accepting the SQLite project
+        and the JSONL metadata record avoids reopening both stores per row.
+        """
+        if state_project is not None:
+            raw_scope = (
+                metadata.get(WORKSPACE_SCOPE_METADATA_KEY)
+                if isinstance(metadata, dict)
+                else None
+            )
+            access_mode = (
+                raw_scope.get("access_mode")
+                if isinstance(raw_scope, dict)
+                and isinstance(raw_scope.get("access_mode"), str)
+                else self.default_scope().access_mode
+            )
+            return build_workspace_scope(
+                state_project.canonical_root_path,
+                access_mode,
+                source_channel=_WEBUI_SCOPE_CHANNEL,
+            )
         if not isinstance(metadata, dict) or WORKSPACE_SCOPE_METADATA_KEY not in metadata:
             return self.default_scope()
         try:
@@ -199,6 +223,32 @@ class WebUIWorkspaceController:
             )
         except WorkspaceScopeError:
             return self.default_scope()
+
+    def scope_for_session_key(self, session_key: str) -> WorkspaceScope:
+        state_session = self._state.get_session(session_key) if self._state is not None else None
+        state_project = (
+            self._state.get_project(state_session.project_id)
+            if self._state is not None and state_session is not None
+            else None
+        )
+        if self._sessions is None:
+            if state_project is None:
+                return self.default_scope()
+            return build_workspace_scope(
+                state_project.canonical_root_path,
+                self.default_scope().access_mode,
+                source_channel=_WEBUI_SCOPE_CHANNEL,
+            )
+        metadata_reader = getattr(self._sessions, "read_session_metadata", None)
+        if callable(metadata_reader):
+            data = metadata_reader(session_key)
+        else:
+            data = self._sessions.read_session_file(session_key)
+        metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+        return self.scope_for_session_metadata(
+            metadata,
+            state_project=state_project,
+        )
 
     def payload(self, *, controls_available: bool) -> dict[str, Any]:
         return workspaces_payload(
@@ -279,9 +329,49 @@ class WebUIWorkspaceController:
             raise WorkspaceScopeError("chat_running", status=409)
         return scope
 
-    def persist_scope(self, chat_id: str, scope: WorkspaceScope) -> None:
-        if self._sessions is not None:
-            session = self._sessions.get_or_create(f"websocket:{chat_id}")
+    def persist_scope(self, chat_id: str, scope: WorkspaceScope) -> dict[str, str]:
+        binding: dict[str, str] = {}
+        session_key = f"websocket:{chat_id}"
+        session = (
+            self._sessions.get_or_create(session_key)
+            if self._sessions is not None
+            else None
+        )
+        has_activity = bool(session.messages) if session is not None else False
+        if self._state is not None:
+            try:
+                project, state_session = self._state.ensure_session_for_project(
+                    session_key,
+                    scope.project_path,
+                    project_name=scope.project_name,
+                    event_log_path=(
+                        self._sessions.session_path(session_key)
+                        if self._sessions is not None
+                        else None
+                    ),
+                    title=(
+                        str(session.metadata.get("title") or "")
+                        if session is not None
+                        else ""
+                    ),
+                    metadata={WORKSPACE_SCOPE_METADATA_KEY: scope.metadata()},
+                    artifact_index_initialized=not has_activity,
+                    allow_draft_rebind=not has_activity,
+                )
+            except SessionProjectMismatch as exc:
+                raise WorkspaceScopeError(
+                    "session_project_mismatch",
+                    status=409,
+                ) from exc
+            if session is not None:
+                session.metadata[PROJECT_ID_METADATA_KEY] = project.id
+                session.metadata[SESSION_ID_METADATA_KEY] = state_session.id
+            binding = {
+                "project_id": project.id,
+                "session_id": state_session.id,
+            }
+        if session is not None:
             session.metadata["webui"] = True
             session.metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
             self._sessions.save(session)
+        return binding
