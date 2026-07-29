@@ -1882,6 +1882,42 @@ async def test_send_turn_end_includes_token_usage_when_present() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_turn_usage_updated_emits_live_estimate() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={
+            "_turn_usage_update": True,
+            "_runtime_turn_id": "turn-usage",
+            "usage_estimated": True,
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 34,
+                "total_tokens": 1234,
+            },
+        },
+    ))
+
+    assert _sent_ws_payloads(mock_ws) == [{
+        "event": "turn_usage_updated",
+        "chat_id": "chat-1",
+        "turn_id": "turn-usage",
+        "estimated": True,
+        "usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 34,
+            "total_tokens": 1234,
+        },
+    }]
+
+
+@pytest.mark.asyncio
 async def test_send_turn_end_includes_goal_state_when_present() -> None:
     bus = MagicMock()
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))

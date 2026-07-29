@@ -13,6 +13,22 @@ import pytest
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SkillsLoader
 
 
+def test_removed_legacy_skills_are_not_builtin_discoverable(tmp_path: Path) -> None:
+    loader = SkillsLoader(tmp_path, builtin_skills_dir=BUILTIN_SKILLS_DIR)
+    names = {
+        entry["name"]
+        for entry in loader.list_skills(filter_unavailable=False)
+    }
+
+    assert names.isdisjoint({
+        "tmux",
+        "update-setup",
+        "summarize",
+        "image-generation",
+        "github",
+    })
+
+
 def test_builtin_ifind_skill_is_registry_discoverable(tmp_path: Path) -> None:
     loader = SkillsLoader(tmp_path, builtin_skills_dir=BUILTIN_SKILLS_DIR)
 

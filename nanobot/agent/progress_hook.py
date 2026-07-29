@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.utils.helpers import IncrementalThinkExtractor, strip_think
+from nanobot.utils.helpers import (
+    IncrementalThinkExtractor,
+    estimate_message_tokens,
+    strip_think,
+)
 from nanobot.utils.progress_events import (
     build_tool_event_finish_payloads,
     build_tool_event_start_payload,
@@ -53,6 +58,12 @@ class AgentProgressHook(AgentHook):
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
         self._pending_stream_end = False
+        self._usage_snapshot: dict[str, int] = {}
+        self._usage_answer_buf = ""
+        self._usage_reasoning_buf = ""
+        self._usage_last_emit_at = 0.0
+        self._usage_context: AgentHookContext | None = None
+        self._usage_is_estimated = False
 
     def wants_streaming(self) -> bool:
         return self._on_stream is not None
@@ -99,6 +110,91 @@ class AgentProgressHook(AgentHook):
             await self.emit_reasoning_end()
             if self._on_stream:
                 await self._on_stream(incremental)
+        self._usage_answer_buf += incremental
+        await self._emit_live_usage(context)
+
+    async def on_usage(
+        self,
+        context: AgentHookContext,
+        usage: dict[str, int],
+        *,
+        estimated: bool,
+    ) -> None:
+        self._usage_context = context
+        self._usage_snapshot = {
+            str(key): int(value)
+            for key, value in usage.items()
+            if isinstance(value, int | float)
+        }
+        self._usage_is_estimated = estimated
+        if estimated:
+            self._usage_answer_buf = ""
+            self._usage_reasoning_buf = ""
+        await self._publish_usage(self._usage_snapshot, estimated=estimated)
+        if not estimated:
+            self._usage_answer_buf = ""
+            self._usage_reasoning_buf = ""
+        self._usage_last_emit_at = time.monotonic()
+
+    async def _emit_live_usage(
+        self,
+        context: AgentHookContext,
+        *,
+        force: bool = False,
+    ) -> None:
+        if not self._usage_snapshot:
+            return
+        if not self._usage_is_estimated:
+            return
+        if not self._usage_answer_buf and not self._usage_reasoning_buf:
+            return
+        now = time.monotonic()
+        if not force and now - self._usage_last_emit_at < 0.5:
+            return
+        completion_estimate = estimate_message_tokens({
+            "role": "assistant",
+            "content": self._usage_answer_buf,
+            "reasoning_content": self._usage_reasoning_buf,
+        })
+        prompt_tokens = max(0, int(self._usage_snapshot.get("prompt_tokens", 0)))
+        completion_tokens = max(
+            0,
+            int(self._usage_snapshot.get("completion_tokens", 0))
+            + completion_estimate,
+        )
+        payload = {
+            **self._usage_snapshot,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        confirmed_new_tokens = self._usage_snapshot.get("confirmed_new_tokens")
+        if confirmed_new_tokens is not None:
+            payload["new_tokens"] = max(
+                0,
+                int(confirmed_new_tokens) + completion_estimate,
+            )
+        context.usage = dict(payload)
+        await self._publish_usage(payload, estimated=True)
+        self._usage_last_emit_at = now
+
+    async def _publish_usage(
+        self,
+        usage: dict[str, int],
+        *,
+        estimated: bool,
+    ) -> None:
+        if (
+            self._channel != "websocket"
+            or self._on_progress is None
+            or not self._on_progress_accepts(self._on_progress, "usage")
+        ):
+            return
+        await self._on_progress(
+            "",
+            usage=usage,
+            usage_estimated=estimated,
+        )
 
     async def _emit_stream_end(self, *, resuming: bool, stream_kind: str) -> None:
         if not self._on_stream_end:
@@ -112,6 +208,7 @@ class AgentProgressHook(AgentHook):
             await self._on_stream_end(resuming=resuming)
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+        await self._emit_live_usage(context, force=True)
         await self.emit_reasoning_end()
         if resuming and context.response is None:
             # Provider-level recovery happens before the final response (and
@@ -203,6 +300,10 @@ class AgentProgressHook(AgentHook):
         ):
             self._reasoning_open = True
             await self._on_progress(reasoning_content, reasoning=True)
+        if reasoning_content:
+            self._usage_reasoning_buf += reasoning_content
+            if self._usage_context is not None:
+                await self._emit_live_usage(self._usage_context)
 
     async def emit_reasoning_end(self) -> None:
         """Close the current reasoning stream segment, if any was open."""

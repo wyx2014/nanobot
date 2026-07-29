@@ -44,6 +44,69 @@ def test_desktop_playwright_mcp_migration_pins_latest() -> None:
     assert cli_commands._pin_desktop_playwright_mcp(config) is False
 
 
+def test_desktop_first_launch_installs_voice_and_mcp_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nanobot.config.loader import get_config_path, load_config, set_config_path
+
+    original_config_path = get_config_path()
+    config_path = tmp_path / "desktop" / "config.json"
+    monkeypatch.delenv("JUYUAN_MCP_TOKEN", raising=False)
+    try:
+        runtime = cli_commands._load_or_create_desktop_config(
+            str(config_path),
+            str(tmp_path / "workspace"),
+        )
+        persisted = load_config(config_path)
+    finally:
+        set_config_path(original_config_path)
+
+    assert persisted.transcription.enabled is True
+    assert persisted.transcription.provider == "stepfun"
+    assert persisted.transcription.model == "stepaudio-2.5-asr"
+    assert persisted.transcription.language == "zh"
+    speech_preset = persisted.model_defaults.speech_to_text
+    assert speech_preset
+    assert persisted.model_presets[speech_preset].provider == "stepfun"
+    assert persisted.model_presets[speech_preset].model == "stepaudio-2.5-asr"
+    assert persisted.model_presets[speech_preset].capabilities == ["speech_to_text"]
+    assert set(persisted.tools.mcp_servers) == {"juyuan", "playwright"}
+    assert persisted.tools.mcp_servers["juyuan"].url == ""
+    assert persisted.tools.mcp_servers["playwright"].args == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+    ]
+    assert runtime.transcription.provider == "stepfun"
+
+
+def test_desktop_existing_config_migrates_empty_transcription_to_step(
+    tmp_path: Path,
+) -> None:
+    from nanobot.config.loader import get_config_path, load_config, set_config_path
+
+    original_config_path = get_config_path()
+    config_path = tmp_path / "desktop" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("{}")
+    try:
+        runtime = cli_commands._load_or_create_desktop_config(
+            str(config_path),
+            None,
+        )
+        persisted = load_config(config_path)
+    finally:
+        set_config_path(original_config_path)
+
+    assert persisted.transcription.provider == "stepfun"
+    assert persisted.transcription.model == "stepaudio-2.5-asr"
+    assert persisted.transcription.language == "zh"
+    speech_preset = persisted.model_defaults.speech_to_text
+    assert speech_preset
+    assert persisted.model_presets[speech_preset].capabilities == ["speech_to_text"]
+    assert runtime.transcription.provider == "stepfun"
+
+
 def test_proactive_websocket_delivery_gets_fresh_turn_id() -> None:
     metadata = {
         "webui": True,

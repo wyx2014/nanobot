@@ -12,11 +12,13 @@ from nanobot.webui.settings_api import (
     WebUISettingsError,
     _oauth_provider_status,
     create_model_configuration,
+    ensure_model_capability_defaults,
     provider_models_payload,
     settings_payload,
     settings_usage_payload,
     update_agent_settings,
     update_model_configuration,
+    update_model_default,
     update_network_safety_settings,
     update_provider_settings,
     update_transcription_settings,
@@ -463,6 +465,30 @@ def test_settings_payload_includes_effective_transcription_config(
     assert payload["transcription"]["provider_configured"] is True
     assert payload["transcription"]["model"] == "whisper-1"
     assert payload["transcription"]["language"] == "en"
+    assert payload["transcription"]["streaming"]["supported"] is False
+
+
+def test_settings_payload_reports_stepfun_realtime_asr_mapping(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.transcription.provider = "stepfun"
+    config.transcription.model = "stepaudio-2.5-asr"
+    config.providers.stepfun.api_key = "step-test"
+    config.providers.stepfun.api_base = "https://api.stepfun.com/v1"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    payload = settings_payload()
+
+    assert payload["transcription"]["streaming"] == {
+        "supported": True,
+        "profile": "stepfun-asr-server-vad",
+        "upstream_model": "stepaudio-2.5-asr-stream",
+        "batch_fallback": True,
+    }
 
 
 def test_settings_payload_exposes_openrouter_transcription_provider(
@@ -559,6 +585,77 @@ def test_model_configuration_rejects_transcription_only_provider(
                 "model": ["universal-3-pro"],
             }
         )
+
+
+def test_speech_model_configuration_and_default_are_independent_from_text(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.providers.openai.api_key = "sk-test"
+    config.providers.assemblyai.api_key = "aai-test"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    payload = create_model_configuration(
+        {
+            "label": ["AssemblyAI Universal"],
+            "provider": ["assemblyai"],
+            "model": ["universal-3-pro"],
+            "capabilities": ["speech_to_text"],
+        }
+    )
+
+    speech_preset = next(
+        row for row in payload["model_presets"] if row["label"] == "AssemblyAI Universal"
+    )
+    assert speech_preset["capabilities"] == ["speech_to_text"]
+    assert payload["agent"]["model_preset"] == "default"
+
+    payload = update_model_default(
+        {
+            "capability": ["speech_to_text"],
+            "name": [speech_preset["name"]],
+        }
+    )
+
+    saved = load_config(config_path)
+    assert saved.agents.defaults.model_preset is None
+    assert saved.model_defaults.text is None
+    assert saved.model_defaults.speech_to_text == speech_preset["name"]
+    assert saved.transcription.provider == "assemblyai"
+    assert saved.transcription.model == "universal-3-pro"
+    assert payload["model_defaults"]["text"] == "default"
+    assert payload["model_defaults"]["speech_to_text"] == speech_preset["name"]
+
+
+def test_capability_default_migration_removes_retired_model_purposes() -> None:
+    config = Config()
+    config.transcription.provider = "stepfun"
+    config.transcription.model = "stepaudio-2-asr"
+    config.tools.image_generation.provider = "openai"
+    config.tools.image_generation.model = "gpt-image-1"
+    config.model_presets["legacy-multimodal"] = ModelPresetConfig(
+        model="legacy-model",
+        provider="openai",
+        capabilities=["text", "vision", "text_to_speech", "image_generation"],
+    )
+    config.model_defaults.vision = "legacy-multimodal"
+    config.model_defaults.text_to_speech = "legacy-multimodal"
+    config.model_defaults.image_generation = "legacy-multimodal"
+
+    assert ensure_model_capability_defaults(config) is True
+
+    assert config.model_defaults.text == "default"
+    speech_name = config.model_defaults.speech_to_text
+    assert speech_name
+    assert config.model_presets[speech_name].capabilities == ["speech_to_text"]
+    assert config.model_defaults.vision is None
+    assert config.model_defaults.text_to_speech is None
+    assert config.model_defaults.image_generation is None
+    assert config.model_presets["legacy-multimodal"].capabilities == ["text"]
+    assert ensure_model_capability_defaults(config) is False
 
 
 def test_update_transcription_settings_writes_top_level_only(

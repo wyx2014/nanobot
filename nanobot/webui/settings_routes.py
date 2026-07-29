@@ -43,6 +43,7 @@ from nanobot.webui.settings_api import (
     settings_usage_payload,
     update_agent_settings,
     update_image_generation_settings,
+    update_model_default,
     update_model_configuration,
     update_network_safety_settings,
     update_provider_settings,
@@ -110,6 +111,8 @@ class WebUISettingsRouter:
             return self._handle_settings_model_configuration_update(request)
         if path == "/api/settings/model-configurations/delete":
             return self._handle_settings_model_configuration_delete(request)
+        if path == "/api/settings/model-defaults/update":
+            return self._handle_settings_model_default_update(request)
         if path == "/api/settings/provider/create":
             return self._handle_settings_provider_create(request)
         if path == "/api/settings/provider/update":
@@ -320,6 +323,15 @@ class WebUISettingsRouter:
             return self._unauthorized()
         try:
             payload = delete_model_configuration(self._query(request))
+        except WebUISettingsError as e:
+            return self._error_response(e.status, e.message)
+        return self._json_response(self._with_restart_state(payload))
+
+    def _handle_settings_model_default_update(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            payload = update_model_default(self._query(request))
         except WebUISettingsError as e:
             return self._error_response(e.status, e.message)
         return self._json_response(self._with_restart_state(payload))

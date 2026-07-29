@@ -112,6 +112,7 @@ class TerminalTurn:
     completed_at: float
     finish_reason: FinishReason
     error: TurnError | None = None
+    usage: dict[str, int] | None = None
 
     def payload(self) -> dict[str, Any]:
         duration_ms = max(0, round((self.completed_at - self.started_at) * 1000))
@@ -126,6 +127,7 @@ class TerminalTurn:
             "duration_ms": duration_ms,
             "finish_reason": self.finish_reason.value,
             **({"error": self.error.payload()} if self.error is not None else {}),
+            **({"usage": dict(self.usage)} if self.usage else {}),
         }
 
 
@@ -290,6 +292,7 @@ class ThreadRuntimeRegistry:
         status: TurnStatus,
         finish_reason: FinishReason,
         error: TurnError | None = None,
+        usage: dict[str, int] | None = None,
         completed_at: float | None = None,
     ) -> TerminalTurn:
         if not status.terminal:
@@ -332,6 +335,15 @@ class ThreadRuntimeRegistry:
                 completed_at=completed_at or time.time(),
                 finish_reason=finish_reason,
                 error=error,
+                usage=(
+                    {
+                        str(key): int(value)
+                        for key, value in usage.items()
+                        if isinstance(value, int | float)
+                    }
+                    if usage
+                    else None
+                ),
             )
             facts.terminalizing_turn_id = active.id
             terminal_revision = facts.snapshot_revision + 1
@@ -540,6 +552,7 @@ class TurnLifecycleManager:
         error_code: str | None = None,
         error_message: str | None = None,
         retryable: bool = False,
+        usage: dict[str, int] | None = None,
     ) -> TerminalTurn:
         error = (
             TurnError(
@@ -556,6 +569,7 @@ class TurnLifecycleManager:
             status=status,
             finish_reason=finish_reason,
             error=error,
+            usage=usage,
         )
 
     async def commit_final_answer(

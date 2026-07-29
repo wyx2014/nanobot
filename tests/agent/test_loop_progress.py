@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import nanobot.agent.runner as runner_module
+from nanobot.agent.hook import AgentHookContext
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse, ToolCallRequest
@@ -33,6 +35,66 @@ def _attach_webui_runtime_events(loop: AgentLoop, bus: MessageBus) -> None:
         schedule_background=lambda coro: loop._schedule_background(coro),
     )
     coordinator.subscribe(loop.runtime_events)
+
+
+@pytest.mark.asyncio
+async def test_websocket_progress_hook_publishes_live_and_exact_usage() -> None:
+    updates: list[tuple[dict[str, int], bool]] = []
+
+    async def on_progress(
+        _content: str,
+        *,
+        usage: dict[str, int] | None = None,
+        usage_estimated: bool = False,
+        **_kwargs: Any,
+    ) -> None:
+        if usage:
+            updates.append((dict(usage), usage_estimated))
+
+    hook = AgentProgressHook(
+        on_progress=on_progress,
+        on_stream=AsyncMock(),
+        channel="websocket",
+    )
+    context = AgentHookContext(iteration=0, messages=[])
+    await hook.on_usage(
+        context,
+        {
+            "prompt_tokens": 1200,
+            "completion_tokens": 0,
+            "total_tokens": 1200,
+            "confirmed_new_tokens": 200,
+            "new_tokens": 200,
+        },
+        estimated=True,
+    )
+    hook._usage_last_emit_at = 0.0
+    await hook.emit_reasoning("正在分析财务数据和估值区间。")
+    hook._usage_last_emit_at = 0.0
+    await hook.on_stream(context, "这是正在生成的回答。")
+    await hook.on_usage(
+        context,
+        {"prompt_tokens": 1180, "completion_tokens": 20, "total_tokens": 1200},
+        estimated=False,
+    )
+
+    assert updates[0] == ({
+        "prompt_tokens": 1200,
+        "completion_tokens": 0,
+        "total_tokens": 1200,
+        "confirmed_new_tokens": 200,
+        "new_tokens": 200,
+    }, True)
+    assert updates[1][0]["completion_tokens"] > 0
+    assert updates[1][0]["new_tokens"] > 200
+    assert updates[1][1] is True
+    assert updates[2][0]["completion_tokens"] >= updates[1][0]["completion_tokens"]
+    assert updates[2][1] is True
+    assert updates[-1] == ({
+        "prompt_tokens": 1180,
+        "completion_tokens": 20,
+        "total_tokens": 1200,
+    }, False)
 
 
 class TestToolEventProgress:

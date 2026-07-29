@@ -65,6 +65,7 @@ from nanobot.webui.session_artifacts import (
     registered_artifact_row,
 )
 from nanobot.webui.transcription_ws import webui_transcription_event
+from nanobot.webui.voice_stream_ws import WebuiVoiceStreamManager
 from nanobot.webui.websocket_logging import websockets_server_logger
 
 
@@ -355,6 +356,7 @@ class WebSocketChannel(BaseChannel):
         self._media = gateway.media
         self._transcripts = gateway.transcripts
         self._workspaces = gateway.workspaces
+        self._voice_streams = WebuiVoiceStreamManager(self._send_event)
 
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
         self._resumable_streams: dict[str, tuple[str, str]] = {}
@@ -955,6 +957,7 @@ class WebSocketChannel(BaseChannel):
         except Exception as e:
             self.logger.debug("connection ended: {}", e)
         finally:
+            await self._voice_streams.cleanup(connection)
             self._cleanup_connection(connection)
 
     # -- Inbound WebSocket envelopes ---------------------------------------
@@ -1151,6 +1154,18 @@ class WebSocketChannel(BaseChannel):
         if t == "transcribe_audio":
             event, payload = await webui_transcription_event(envelope)
             await self._send_event(connection, event, **payload)
+            return
+        if t == "voice_stream_start":
+            await self._voice_streams.start(connection, envelope)
+            return
+        if t == "voice_audio_chunk":
+            await self._voice_streams.append(connection, envelope)
+            return
+        if t == "voice_stream_stop":
+            await self._voice_streams.stop(connection, envelope)
+            return
+        if t == "voice_stream_cancel":
+            await self._voice_streams.cancel(connection, envelope)
             return
         if t == "message":
             cid = envelope.get("chat_id")
@@ -1439,6 +1454,16 @@ class WebSocketChannel(BaseChannel):
             snapshot = msg.metadata.get("runtime_snapshot")
             if isinstance(snapshot, dict):
                 await self.send_thread_runtime_status_changed(msg.chat_id, snapshot)
+            return
+        if msg.metadata.get("_turn_usage_update"):
+            usage = msg.metadata.get("usage")
+            if isinstance(usage, dict):
+                await self.send_turn_usage_updated(
+                    msg.chat_id,
+                    usage=usage,
+                    estimated=msg.metadata.get("usage_estimated") is True,
+                    metadata=msg.metadata,
+                )
             return
         if msg.metadata.get("_team_member_updated"):
             member = msg.metadata.get("team_member")
@@ -2158,6 +2183,47 @@ class WebSocketChannel(BaseChannel):
             return
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" turn_end ")
+
+    async def send_turn_usage_updated(
+        self,
+        chat_id: str,
+        *,
+        usage: dict[str, Any],
+        estimated: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish live per-turn token usage without journaling high-frequency estimates."""
+        normalized = {
+            str(key): max(0, int(value))
+            for key, value in usage.items()
+            if isinstance(value, int | float)
+        }
+        prompt_tokens = normalized.get("prompt_tokens", normalized.get("input_tokens", 0))
+        completion_tokens = normalized.get(
+            "completion_tokens",
+            normalized.get("output_tokens", 0),
+        )
+        total_tokens = normalized.get(
+            "total_tokens",
+            prompt_tokens + completion_tokens,
+        )
+        body: dict[str, Any] = {
+            "event": "turn_usage_updated",
+            "chat_id": chat_id,
+            "usage": {
+                **normalized,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
+            "estimated": bool(estimated),
+        }
+        turn_id = (metadata or {}).get("_runtime_turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            body["turn_id"] = turn_id
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in list(self._subs.get(chat_id, ())):
+            await self._safe_send_to(connection, raw, label=" turn_usage_updated ")
 
     async def send_turn_lifecycle_started(
         self,

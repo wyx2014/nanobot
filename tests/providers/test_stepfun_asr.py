@@ -32,7 +32,7 @@ def audio_file(tmp_path: Path) -> Path:
 
 def test_stepfun_defaults() -> None:
     provider = StepFunTranscriptionProvider(api_key="sk-test")
-    assert provider.api_url == "https://api.stepfun.com/v1/audio/asr/sse"
+    assert provider.api_url == "https://api.stepfun.com/step_plan/v1/audio/asr/sse"
     assert provider.model == "stepaudio-2.5-asr"
 
 
@@ -48,6 +48,14 @@ def test_stepfun_api_base_appends_asr_path() -> None:
     provider = StepFunTranscriptionProvider(
         api_key="sk-test",
         api_base="https://api.stepfun.com/step_plan/v1",
+    )
+    assert provider.api_url == "https://api.stepfun.com/step_plan/v1/audio/asr/sse"
+
+
+def test_stepfun_public_api_base_is_upgraded_to_step_plan() -> None:
+    provider = StepFunTranscriptionProvider(
+        api_key="sk-test",
+        api_base="https://api.stepfun.com/v1",
     )
     assert provider.api_url == "https://api.stepfun.com/step_plan/v1/audio/asr/sse"
 
@@ -120,6 +128,38 @@ async def test_sse_only_done_event(audio_file: Path) -> None:
         result = await provider.transcribe(audio_file)
 
     assert result == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_step_plan_request_contract(audio_file: Path) -> None:
+    stream_cm = _make_stream_cm(
+        200,
+        [f"data: {json.dumps({'type': 'transcript.text.done', 'text': 'ok'})}"],
+    )
+    provider = StepFunTranscriptionProvider(
+        api_key="sk-test",
+        language="zh",
+    )
+
+    with patch("httpx.AsyncClient.stream", stream_cm):
+        assert await provider.transcribe(audio_file) == "ok"
+
+    args, kwargs = stream_cm.call_args
+    assert args[:2] == (
+        "POST",
+        "https://api.stepfun.com/step_plan/v1/audio/asr/sse",
+    )
+    assert kwargs["headers"]["Authorization"] == "Bearer sk-test"
+    assert kwargs["headers"]["Accept"] == "text/event-stream"
+    assert kwargs["json"]["audio"]["input"] == {
+        "transcription": {
+            "model": "stepaudio-2.5-asr",
+            "enable_itn": True,
+            "language": "zh",
+        },
+        "format": {"type": "ogg"},
+    }
+    assert kwargs["json"]["audio"]["data"]
 
 
 @pytest.mark.asyncio

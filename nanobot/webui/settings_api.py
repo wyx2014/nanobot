@@ -16,13 +16,16 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from nanobot import __version__
+from nanobot.audio.streaming_transcription import (
+    resolve_streaming_transcription_profile,
+)
 from nanobot.audio.transcription import resolve_transcription_config
 from nanobot.audio.transcription_registry import (
     resolve_transcription_provider,
     transcription_provider_names,
 )
 from nanobot.config.loader import get_config_path, load_config, save_config
-from nanobot.config.schema import ModelPresetConfig, ProviderConfig
+from nanobot.config.schema import ModelCapability, ModelPresetConfig, ProviderConfig
 from nanobot.providers.image_generation import (
     get_image_gen_provider,
     image_gen_provider_names,
@@ -37,6 +40,19 @@ from nanobot.webui.workspaces import (
 
 QueryParams = dict[str, list[str]]
 RuntimeSurface = Literal["browser", "native"]
+MODEL_CAPABILITIES: tuple[ModelCapability, ...] = (
+    "text",
+    "speech_to_text",
+)
+_STORED_MODEL_CAPABILITIES: tuple[ModelCapability, ...] = (
+    *MODEL_CAPABILITIES,
+    "text_to_speech",
+    "vision",
+    "image_generation",
+)
+_REMOVED_MODEL_CAPABILITIES = frozenset(
+    {"text_to_speech", "vision", "image_generation"}
+)
 
 
 def _version_payload() -> dict[str, Any]:
@@ -642,6 +658,112 @@ def _model_configuration_slug(label: str) -> str:
     return normalized
 
 
+def _parse_model_capabilities(
+    value: str | None,
+    *,
+    default: list[ModelCapability] | None = None,
+) -> list[ModelCapability]:
+    if value is None:
+        return list(default or ["text"])
+    raw = [part.strip() for part in value.split(",") if part.strip()]
+    invalid = [part for part in raw if part not in MODEL_CAPABILITIES]
+    if invalid:
+        raise WebUISettingsError(f"unknown model capability: {invalid[0]}")
+    return list(dict.fromkeys(raw)) or list(default or ["text"])
+
+
+def _matching_capability_preset(
+    config: Any,
+    *,
+    provider: str,
+    model: str,
+    capability: ModelCapability,
+) -> str | None:
+    for name, preset in config.model_presets.items():
+        if (
+            preset.provider == provider
+            and preset.model == model
+            and capability in preset.capabilities
+        ):
+            return name
+    return None
+
+
+def _ensure_capability_preset(
+    config: Any,
+    *,
+    provider: str,
+    model: str,
+    capability: ModelCapability,
+    label: str,
+) -> tuple[str, bool]:
+    existing = _matching_capability_preset(
+        config,
+        provider=provider,
+        model=model,
+        capability=capability,
+    )
+    if existing:
+        return existing, False
+    base_name = _model_configuration_slug(f"{provider}-{model}-{capability}")
+    name = base_name
+    suffix = 2
+    while name in config.model_presets:
+        name = f"{base_name[:43]}-{suffix}"
+        suffix += 1
+    base = config.resolve_default_preset()
+    config.model_presets[name] = ModelPresetConfig(
+        label=label,
+        model=model,
+        provider=provider,
+        max_tokens=base.max_tokens,
+        context_window_tokens=base.context_window_tokens,
+        temperature=base.temperature,
+        reasoning_effort=base.reasoning_effort,
+        capabilities=[capability],
+    )
+    return name, True
+
+
+def ensure_model_capability_defaults(config: Any) -> bool:
+    """Keep the two user-facing model purposes and remove retired purpose tags."""
+    changed = False
+    for capability in _REMOVED_MODEL_CAPABILITIES:
+        if getattr(config.model_defaults, capability) is not None:
+            setattr(config.model_defaults, capability, None)
+            changed = True
+    for preset in config.model_presets.values():
+        capabilities = [
+            capability
+            for capability in preset.capabilities
+            if capability not in _REMOVED_MODEL_CAPABILITIES
+        ]
+        if preset.capabilities != capabilities:
+            preset.capabilities = capabilities
+            changed = True
+
+    text_default = config.agents.defaults.model_preset or "default"
+    if config.model_defaults.text != text_default:
+        config.model_defaults.text = text_default
+        changed = True
+
+    transcription = resolve_transcription_config(config)
+    if transcription.provider and transcription.model:
+        name, created = _ensure_capability_preset(
+            config,
+            provider=transcription.provider,
+            model=transcription.model,
+            capability="speech_to_text",
+            label=f"{transcription.provider} / {transcription.model}",
+        )
+        changed = created or changed
+        if config.model_defaults.speech_to_text != name:
+            config.model_defaults.speech_to_text = name
+            changed = True
+
+    return changed
+
+
 def _validate_configured_provider(config: Any, provider: str) -> None:
     if provider == "auto":
         return
@@ -653,6 +775,27 @@ def _validate_configured_provider(config: Any, provider: str) -> None:
         raise WebUISettingsError("provider does not support chat models")
     if not _provider_configured_for_settings(spec, provider_config):
         raise WebUISettingsError("provider is not configured")
+
+
+def _validate_provider_for_capabilities(
+    config: Any,
+    provider: str,
+    capabilities: list[ModelCapability],
+) -> None:
+    """Validate a provider against every capability assigned to a model preset."""
+    if any(capability in {"text", "vision"} for capability in capabilities):
+        _validate_configured_provider(config, provider)
+    if "speech_to_text" in capabilities:
+        if resolve_transcription_provider(provider) is None:
+            raise WebUISettingsError("provider does not support speech recognition")
+        resolved_provider = _resolve_settings_provider(config, provider)
+        if resolved_provider is None:
+            raise WebUISettingsError("unknown provider")
+        spec, _, provider_config = resolved_provider
+        if not _provider_configured_for_settings(spec, provider_config):
+            raise WebUISettingsError("provider is not configured")
+    if "image_generation" in capabilities and get_image_gen_provider(provider) is None:
+        raise WebUISettingsError("provider does not support image generation")
 
 
 def _image_generation_provider_rows(config: Any) -> list[dict[str, Any]]:
@@ -779,6 +922,7 @@ def settings_payload(
     search_config = config.tools.web.search
     image_config = config.tools.image_generation
     transcription = resolve_transcription_config(config)
+    streaming_transcription = resolve_streaming_transcription_profile(transcription)
     search_provider = (
         search_config.provider
         if search_config.provider in _WEB_SEARCH_PROVIDER_BY_NAME
@@ -808,6 +952,7 @@ def settings_payload(
             "reasoning_effort_values": _reasoning_effort_values_for(
                 defaults.provider, defaults.model
             ),
+            "capabilities": ["text"],
         }
     ]
     for name, preset in config.model_presets.items():
@@ -826,6 +971,11 @@ def settings_payload(
                 "reasoning_effort_values": _reasoning_effort_values_for(
                     preset.provider, preset.model
                 ),
+                "capabilities": [
+                    capability
+                    for capability in preset.capabilities
+                    if capability in MODEL_CAPABILITIES
+                ],
             }
         )
 
@@ -851,6 +1001,10 @@ def settings_payload(
             "tool_hint_max_length": defaults.tool_hint_max_length,
         },
         "model_presets": model_presets,
+        "model_defaults": {
+            "text": config.agents.defaults.model_preset or "default",
+            "speech_to_text": config.model_defaults.speech_to_text,
+        },
         "providers": providers,
         "web_search": {
             "provider": search_provider,
@@ -894,6 +1048,23 @@ def settings_payload(
             "max_duration_sec": transcription.max_duration_sec,
             "max_upload_mb": transcription.max_upload_mb,
             "providers": _transcription_provider_rows(config),
+            "streaming": {
+                "supported": streaming_transcription is not None,
+                "profile": (
+                    streaming_transcription.name
+                    if streaming_transcription is not None
+                    else None
+                ),
+                "upstream_model": (
+                    streaming_transcription.model
+                    if streaming_transcription is not None
+                    else None
+                ),
+                "batch_fallback": bool(
+                    streaming_transcription
+                    and streaming_transcription.batch_fallback
+                ),
+            },
         },
         "runtime": {
             "config_path": str(get_config_path().expanduser()),
@@ -956,6 +1127,7 @@ def update_agent_settings(query: QueryParams) -> dict[str, Any]:
             raise WebUISettingsError("unknown model preset")
         if defaults.model_preset != preset_value:
             defaults.model_preset = preset_value
+            config.model_defaults.text = preset_value or "default"
             changed = True
 
     model = _query_first(query, "model")
@@ -1046,6 +1218,7 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
     raw_name = (_query_first(query, "name") or label).strip()
     model = (_query_first(query, "model") or "").strip()
     provider = (_query_first(query, "provider") or "").strip()
+    capabilities = _parse_model_capabilities(_query_first(query, "capabilities"))
 
     if not label:
         label = raw_name
@@ -1056,14 +1229,12 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
 
     name = _model_configuration_slug(raw_name or label)
     config = load_config()
-    for preset_name, preset in config.model_presets.items():
+    for preset in config.model_presets.values():
         if preset.provider == provider and preset.model == model:
-            config.agents.defaults.model_preset = preset_name
-            save_config(config)
-            return settings_payload()
+            raise WebUISettingsError("configuration already exists", status=409)
     if name in config.model_presets:
         raise WebUISettingsError("configuration already exists", status=409)
-    _validate_configured_provider(config, provider)
+    _validate_provider_for_capabilities(config, provider, capabilities)
 
     base = config.resolve_default_preset()
     config.model_presets[name] = ModelPresetConfig(
@@ -1074,8 +1245,11 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
         context_window_tokens=base.context_window_tokens,
         temperature=base.temperature,
         reasoning_effort=base.reasoning_effort,
+        capabilities=capabilities,
     )
-    config.agents.defaults.model_preset = name
+    if "text" in capabilities:
+        config.agents.defaults.model_preset = name
+        config.model_defaults.text = name
     save_config(config)
     return settings_payload()
 
@@ -1109,15 +1283,41 @@ def update_model_configuration(query: QueryParams) -> dict[str, Any]:
             preset.model = model
             changed = True
 
-    provider = _query_first(query, "provider")
-    if provider is not None:
-        provider = provider.strip()
-        if not provider:
+    provider_raw = _query_first(query, "provider")
+    proposed_provider = preset.provider
+    if provider_raw is not None:
+        proposed_provider = provider_raw.strip()
+        if not proposed_provider:
             raise WebUISettingsError("provider is required")
-        _validate_configured_provider(config, provider)
-        if preset.provider != provider:
-            preset.provider = provider
-            changed = True
+
+    capabilities_raw = _query_first(query, "capabilities")
+    proposed_capabilities = list(preset.capabilities)
+    if capabilities_raw is not None:
+        proposed_capabilities = _parse_model_capabilities(
+            capabilities_raw,
+            default=list(preset.capabilities),
+        )
+        for capability in MODEL_CAPABILITIES:
+            if (
+                getattr(config.model_defaults, capability) == name
+                and capability not in proposed_capabilities
+            ):
+                raise WebUISettingsError(
+                    f"cannot remove {capability} while this model is its default"
+                )
+
+    if provider_raw is not None or capabilities_raw is not None:
+        _validate_provider_for_capabilities(
+            config,
+            proposed_provider,
+            proposed_capabilities,
+        )
+    if preset.provider != proposed_provider:
+        preset.provider = proposed_provider
+        changed = True
+    if preset.capabilities != proposed_capabilities:
+        preset.capabilities = proposed_capabilities
+        changed = True
 
     context_window_tokens = _parse_context_window_tokens(
         _query_first_alias(query, "context_window_tokens", "contextWindowTokens")
@@ -1129,8 +1329,17 @@ def update_model_configuration(query: QueryParams) -> dict[str, Any]:
         preset.context_window_tokens = context_window_tokens
         changed = True
 
-    if config.agents.defaults.model_preset != name:
+    should_select_text_preset = any(
+        value is not None
+        for value in (label, model, provider_raw, context_window_tokens)
+    )
+    if (
+        should_select_text_preset
+        and "text" in preset.capabilities
+        and config.agents.defaults.model_preset != name
+    ):
         config.agents.defaults.model_preset = name
+        config.model_defaults.text = name
         changed = True
 
     if changed:
@@ -1148,7 +1357,48 @@ def delete_model_configuration(query: QueryParams) -> dict[str, Any]:
         del config.model_presets[name]
         if config.agents.defaults.model_preset == name:
             config.agents.defaults.model_preset = None
+            config.model_defaults.text = "default"
+        for capability in _STORED_MODEL_CAPABILITIES:
+            if getattr(config.model_defaults, capability) == name:
+                setattr(config.model_defaults, capability, None)
         save_config(config)
+    return settings_payload()
+
+
+def update_model_default(query: QueryParams) -> dict[str, Any]:
+    capability = (_query_first(query, "capability") or "").strip()
+    name = (_query_first(query, "name") or "").strip()
+    if capability not in MODEL_CAPABILITIES:
+        raise WebUISettingsError("unknown model capability")
+    if not name:
+        raise WebUISettingsError("model configuration is required")
+
+    config = load_config()
+    if name == "default":
+        if capability != "text":
+            raise WebUISettingsError("default model is only available for text")
+        preset = config.resolve_default_preset()
+    else:
+        preset = config.model_presets.get(name)
+        if preset is None:
+            raise WebUISettingsError("unknown model configuration")
+        if capability not in preset.capabilities:
+            raise WebUISettingsError("model configuration does not support this capability")
+
+    setattr(config.model_defaults, capability, name)
+    if capability == "text":
+        config.agents.defaults.model_preset = None if name == "default" else name
+    elif capability == "speech_to_text":
+        if resolve_transcription_provider(preset.provider) is None:
+            raise WebUISettingsError("provider does not support speech recognition")
+        config.transcription.provider = preset.provider
+        config.transcription.model = preset.model
+    elif capability == "image_generation":
+        if get_image_gen_provider(preset.provider) is None:
+            raise WebUISettingsError("provider does not support image generation")
+        config.tools.image_generation.provider = preset.provider
+        config.tools.image_generation.model = preset.model
+    save_config(config)
     return settings_payload()
 
 

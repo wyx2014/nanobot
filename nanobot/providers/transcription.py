@@ -74,9 +74,11 @@ def _resolve_api_path(api_base: str | None, default_base: str, path: str) -> str
 
 
 def _resolve_stepfun_asr_url(api_base: str | None) -> str:
-    base = (api_base or "https://api.stepfun.com/v1").rstrip("/")
+    base = (api_base or "https://api.stepfun.com/step_plan/v1").rstrip("/")
     if base.endswith(_STEPFUN_ASR_PATH):
         return base
+    if base in {"https://api.stepfun.com", "https://api.stepfun.com/v1"}:
+        base = "https://api.stepfun.com/step_plan/v1"
     return f"{base}/{_STEPFUN_ASR_PATH}"
 
 
@@ -791,7 +793,7 @@ class XiaomiMiMoTranscriptionProvider:
 class StepFunTranscriptionProvider:
     """Voice transcription provider using StepFun ASR SSE endpoint."""
 
-    _DEFAULT_URL = "https://api.stepfun.com/v1/audio/asr/sse"
+    _DEFAULT_URL = "https://api.stepfun.com/step_plan/v1/audio/asr/sse"
 
     def __init__(
         self,
@@ -825,3 +827,33 @@ class StepFunTranscriptionProvider:
             provider_label="StepFun",
             language=self.language,
         )
+
+
+class DashScopeRealtimeTranscriptionProvider:
+    """Compatibility adapter for non-WebUI callers using Qwen realtime ASR.
+
+    Realtime microphone input uses ``nanobot.audio.streaming_transcription``
+    directly. File transcription is intentionally unsupported here because
+    channel voice attachments may be compressed formats that require a decoder;
+    returning an empty string preserves the existing channel failure contract.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+    ):
+        self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+        self.api_base = api_base
+        self.language = language
+        self.model = model or "qwen3-asr-flash-realtime"
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        logger.warning(
+            "DashScope realtime ASR only supports streaming WebUI microphone input; "
+            "file transcription is unavailable for {}",
+            file_path,
+        )
+        return ""

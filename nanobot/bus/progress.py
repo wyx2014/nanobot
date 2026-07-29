@@ -30,6 +30,8 @@ def build_bus_progress_callback(
         reasoning_end: bool = False,
         narration: bool = False,
         narration_end: bool = False,
+        usage: dict[str, int] | None = None,
+        usage_estimated: bool = False,
     ) -> None:
         meta = dict(msg.metadata or {})
         meta["_progress"] = True
@@ -42,6 +44,14 @@ def build_bus_progress_callback(
             meta["_narration_delta"] = True
         if narration_end:
             meta["_narration_end"] = True
+        if usage:
+            meta["_turn_usage_update"] = True
+            meta["usage"] = {
+                str(key): int(value)
+                for key, value in usage.items()
+                if isinstance(value, int | float)
+            }
+            meta["usage_estimated"] = bool(usage_estimated)
         if tool_events:
             meta["_tool_events"] = tool_events
         if file_edit_events:
@@ -65,6 +75,8 @@ def build_bus_progress_callback(
         reasoning_end: bool = False,
         narration: bool = False,
         narration_end: bool = False,
+        usage: dict[str, int] | None = None,
+        usage_estimated: bool = False,
     ) -> None:
         await _publish_progress(
             content,
@@ -75,6 +87,8 @@ def build_bus_progress_callback(
             reasoning_end=reasoning_end,
             narration=narration,
             narration_end=narration_end,
+            usage=usage,
+            usage_estimated=usage_estimated,
         )
 
     return _bus_progress

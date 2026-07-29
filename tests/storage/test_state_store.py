@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -600,6 +601,11 @@ def test_v2_lifecycle_projection_has_one_stable_terminal(tmp_path: Path) -> None
             "started_at": 900,
             "completed_at": 1_500,
             "finish_reason": "userInterrupted",
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 34,
+                "total_tokens": 1234,
+            },
         },
     }
 
@@ -618,6 +624,16 @@ def test_v2_lifecycle_projection_has_one_stable_terminal(tmp_path: Path) -> None
         },
     ) is True
     assert store.active_turn_id(session.session_key) is None
+    with sqlite3.connect(store.path) as connection:
+        usage_json = connection.execute(
+            "SELECT usage_json FROM turns WHERE id = ?",
+            ("turn-v2",),
+        ).fetchone()[0]
+    assert json.loads(usage_json) == {
+        "prompt_tokens": 1200,
+        "completion_tokens": 34,
+        "total_tokens": 1234,
+    }
     assert store.latest_turn_snapshot(session.session_key) == {
         "id": "turn-v2",
         "runtime_epoch": "epoch-a",

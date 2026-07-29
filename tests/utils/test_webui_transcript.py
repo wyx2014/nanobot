@@ -538,6 +538,72 @@ def test_replay_delta_and_turn_end(tmp_path, monkeypatch) -> None:
     assert msgs[1]["usage"] == {"inputTokens": 120, "outputTokens": 34}
 
 
+def test_replay_preserves_event_times_and_nested_turn_timing() -> None:
+    started_at = 1_785_222_059_843
+    completed_at = 1_785_222_083_788
+    msgs = replay_transcript_to_ui_messages([
+        {
+            "event": "user",
+            "chat_id": "timing",
+            "text": "今天天气",
+            "turn_id": "turn-timing",
+            "recorded_at": started_at,
+        },
+        {
+            "event": "message",
+            "chat_id": "timing",
+            "text": "",
+            "kind": "progress",
+            "turn_id": "turn-timing",
+            "recorded_at": started_at + 6_000,
+            "tool_events": [{
+                "phase": "end",
+                "call_id": "weather",
+                "name": "exec",
+                "occurred_at": started_at + 5_900,
+                "result": "sunny",
+            }],
+        },
+        {
+            "event": "delta",
+            "chat_id": "timing",
+            "text": "晴天",
+            "turn_id": "turn-timing",
+            "recorded_at": completed_at - 1_000,
+        },
+        {
+            "event": "turn_completed",
+            "chat_id": "timing",
+            "turn_id": "turn-timing",
+            "recorded_at": completed_at,
+            "turn": {
+                "id": "turn-timing",
+                "status": "completed",
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "duration_ms": completed_at - started_at,
+                "usage": {
+                    "prompt_tokens": 1200,
+                    "completion_tokens": 34,
+                    "total_tokens": 1234,
+                },
+            },
+        },
+    ])
+
+    assert [message["createdAt"] for message in msgs] == [
+        started_at,
+        started_at + 6_000,
+        completed_at - 1_000,
+    ]
+    assert msgs[-1]["latencyMs"] == completed_at - started_at
+    assert msgs[-1]["completedAt"] == completed_at
+    assert msgs[-1]["usage"] == {
+        "inputTokens": 1200,
+        "outputTokens": 34,
+    }
+
+
 def test_thread_response_does_not_mark_completed_message_tool_tail_pending(
     tmp_path,
     monkeypatch,

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 
 import pytest
 
 from nanobot.config.loader import load_config
+from nanobot.config.schema import Config, MCPServerConfig
 from nanobot.webui.mcp_presets_api import (
     McpPresetError,
     custom_mcp_action,
+    install_desktop_default_mcp_servers,
     mcp_presets_action,
     mcp_presets_payload,
     mcp_presets_test_action,
     normalize_mcp_preset_mentions,
+    prune_retired_desktop_mcp_presets,
 )
+
+mcp_module = importlib.import_module("nanobot.agent.tools.mcp")
 
 
 def _use_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -25,27 +31,15 @@ def test_mcp_presets_payload_lists_supported_cards(tmp_path, monkeypatch: pytest
     payload = mcp_presets_payload()
     names = {preset["name"] for preset in payload["presets"]}
 
-    assert {
-        "browserbase",
-        "playwright",
-        "github",
-        "figma",
-        "context7",
-        "firecrawl",
-        "exa",
-        "microsoft-learn",
-        "aws-docs",
-        "brave-search",
-        "postman",
-    }.issubset(names)
-    browserbase = next(preset for preset in payload["presets"] if preset["name"] == "browserbase")
-    assert browserbase["installed"] is False
-    assert browserbase["install_supported"] is True
-    assert browserbase["required_fields"][0]["configured"] is False
-    assert "browserbaseApiKey" not in browserbase["connection_summary"]
-    manifest = browserbase["manifest"]
+    assert names == {"juyuan", "playwright"}
+    juyuan = next(preset for preset in payload["presets"] if preset["name"] == "juyuan")
+    assert juyuan["installed"] is False
+    assert juyuan["install_supported"] is True
+    assert juyuan["required_fields"][0]["configured"] is False
+    assert "token" not in juyuan["connection_summary"]
+    manifest = juyuan["manifest"]
     assert manifest["schema"] == "agent-app.v1"
-    assert manifest["id"] == "browserbase"
+    assert manifest["id"] == "juyuan"
     assert manifest["source"] == "mcp-preset"
     assert manifest["capabilities"][0]["type"] == "mcp"
     assert manifest["capabilities"][0]["transport"] == "streamableHttp"
@@ -54,7 +48,55 @@ def test_mcp_presets_payload_lists_supported_cards(tmp_path, monkeypatch: pytest
     assert manifest["trust"]["review_status"] == "builtin_preset"
 
 
-def test_enable_browserbase_writes_scrubbed_config_payload(
+def test_desktop_defaults_install_only_juyuan_and_playwright(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+    monkeypatch.delenv("JUYUAN_MCP_TOKEN", raising=False)
+    config = Config()
+
+    assert install_desktop_default_mcp_servers(config) is True
+    assert set(config.tools.mcp_servers) == {"juyuan", "playwright"}
+    assert config.tools.mcp_servers["juyuan"].url == ""
+    assert config.tools.mcp_servers["playwright"].args == [
+        "-y",
+        "@playwright/mcp@0.0.78",
+    ]
+    assert config.tools.mcp_servers["playwright"].cwd == str(tmp_path / "mcp" / "playwright")
+    assert install_desktop_default_mcp_servers(config) is False
+
+
+def test_desktop_defaults_use_juyuan_token_from_environment(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("JUYUAN_MCP_TOKEN", "environment-secret")
+    config = Config()
+
+    install_desktop_default_mcp_servers(config)
+
+    assert config.tools.mcp_servers["juyuan"].url.endswith(
+        "?token=%24%7BJUYUAN_MCP_TOKEN%7D"
+    )
+
+
+def test_prune_retired_desktop_presets_preserves_custom_servers() -> None:
+    config = Config()
+    config.tools.mcp_servers = {
+        "browserbase": MCPServerConfig(command="old-preset"),
+        "github": MCPServerConfig(command="old-preset"),
+        "internal-docs": MCPServerConfig(command="custom-server"),
+        "juyuan": MCPServerConfig(url="https://example.invalid/mcp"),
+    }
+
+    assert prune_retired_desktop_mcp_presets(config) is True
+    assert set(config.tools.mcp_servers) == {"internal-docs", "juyuan"}
+    assert prune_retired_desktop_mcp_presets(config) is False
+
+
+def test_enable_juyuan_writes_scrubbed_config_payload(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -63,8 +105,8 @@ def test_enable_browserbase_writes_scrubbed_config_payload(
     payload = mcp_presets_action(
         "enable",
         {
-            "name": ["browserbase"],
-            "browserbase_api_key": ["bb_live_secret"],
+            "name": ["juyuan"],
+            "juyuan_token": ["juyuan-secret"],
         },
     )
 
@@ -72,48 +114,22 @@ def test_enable_browserbase_writes_scrubbed_config_payload(
     assert payload["last_action"]["ok"] is True
     assert payload["last_action"]["installed"] is True
     assert payload["last_action"]["verification"] == ["config_present"]
-    preset = next(row for row in payload["presets"] if row["name"] == "browserbase")
+    preset = next(row for row in payload["presets"] if row["name"] == "juyuan")
     assert preset["installed"] is True
     assert preset["configured"] is True
-    assert "bb_live_secret" not in str(payload)
+    assert "juyuan-secret" not in str(payload)
     config = load_config()
-    assert "browserbaseApiKey=bb_live_secret" in config.tools.mcp_servers["browserbase"].url
+    assert "token=juyuan-secret" in config.tools.mcp_servers["juyuan"].url
 
 
 def test_enable_requires_missing_secret(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     _use_config(tmp_path, monkeypatch)
 
     with pytest.raises(McpPresetError) as exc:
-        mcp_presets_action("enable", {"name": ["browserbase"]})
+        mcp_presets_action("enable", {"name": ["juyuan"]})
 
     assert exc.value.status == 400
-    assert "Browserbase API key" in exc.value.message
-
-
-def test_enable_context7_optional_api_key_appends_arg(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _use_config(tmp_path, monkeypatch)
-
-    payload = mcp_presets_action(
-        "enable",
-        {
-            "name": ["context7"],
-            "context7_api_key": ["ctx7_secret"],
-        },
-    )
-
-    assert "ctx7_secret" not in str(payload)
-    row = next(item for item in payload["presets"] if item["name"] == "context7")
-    assert row["configured"] is True
-    config = load_config()
-    assert config.tools.mcp_servers["context7"].args == [
-        "-y",
-        "@upstash/context7-mcp@latest",
-        "--api-key",
-        "ctx7_secret",
-    ]
+    assert "聚源 MCP token" in exc.value.message
 
 
 def test_enable_stdio_preset_uses_config_scoped_cwd(
@@ -133,36 +149,6 @@ def test_enable_stdio_preset_uses_config_scoped_cwd(
     assert config.tools.mcp_servers["playwright"].connect_timeout == 15
     assert cwd == str(tmp_path / "mcp" / "playwright")
     assert (tmp_path / "mcp" / "playwright").is_dir()
-
-
-def test_enable_no_auth_remote_presets_write_url(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _use_config(tmp_path, monkeypatch)
-
-    mcp_presets_action("enable", {"name": ["microsoft-learn"]})
-    mcp_presets_action("enable", {"name": ["exa"]})
-    mcp_presets_action("enable", {"name": ["firecrawl"]})
-
-    config = load_config()
-    assert config.tools.mcp_servers["microsoft-learn"].url == "https://learn.microsoft.com/api/mcp"
-    assert config.tools.mcp_servers["exa"].url == "https://mcp.exa.ai/mcp"
-    assert config.tools.mcp_servers["firecrawl"].url == "https://mcp.firecrawl.dev/v2/mcp"
-
-
-def test_firecrawl_preset_is_keyless(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _use_config(tmp_path, monkeypatch)
-
-    payload = mcp_presets_action("enable", {"name": ["firecrawl"]})
-
-    row = next(item for item in payload["presets"] if item["name"] == "firecrawl")
-    assert row["transport"] == "streamableHttp"
-    assert row["requires"] == "Network access"
-    assert row["required_fields"] == []
-    assert row["configured"] is True
-    assert "Keyless" in row["note"]
-    config = load_config()
-    assert config.tools.mcp_servers["firecrawl"].type == "streamableHttp"
-    assert config.tools.mcp_servers["firecrawl"].url == "https://mcp.firecrawl.dev/v2/mcp"
-    assert config.tools.mcp_servers["firecrawl"].env == {}
 
 
 def test_remove_mcp_preset_updates_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -242,7 +228,7 @@ def test_test_mcp_preset_connects_and_reports_tools(
         registry.register(FakeTool())
         return {"playwright": FakeStack()}
 
-    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", fake_connect)
+    monkeypatch.setattr(mcp_module, "connect_mcp_servers", fake_connect)
 
     payload = asyncio.run(mcp_presets_test_action({"name": ["playwright"]}))
 
@@ -259,20 +245,23 @@ def test_test_mcp_preset_scrubs_connection_errors(
     mcp_presets_action(
         "enable",
         {
-            "name": ["browserbase"],
-            "browserbase_api_key": ["bb_live_secret"],
+            "name": ["juyuan"],
+            "juyuan_token": ["juyuan-secret"],
         },
     )
 
     async def fake_connect(_servers, _registry):
-        raise RuntimeError("failed https://mcp.browserbase.com/mcp?browserbaseApiKey=bb_live_secret")
+        raise RuntimeError(
+            "failed https://api.gildata.com/mcp-servers/aidata-assistant-srv-api"
+            "?token=juyuan-secret"
+        )
 
-    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", fake_connect)
+    monkeypatch.setattr(mcp_module, "connect_mcp_servers", fake_connect)
 
-    payload = asyncio.run(mcp_presets_test_action({"name": ["browserbase"]}))
+    payload = asyncio.run(mcp_presets_test_action({"name": ["juyuan"]}))
 
     assert payload["last_action"]["ok"] is False
-    assert "bb_live_secret" not in str(payload)
+    assert "juyuan-secret" not in str(payload)
     assert "<redacted>" in payload["last_action"]["error"]
 
 
@@ -288,8 +277,8 @@ def test_unlisted_oauth_placeholder_is_not_enabled(tmp_path, monkeypatch: pytest
 def test_normalize_mcp_preset_mentions_keeps_known_presets_only() -> None:
     payload = normalize_mcp_preset_mentions([
         {
-            "name": "browserbase",
-            "display_name": "Browserbase",
+            "name": "juyuan",
+            "display_name": "聚源金融数据",
             "transport": "streamableHttp",
             "configured": True,
             "logo_url": "https://example.invalid/logo.svg",
@@ -299,8 +288,8 @@ def test_normalize_mcp_preset_mentions_keeps_known_presets_only() -> None:
     ])
 
     assert payload == [{
-        "name": "browserbase",
-        "display_name": "Browserbase",
+        "name": "juyuan",
+        "display_name": "聚源金融数据",
         "transport": "streamableHttp",
         "configured": True,
         "logo_url": "https://example.invalid/logo.svg",

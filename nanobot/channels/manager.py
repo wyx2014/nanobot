@@ -344,7 +344,7 @@ class ChannelManager:
                         await self._send_with_retry(channel, msg)
                     continue
 
-                if msg.metadata.get("_progress"):
+                if msg.metadata.get("_progress") and not msg.metadata.get("_turn_usage_update"):
                     is_tool_hint = bool(msg.metadata.get("_tool_hint"))
                     has_websocket_tool_events = (
                         msg.channel == "websocket"
@@ -400,6 +400,7 @@ class ChannelManager:
                         not msg.metadata.get("_stream_delta")
                         and not msg.metadata.get("_stream_end")
                         and not msg.metadata.get("_streamed")
+                        and not msg.metadata.get("_turn_usage_update")
                     ):
                         if self._should_suppress_outbound(msg):
                             logger.info("Suppressing duplicate outbound message to {}:{}", msg.channel, msg.chat_id)

@@ -487,6 +487,50 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
+            try:
+                usage_tools = spec.tools.get_definitions()
+            except Exception:
+                usage_tools = None
+            prompt_estimate, _ = estimate_prompt_tokens_chain(
+                self.provider,
+                spec.model,
+                messages_for_model,
+                usage_tools,
+            )
+            live_usage = {
+                **usage,
+                "prompt_tokens": max(0, int(usage.get("prompt_tokens", 0)))
+                + max(0, prompt_estimate),
+                "completion_tokens": max(0, int(usage.get("completion_tokens", 0))),
+            }
+            live_usage["total_tokens"] = (
+                live_usage["prompt_tokens"] + live_usage["completion_tokens"]
+            )
+            # The current prompt's cache hit ratio isn't known until the
+            # provider responds.  Keep a confirmed lower bound so live UIs
+            # don't count the whole prompt as new and then jump backwards
+            # when cached_tokens arrives.
+            confirmed_total = max(0, int(usage.get("total_tokens", 0)))
+            if confirmed_total == 0:
+                confirmed_total = (
+                    max(0, int(usage.get("prompt_tokens", 0)))
+                    + max(0, int(usage.get("completion_tokens", 0)))
+                )
+            confirmed_cached = min(
+                confirmed_total,
+                max(
+                    0,
+                    int(
+                        usage.get(
+                            "cached_tokens",
+                            usage.get("cache_read_input_tokens", 0),
+                        )
+                    ),
+                ),
+            )
+            live_usage["confirmed_new_tokens"] = confirmed_total - confirmed_cached
+            live_usage["new_tokens"] = live_usage["confirmed_new_tokens"]
+            await hook.on_usage(context, live_usage, estimated=True)
             response = await self._request_model(spec, messages_for_model, hook, context)
             context.response = response
             context.tool_calls = list(response.tool_calls)
@@ -500,6 +544,11 @@ class AgentRunner:
             raw_usage = self._usage_or_estimate(spec, messages_for_model, response)
             context.usage = dict(raw_usage)
             self._accumulate_usage(usage, raw_usage)
+            await hook.on_usage(
+                context,
+                dict(usage),
+                estimated=bool(usage.get("estimated_tokens", 0)),
+            )
             if reasoning_text and not context.streamed_reasoning:
                 await hook.emit_reasoning(reasoning_text)
                 await hook.emit_reasoning_end()

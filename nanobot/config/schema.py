@@ -107,6 +107,14 @@ class InlineFallbackConfig(Base):
 
 FallbackCandidate = str | InlineFallbackConfig
 
+ModelCapability = Literal[
+    "text",
+    "speech_to_text",
+    "text_to_speech",
+    "vision",
+    "image_generation",
+]
+
 
 class ModelPresetConfig(Base):
     """A named set of model + generation parameters for quick switching."""
@@ -118,6 +126,7 @@ class ModelPresetConfig(Base):
     context_window_tokens: int = 200_000
     temperature: float = 0.1
     reasoning_effort: str | None = None
+    capabilities: list[ModelCapability] = Field(default_factory=lambda: ["text"])
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -126,6 +135,16 @@ class ModelPresetConfig(Base):
             max_tokens=self.max_tokens,
             reasoning_effort=self.reasoning_effort,
         )
+
+
+class ModelDefaultsConfig(Base):
+    """Independent default model configuration for each product capability."""
+
+    text: str | None = None
+    speech_to_text: str | None = None
+    text_to_speech: str | None = None
+    vision: str | None = None
+    image_generation: str | None = None
 
 
 class AgentDefaults(Base):
@@ -372,6 +391,10 @@ class Config(BaseSettings):
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
     )
+    model_defaults: ModelDefaultsConfig = Field(
+        default_factory=ModelDefaultsConfig,
+        validation_alias=AliasChoices("modelDefaults", "model_defaults"),
+    )
 
     def __init__(self, **values: Any) -> None:
         if not type(self).__pydantic_complete__:
@@ -388,6 +411,11 @@ class Config(BaseSettings):
         for fallback in self.agents.defaults.fallback_models:
             if isinstance(fallback, str) and fallback not in self.model_presets:
                 raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
+        for capability, preset_name in self.model_defaults.model_dump().items():
+            if preset_name and preset_name != "default" and preset_name not in self.model_presets:
+                raise ValueError(
+                    f"model_defaults.{capability} entry {preset_name!r} not found in model_presets"
+                )
         return self
 
     def resolve_default_preset(self) -> ModelPresetConfig:

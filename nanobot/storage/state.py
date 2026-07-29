@@ -2636,6 +2636,13 @@ class StateStore:
             )
             turn_error = turn_payload.get("error")
             error_payload = turn_error if isinstance(turn_error, dict) else {}
+            turn_usage = turn_payload.get("usage")
+            usage_payload = turn_usage if isinstance(turn_usage, dict) else event.get("usage")
+            usage_json = (
+                json.dumps(usage_payload, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(usage_payload, dict) and usage_payload
+                else None
+            )
             connection.execute(
                 """
                 UPDATE turns
@@ -2643,6 +2650,7 @@ class StateStore:
                     runtime_epoch = COALESCE(?, runtime_epoch),
                     finish_reason = ?,
                     terminal_event_id = ?,
+                    usage_json = COALESCE(?, usage_json),
                     error_code = CASE
                         WHEN ? = 'failed' THEN COALESCE(?, error_code, 'TURN_FAILED')
                         ELSE error_code
@@ -2659,6 +2667,7 @@ class StateStore:
                     _optional_text(turn_payload.get("runtime_epoch")),
                     finish_reason,
                     terminal_event_id,
+                    usage_json,
                     status,
                     _optional_text(error_payload.get("code")),
                     status,

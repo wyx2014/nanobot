@@ -70,6 +70,11 @@ TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderSpec, ...] = (
         adapter="nanobot.providers.transcription:StepFunTranscriptionProvider",
     ),
     TranscriptionProviderSpec(
+        name="dashscope",
+        default_model="qwen3-asr-flash-realtime",
+        adapter="nanobot.providers.transcription:DashScopeRealtimeTranscriptionProvider",
+    ),
+    TranscriptionProviderSpec(
         name="assemblyai",
         default_model="universal-3-pro,universal-2",
         adapter="nanobot.providers.transcription:AssemblyAITranscriptionProvider",

@@ -858,6 +858,7 @@ class AgentLoop:
         finish_reason: FinishReason,
         error_code: str | None = None,
         error_message: str | None = None,
+        usage: dict[str, int] | None = None,
     ) -> None:
         turn_id = str((msg.metadata or {}).get("_runtime_turn_id") or "").strip()
         if not turn_id:
@@ -875,6 +876,7 @@ class AgentLoop:
                 finish_reason=finish_reason,
                 error_code=error_code,
                 error_message=error_message,
+                usage=usage,
             )
         except TurnLifecycleError as exc:
             logger.error(
@@ -1617,6 +1619,12 @@ class AgentLoop:
                                 else None
                             ),
                             error_message=terminal_error,
+                            usage=(
+                                response.metadata.get("usage")
+                                if response is not None
+                                and isinstance(response.metadata.get("usage"), dict)
+                                else None
+                            ),
                         )
                         completion_metadata = dict(msg.metadata or {})
                         if response is not None:
@@ -2825,6 +2833,12 @@ class AgentLoop:
                             else None
                         ),
                         error_message=terminal_error,
+                        usage=(
+                            response.metadata.get("usage")
+                            if response is not None
+                            and isinstance(response.metadata.get("usage"), dict)
+                            else None
+                        ),
                     )
                 return response
         except asyncio.CancelledError:

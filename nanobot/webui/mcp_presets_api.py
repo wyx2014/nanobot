@@ -49,6 +49,21 @@ _DEFAULT_TEST_TIMEOUT = 20
 _DEFAULT_CUSTOM_TIMEOUT = 30
 _CUSTOM_ACTIONS = {"custom", "import", "import-cursor", "tools"}
 PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.78"
+JUYUAN_MCP_URL = "https://api.gildata.com/mcp-servers/aidata-assistant-srv-api"
+DESKTOP_DEFAULT_MCP_PRESETS = ("juyuan", "playwright")
+RETIRED_DESKTOP_MCP_PRESETS = frozenset({
+    "aws-docs",
+    "brave-search",
+    "browserbase",
+    "context7",
+    "exa",
+    "figma",
+    "firecrawl",
+    "github",
+    "microsoft-learn",
+    "postman",
+    "supabase",
+})
 
 McpReload = Callable[[], Awaitable[dict[str, Any]]]
 
@@ -96,30 +111,32 @@ def _favicon_url(domain: str) -> str:
 
 MCP_PRESETS: tuple[McpPreset, ...] = (
     McpPreset(
-        name="browserbase",
-        display_name="Browserbase",
-        category="browser",
-        description="Cloud browser automation through Browserbase's hosted MCP server.",
-        docs_url="https://docs.browserbase.com/integrations/mcp/setup",
+        name="juyuan",
+        display_name="聚源金融数据",
+        category="finance",
+        description="通过聚源金融数据 MCP 查询行情、财务、公告、资金与机构数据。",
+        docs_url="https://www.gildata.com/",
         transport="streamableHttp",
         install_supported=True,
-        brand_domain="browserbase.com",
-        brand_color="#111827",
-        requires="Browserbase API key",
+        brand_domain="gildata.com",
+        brand_color="#B42318",
+        requires="聚源 MCP token",
         server=MCPServerConfig(
             type="streamableHttp",
-            url="https://mcp.browserbase.com/mcp",
+            url=JUYUAN_MCP_URL,
+            connect_timeout=10,
             tool_timeout=60,
         ),
         fields=(
             McpPresetField(
-                name="browserbase_api_key",
-                label="Browserbase API key",
-                target=("url_param", "browserbaseApiKey"),
-                env_var="BROWSERBASE_API_KEY",
-                placeholder="bb_live_...",
+                name="juyuan_token",
+                label="聚源 MCP token",
+                target=("url_param", "token"),
+                env_var="JUYUAN_MCP_TOKEN",
+                placeholder="请输入聚源 MCP token",
             ),
         ),
+        note="首次安装会预置连接器；填写 token 后才会连接并启用工具。",
     ),
     McpPreset(
         name="playwright",
@@ -139,245 +156,6 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
             connect_timeout=15,
             tool_timeout=60,
         ),
-    ),
-    McpPreset(
-        name="context7",
-        display_name="Context7",
-        category="docs",
-        description="Fetch current library docs and code examples while the agent works.",
-        docs_url="https://context7.com/docs/resources/all-clients",
-        transport="stdio",
-        install_supported=True,
-        brand_domain="context7.com",
-        brand_color="#111827",
-        requires="Node.js and npx; API key optional",
-        server=MCPServerConfig(
-            type="stdio",
-            command="npx",
-            args=["-y", "@upstash/context7-mcp@latest"],
-            tool_timeout=45,
-        ),
-        fields=(
-            McpPresetField(
-                name="context7_api_key",
-                label="Context7 API key",
-                target=("arg", "--api-key"),
-                env_var="CONTEXT7_API_KEY",
-                placeholder="ctx7_...",
-                required=False,
-            ),
-        ),
-        note="Works without a key for basic public docs; add a key for higher limits or private docs.",
-    ),
-    McpPreset(
-        name="firecrawl",
-        display_name="Firecrawl",
-        category="web",
-        description="Scrape, crawl, search, and extract web pages through Firecrawl's MCP server.",
-        docs_url="https://docs.firecrawl.dev/use-cases/developers-mcp",
-        transport="streamableHttp",
-        install_supported=True,
-        brand_domain="firecrawl.dev",
-        brand_color="#EB5E28",
-        requires="Network access",
-        server=MCPServerConfig(
-            type="streamableHttp",
-            url="https://mcp.firecrawl.dev/v2/mcp",
-            tool_timeout=60,
-        ),
-        note=(
-            "Uses Firecrawl Keyless through the hosted MCP endpoint. No API key is required for "
-            "the built-in preset; use a custom MCP server URL if you want account-specific limits."
-        ),
-    ),
-    McpPreset(
-        name="exa",
-        display_name="Exa",
-        category="web",
-        description="Search the web and fetch clean page content through Exa's hosted MCP server.",
-        docs_url="https://exa.ai/mcp",
-        transport="streamableHttp",
-        install_supported=True,
-        brand_domain="exa.ai",
-        brand_color="#101010",
-        requires="Network access",
-        server=MCPServerConfig(
-            type="streamableHttp",
-            url="https://mcp.exa.ai/mcp",
-            tool_timeout=45,
-        ),
-        note="Hosted Exa MCP endpoint currently does not require an API key.",
-    ),
-    McpPreset(
-        name="microsoft-learn",
-        display_name="Microsoft Learn",
-        category="docs",
-        description="Search and fetch Microsoft Learn documentation through Microsoft's hosted MCP server.",
-        docs_url="https://learn.microsoft.com/en-us/training/support/mcp",
-        transport="streamableHttp",
-        install_supported=True,
-        brand_domain="learn.microsoft.com",
-        brand_color="#0078D4",
-        requires="Network access",
-        server=MCPServerConfig(
-            type="streamableHttp",
-            url="https://learn.microsoft.com/api/mcp",
-            tool_timeout=45,
-        ),
-        note="Public documentation only; no authentication required.",
-    ),
-    McpPreset(
-        name="aws-docs",
-        display_name="AWS Documentation",
-        category="docs",
-        description="Search AWS documentation and service guidance through AWS Labs' documentation MCP server.",
-        docs_url="https://awslabs.github.io/mcp/servers/aws-documentation-mcp-server/",
-        transport="stdio",
-        install_supported=True,
-        brand_domain="aws.amazon.com",
-        brand_color="#FF9900",
-        requires="uvx",
-        server=MCPServerConfig(
-            type="stdio",
-            command="uvx",
-            args=["awslabs.aws-documentation-mcp-server@latest"],
-            env={"FASTMCP_LOG_LEVEL": "ERROR", "AWS_DOCUMENTATION_PARTITION": "aws"},
-            tool_timeout=60,
-        ),
-    ),
-    McpPreset(
-        name="brave-search",
-        display_name="Brave Search",
-        category="web",
-        description="Run web, news, image, video, and local search through Brave Search.",
-        docs_url="https://www.npmjs.com/package/@brave/brave-search-mcp-server",
-        transport="stdio",
-        install_supported=True,
-        brand_domain="brave.com",
-        brand_color="#FB542B",
-        requires="Node.js, npx, and Brave Search API key",
-        server=MCPServerConfig(
-            type="stdio",
-            command="npx",
-            args=["-y", "@brave/brave-search-mcp-server@latest", "--transport", "stdio"],
-            tool_timeout=45,
-        ),
-        fields=(
-            McpPresetField(
-                name="brave_api_key",
-                label="Brave Search API key",
-                target=("env", "BRAVE_API_KEY"),
-                env_var="BRAVE_API_KEY",
-                placeholder="BSA...",
-            ),
-        ),
-    ),
-    McpPreset(
-        name="postman",
-        display_name="Postman",
-        category="api",
-        description="Inspect and manage Postman APIs, collections, and workspaces through the local MCP server.",
-        docs_url="https://learning.postman.com/docs/developer/postman-api/postman-mcp-server/postman-mcp-local-server",
-        transport="stdio",
-        install_supported=True,
-        brand_domain="postman.com",
-        brand_color="#FF6C37",
-        requires="Node.js, npx, and Postman API key",
-        server=MCPServerConfig(
-            type="stdio",
-            command="npx",
-            args=["-y", "@postman/postman-mcp-server@latest", "--full"],
-            tool_timeout=60,
-        ),
-        fields=(
-            McpPresetField(
-                name="postman_api_key",
-                label="Postman API key",
-                target=("env", "POSTMAN_API_KEY"),
-                env_var="POSTMAN_API_KEY",
-                placeholder="PMAK-...",
-            ),
-        ),
-    ),
-    McpPreset(
-        name="figma",
-        display_name="Figma",
-        category="design",
-        description="Read design context from Figma using the local Dev Mode MCP server.",
-        docs_url="https://help.figma.com/hc/en-us/articles/32132100833559-Guide-to-the-Figma-MCP-server",
-        transport="streamableHttp",
-        install_supported=True,
-        brand_domain="figma.com",
-        brand_color="#F24E1E",
-        requires="Figma desktop app with MCP enabled",
-        server=MCPServerConfig(
-            type="streamableHttp",
-            url="http://127.0.0.1:3845/mcp",
-            tool_timeout=45,
-        ),
-        note="Requires Figma Desktop Dev Mode MCP to be running locally.",
-    ),
-    McpPreset(
-        name="github",
-        display_name="GitHub",
-        category="code",
-        description="Repository, issue, and pull request workflows via GitHub's MCP server.",
-        docs_url="https://github.com/github/github-mcp-server",
-        transport="stdio",
-        install_supported=True,
-        brand_domain="github.com",
-        brand_color="#24292F",
-        requires="Docker and GitHub token",
-        server=MCPServerConfig(
-            type="stdio",
-            command="docker",
-            args=[
-                "run",
-                "-i",
-                "--rm",
-                "-e",
-                "GITHUB_PERSONAL_ACCESS_TOKEN",
-                "ghcr.io/github/github-mcp-server",
-            ],
-            tool_timeout=60,
-        ),
-        fields=(
-            McpPresetField(
-                name="github_token",
-                label="GitHub token",
-                target=("env", "GITHUB_PERSONAL_ACCESS_TOKEN"),
-                env_var="GITHUB_PERSONAL_ACCESS_TOKEN",
-                placeholder="ghp_...",
-            ),
-        ),
-    ),
-    McpPreset(
-        name="supabase",
-        display_name="Supabase",
-        category="database",
-        description="Inspect and manage Supabase projects through the Supabase MCP server.",
-        docs_url="https://supabase.com/docs/guides/ai-tools/mcp",
-        transport="stdio",
-        install_supported=True,
-        brand_domain="supabase.com",
-        brand_color="#3ECF8E",
-        requires="Node.js, npx, and Supabase access token",
-        server=MCPServerConfig(
-            type="stdio",
-            command="npx",
-            args=["-y", "@supabase/mcp-server-supabase@latest", "--read-only"],
-            tool_timeout=60,
-        ),
-        fields=(
-            McpPresetField(
-                name="supabase_access_token",
-                label="Supabase access token",
-                target=("env", "SUPABASE_ACCESS_TOKEN"),
-                env_var="SUPABASE_ACCESS_TOKEN",
-                placeholder="sbp_...",
-            ),
-        ),
-        note="MVP config starts read-only by default.",
     ),
 )
 
@@ -610,6 +388,37 @@ def _materialize_server(
         elif target_kind == "url_param":
             cfg.url = _url_with_param(cfg.url, target_name, value)
     return _with_managed_stdio_cwd(preset.name, cfg)
+
+
+def install_desktop_default_mcp_servers(config: Any) -> bool:
+    """Install the desktop's first-launch MCP defaults without embedding secrets."""
+    changed = False
+    for name in DESKTOP_DEFAULT_MCP_PRESETS:
+        if name in config.tools.mcp_servers:
+            continue
+        preset = _preset_by_name(name)
+        if name == "juyuan" and not os.environ.get("JUYUAN_MCP_TOKEN"):
+            # Keep a credential-free placeholder in config so the connector is
+            # installed in the toolbox, but do not make startup connect to an
+            # unauthenticated remote endpoint.
+            server = MCPServerConfig(
+                type="streamableHttp",
+                connect_timeout=10,
+                tool_timeout=60,
+            )
+        else:
+            server = _materialize_server(preset, {}, None)
+        config.tools.mcp_servers[name] = server
+        changed = True
+    return changed
+
+
+def prune_retired_desktop_mcp_presets(config: Any) -> bool:
+    """Remove only presets formerly shipped by desktop; preserve custom MCPs."""
+    removed = RETIRED_DESKTOP_MCP_PRESETS.intersection(config.tools.mcp_servers)
+    for name in removed:
+        config.tools.mcp_servers.pop(name, None)
+    return bool(removed)
 
 
 def _command_available(command: str) -> bool:

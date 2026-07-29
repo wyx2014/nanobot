@@ -1338,6 +1338,18 @@ def replay_transcript_to_ui_messages(
     def _new_id(prefix: str, idx: int) -> str:
         return f"{prefix}-{idx}-{uuid.uuid4().hex[:8]}"
 
+    def _created_at(idx: int) -> int:
+        """Use the event's persisted wall clock, never the history load time."""
+        if 0 <= idx < len(lines):
+            value = lines[idx].get("recorded_at")
+            if isinstance(value, (int, float)) and value >= 0:
+                timestamp = int(value)
+                if timestamp >= 1_000_000_000_000:
+                    return timestamp
+                if timestamp >= 1_000_000_000:
+                    return timestamp * 1000
+        return _ts_base + idx
+
     def _new_activity_segment(*, activate: bool = True) -> str:
         nonlocal active_activity_segment_id, activity_segment_counter
         activity_segment_counter += 1
@@ -1479,7 +1491,7 @@ def replay_transcript_to_ui_messages(
             "narrationStreamId": stream_key,
             "activitySegmentId": segment,
             **turn_fields,
-            "createdAt": _ts_base + idx,
+            "createdAt": _created_at(idx),
         })
 
     def attach_reasoning_chunk(
@@ -1536,7 +1548,7 @@ def replay_transcript_to_ui_messages(
                 "reasoningStreaming": True,
                 "activitySegmentId": segment,
                 **turn_fields,
-                "createdAt": _ts_base + idx,
+                "createdAt": _created_at(idx),
             },
         )
 
@@ -1627,6 +1639,16 @@ def replay_transcript_to_ui_messages(
                 messages[i] = {
                     **messages[i],
                     "latencyMs": latency_ms,
+                    "isStreaming": False,
+                }
+                return
+
+    def stamp_completed_at(completed_at_ms: int) -> None:
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant" and messages[i].get("kind") != "trace":
+                messages[i] = {
+                    **messages[i],
+                    "completedAt": completed_at_ms,
                     "isStreaming": False,
                 }
                 return
@@ -1760,7 +1782,7 @@ def replay_transcript_to_ui_messages(
                 {
                     "id": _new_id("as", idx),
                     "role": "assistant",
-                    "createdAt": _ts_base + idx,
+                    "createdAt": _created_at(idx),
                     **extra,
                 },
             )
@@ -1843,7 +1865,7 @@ def replay_transcript_to_ui_messages(
                     "fileEdits": [],
                     "activitySegmentId": segment,
                     **turn_fields,
-                    "createdAt": _ts_base + idx,
+                    "createdAt": _created_at(idx),
                 },
             )
             target_index = len(messages) - 1
@@ -1908,7 +1930,7 @@ def replay_transcript_to_ui_messages(
                 "role": "user",
                 "content": text_s,
                 **_turn_fields(rec, "user"),
-                "createdAt": _ts_base + idx,
+                "createdAt": _created_at(idx),
             }
             if media_att:
                 row["media"] = media_att
@@ -1968,7 +1990,7 @@ def replay_transcript_to_ui_messages(
                                 else {}
                             ),
                             **_turn_fields(rec, "answer"),
-                            "createdAt": _ts_base + idx,
+                            "createdAt": _created_at(idx),
                         },
                     )
             buffer_parts.append(chunk)
@@ -2010,7 +2032,7 @@ def replay_transcript_to_ui_messages(
                                 else {}
                             ),
                             **_turn_fields(rec, "answer"),
-                            "createdAt": _ts_base + idx,
+                            "createdAt": _created_at(idx),
                         },
                     )
                 else:
@@ -2148,7 +2170,7 @@ def replay_transcript_to_ui_messages(
                             **({"agentUI": agent_ui} if isinstance(agent_ui, dict) else {}),
                             "activitySegmentId": segment,
                             **_turn_fields(rec, "activity"),
-                            "createdAt": _ts_base + idx,
+                            "createdAt": _created_at(idx),
                         },
                     )
                 continue
@@ -2258,10 +2280,31 @@ def replay_transcript_to_ui_messages(
                             },
                         }
             prune_reasoning_only()
+            turn = rec.get("turn")
             lat = rec.get("latency_ms")
+            if (
+                not isinstance(lat, (int, float))
+                and isinstance(turn, dict)
+            ):
+                lat = turn.get("duration_ms")
             if isinstance(lat, (int, float)) and lat >= 0:
                 stamp_latency(int(lat))
-            stamp_usage(rec.get("usage"))
+            completed_at = (
+                turn.get("completed_at")
+                if isinstance(turn, dict)
+                else rec.get("recorded_at")
+            )
+            if not isinstance(completed_at, (int, float)):
+                completed_at = rec.get("recorded_at")
+            if isinstance(completed_at, (int, float)) and completed_at >= 0:
+                completed_at_ms = int(completed_at)
+                if completed_at_ms < 1_000_000_000_000:
+                    completed_at_ms *= 1000
+                stamp_completed_at(completed_at_ms)
+            terminal_usage = rec.get("usage")
+            if not isinstance(terminal_usage, dict) and isinstance(turn, dict):
+                terminal_usage = turn.get("usage")
+            stamp_usage(terminal_usage)
             buffer_message_id = None
             buffer_parts = []
             continue

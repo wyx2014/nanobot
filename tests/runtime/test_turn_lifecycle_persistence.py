@@ -72,6 +72,11 @@ async def test_terminal_barrier_persists_before_registry_becomes_idle(
         expected_turn_id="turn-a",
         status=TurnStatus.COMPLETED,
         finish_reason=FinishReason.SUCCESS,
+        usage={
+            "prompt_tokens": 1200,
+            "completion_tokens": 34,
+            "total_tokens": 1234,
+        },
     )
 
     assert [row["event"] for row in rows] == [
@@ -79,6 +84,11 @@ async def test_terminal_barrier_persists_before_registry_becomes_idle(
         "turn_completed",
     ]
     assert rows[-1]["event_id"] == "terminal_epoch-a_turn-a"
+    assert rows[-1]["turn"]["usage"] == {
+        "prompt_tokens": 1200,
+        "completion_tokens": 34,
+        "total_tokens": 1234,
+    }
     assert state.active_turn_id(session.session_key) is None
     latest = state.latest_turn_snapshot(session.session_key)
     assert latest is not None

@@ -851,8 +851,9 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
 
     config_path = Path(config).expanduser().resolve() if config else get_config_path()
     set_config_path(config_path)
+    first_launch = not config_path.exists()
     changed = False
-    if config_path.exists():
+    if not first_launch:
         try:
             loaded = resolve_config_env_vars(load_config(config_path))
         except ValueError as e:
@@ -861,6 +862,24 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
     else:
         loaded = NanobotConfig()
         changed = True
+
+    from nanobot.webui.mcp_presets_api import (
+        install_desktop_default_mcp_servers,
+        prune_retired_desktop_mcp_presets,
+    )
+
+    if first_launch:
+        changed = install_desktop_default_mcp_servers(loaded) or changed
+    if not loaded.transcription.provider:
+        loaded.transcription.enabled = True
+        loaded.transcription.provider = "stepfun"
+        loaded.transcription.model = "stepaudio-2.5-asr"
+        loaded.transcription.language = "zh"
+        changed = True
+    from nanobot.webui.settings_api import ensure_model_capability_defaults
+
+    changed = ensure_model_capability_defaults(loaded) or changed
+    changed = prune_retired_desktop_mcp_presets(loaded) or changed
 
     if workspace:
         workspace_path = Path(workspace).expanduser()
