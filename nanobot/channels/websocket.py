@@ -59,7 +59,18 @@ from nanobot.webui.interactive_prompt import (
     normalize_interactive_prompt,
     normalize_interactive_prompt_answer,
 )
+from nanobot.webui.media_cache import (
+    DEFAULT_MEDIA_CACHE_CLEANUP_INTERVAL_S,
+    DEFAULT_MEDIA_CACHE_MAX_BYTES,
+    DEFAULT_MEDIA_CACHE_STARTUP_DELAY_S,
+    DEFAULT_MEDIA_CACHE_TTL_S,
+)
 from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
+from nanobot.webui.metadata import (
+    ACTIVE_TURN_CLIENT_TURN_METADATA_KEY,
+    ACTIVE_TURN_CORRECTION_METADATA_KEY,
+    WEBUI_TURN_METADATA_KEY,
+)
 from nanobot.webui.session_artifacts import (
     explicit_artifact_row,
     registered_artifact_row,
@@ -89,6 +100,25 @@ def normalize_skill_scope(raw: Any) -> dict[str, list[str]]:
             names.append(name)
         normalized[key] = names
     return normalized
+
+
+def _artifact_rejection_reason(raw_path: str, project_root: Path) -> str:
+    """Classify why an explicit output wasn't eligible as a project artifact."""
+
+    try:
+        root = project_root.expanduser().resolve(strict=False)
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root)
+    except ValueError:
+        return "outside_project"
+    except (OSError, RuntimeError):
+        return "invalid_path"
+    if not resolved.is_file():
+        return "missing_or_not_file"
+    return "excluded_project_path"
 
 
 class WebSocketConfig(Base):
@@ -130,6 +160,26 @@ class WebSocketConfig(Base):
     max_message_bytes: int = Field(default=37_748_736, ge=1024, le=41_943_040)
     ping_interval_s: float = Field(default=20.0, ge=5.0, le=300.0)
     ping_timeout_s: float = Field(default=20.0, ge=5.0, le=300.0)
+    media_cache_max_bytes: int = Field(
+        default=DEFAULT_MEDIA_CACHE_MAX_BYTES,
+        ge=64 * 1024 * 1024,
+        le=50 * 1024 * 1024 * 1024,
+    )
+    media_cache_ttl_s: int = Field(
+        default=DEFAULT_MEDIA_CACHE_TTL_S,
+        ge=60 * 60,
+        le=365 * 24 * 60 * 60,
+    )
+    media_cache_cleanup_interval_s: int = Field(
+        default=DEFAULT_MEDIA_CACHE_CLEANUP_INTERVAL_S,
+        ge=5 * 60,
+        le=7 * 24 * 60 * 60,
+    )
+    media_cache_startup_delay_s: int = Field(
+        default=DEFAULT_MEDIA_CACHE_STARTUP_DELAY_S,
+        ge=0,
+        le=10 * 60,
+    )
     ssl_certfile: str = ""
     ssl_keyfile: str = ""
 
@@ -357,6 +407,9 @@ class WebSocketChannel(BaseChannel):
         self._transcripts = gateway.transcripts
         self._workspaces = gateway.workspaces
         self._voice_streams = WebuiVoiceStreamManager(self._send_event)
+        from nanobot.browser.mirror import browser_mirror
+
+        browser_mirror.set_event_sink(self.send_browser_event)
 
         self._stream_text_buffers: dict[tuple[str, str], list[str]] = {}
         self._resumable_streams: dict[str, tuple[str, str]] = {}
@@ -416,6 +469,9 @@ class WebSocketChannel(BaseChannel):
         """Replay goal/run strip state after subscribe (same-process refresh)."""
         await self._maybe_push_active_goal_state(chat_id)
         await self._maybe_push_turn_run_wall_clock(chat_id)
+        from nanobot.browser.mirror import browser_mirror
+
+        await browser_mirror.replay(chat_id)
 
     def _session_expert_team(self, chat_id: str) -> dict[str, Any] | None:
         if self.gateway.session_manager is None:
@@ -485,12 +541,16 @@ class WebSocketChannel(BaseChannel):
             if first_phase
             else len(members)
         )
+        has_data_package = team_id == "asset-research-team"
         normalized_members: list[dict[str, Any]] = []
         for member in members:
             member_id = str(member.get("id") or "").strip()
             if not member_id:
                 continue
-            running = first_phase is None or member.get("phase") == first_phase
+            running = (
+                not has_data_package
+                and (first_phase is None or member.get("phase") == first_phase)
+            )
             normalized_members.append({
                 "id": member_id,
                 "name": str(member.get("name") or member_id),
@@ -508,13 +568,18 @@ class WebSocketChannel(BaseChannel):
             "team_id": team_id,
             "team_name": team_name,
             "members": normalized_members,
+            "has_data_package": has_data_package,
             "revision": 0,
             "turn_id": self.gateway.state.active_turn_id(f"websocket:{chat_id}"),
-            "stage": "members",
+            "stage": "preparation" if has_data_package else "members",
             "status": "running",
             "note": (
-                f"{len(normalized_members)} 位专家将分阶段协作，"
-                f"首阶段 {first_phase_count} 位并行研究"
+                "Team Lead 正在建立公司基础数据包，完成后启动四位专家"
+                if has_data_package
+                else (
+                    f"{len(normalized_members)} 位专家将分阶段协作，"
+                    f"首阶段 {first_phase_count} 位并行研究"
+                )
                 if first_phase and first_phase_count < len(normalized_members)
                 else f"{len(normalized_members)} 位专家正在并行研究"
             ),
@@ -536,6 +601,30 @@ class WebSocketChannel(BaseChannel):
         run_status = str(run.get("status") or "running")
         completed = stage == "delivered" and run_status == "completed"
         steps: list[dict[str, Any]] = []
+        terminal_step_status = (
+            "error" if run_status == "failed"
+            else "interrupted" if run_status in {"cancelled", "interrupted"}
+            else None
+        )
+        if run.get("has_data_package") is True:
+            data_package_status = (
+                terminal_step_status
+                if terminal_step_status is not None and stage == "preparation"
+                else "running" if stage == "preparation"
+                else "completed"
+            )
+            steps.append({
+                "id": "data-package",
+                "title": "建立基础数据包",
+                "detail": (
+                    "正在统一公司摘要、财务指标、公告新闻和行业数据"
+                    if stage == "preparation"
+                    else "基础数据包已建立，专家共享同一数据口径"
+                ),
+                "status": data_package_status,
+                "kind": "preparation",
+                "stage_key": "preparation",
+            })
         for member in run.get("members", []):
             if not isinstance(member, dict):
                 continue
@@ -557,21 +646,16 @@ class WebSocketChannel(BaseChannel):
                     else {}
                 ),
             })
-        terminal_step_status = (
-            "error" if run_status == "failed"
-            else "interrupted" if run_status in {"cancelled", "interrupted"}
-            else None
-        )
         lead_status = (
             "completed" if stage in {"audit", "delivered"}
-            else "running" if stage == "synthesis"
             else terminal_step_status if terminal_step_status is not None
+            else "running" if stage == "synthesis"
             else "pending"
         )
         audit_status = (
             "completed" if stage == "delivered"
-            else "running" if stage == "audit"
             else terminal_step_status if terminal_step_status is not None
+            else "running" if stage == "audit"
             else "pending"
         )
         steps.extend([
@@ -581,6 +665,8 @@ class WebSocketChannel(BaseChannel):
                 "detail": (
                     "已完成成员结论的交叉质证与汇总"
                     if stage in {"audit", "delivered"}
+                    else "交叉质证与汇总未完成，团队运行已停止"
+                    if terminal_step_status is not None
                     else "正在交叉质证并汇总各成员结论"
                     if stage == "synthesis"
                     else "等待各位专家交付后进行交叉质证"
@@ -595,6 +681,8 @@ class WebSocketChannel(BaseChannel):
                 "detail": (
                     "最终报告已完成审校并交付"
                     if completed
+                    else "报告审校与交付未完成，团队运行已停止"
+                    if terminal_step_status is not None
                     else "正在核验关键结论并检查报告产物"
                     if stage == "audit"
                     else "等待交叉质证完成后核验关键结论并生成报告"
@@ -819,6 +907,7 @@ class WebSocketChannel(BaseChannel):
 
         self._running = True
         self._stop_event = asyncio.Event()
+        self._media.start_cache_maintenance()
 
         ssl_context = self._build_ssl_context()
         scheme = "wss" if ssl_context else "ws"
@@ -1151,6 +1240,34 @@ class WebSocketChannel(BaseChannel):
                 **binding,
             )
             return
+        if t == "browser_control":
+            cid = envelope.get("chat_id")
+            action = envelope.get("action")
+            if not _is_valid_chat_id(cid):
+                await self._send_event(connection, "error", detail="invalid chat_id")
+                return
+            if action not in {"pause", "resume", "stop", "capture"}:
+                await self._send_event(
+                    connection,
+                    "error",
+                    chat_id=cid,
+                    detail="invalid_browser_control",
+                )
+                return
+            from nanobot.browser.mirror import browser_mirror
+
+            try:
+                await browser_mirror.control(cid, action)
+            except Exception as exc:
+                self.logger.warning("browser control {} failed for {}: {}", action, cid, exc)
+                await self._send_event(
+                    connection,
+                    "error",
+                    chat_id=cid,
+                    detail="browser_control_failed",
+                    reason=str(exc),
+                )
+            return
         if t == "transcribe_audio":
             event, payload = await webui_transcription_event(envelope)
             await self._send_event(connection, event, **payload)
@@ -1236,6 +1353,13 @@ class WebSocketChannel(BaseChannel):
             if envelope.get("webui") is True:
                 metadata["webui"] = True
                 metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
+                active_turn_id = self.gateway.state.active_turn_id(f"websocket:{cid}")
+                if active_turn_id:
+                    client_turn_id = str(metadata.get(WEBUI_TURN_METADATA_KEY) or "").strip()
+                    metadata[WEBUI_TURN_METADATA_KEY] = active_turn_id
+                    metadata[ACTIVE_TURN_CORRECTION_METADATA_KEY] = True
+                    if client_turn_id and client_turn_id != active_turn_id:
+                        metadata[ACTIVE_TURN_CLIENT_TURN_METADATA_KEY] = client_turn_id
             cli_apps = normalize_cli_app_mentions(envelope.get("cli_apps"))
             if cli_apps:
                 metadata["cli_apps"] = cli_apps
@@ -1269,6 +1393,23 @@ class WebSocketChannel(BaseChannel):
                 **binding,
                 "session_key": f"websocket:{cid}",
             }
+            if metadata.get(ACTIVE_TURN_CORRECTION_METADATA_KEY) is True:
+                await asyncio.to_thread(
+                    self.gateway.logs.write,
+                    level="info",
+                    component="turns",
+                    event_name="active_turn_correction_bound",
+                    message="follow-up instruction bound to the active turn",
+                    project_id=str(binding.get("project_id") or "") or None,
+                    session_id=str(binding.get("session_id") or "") or None,
+                    turn_id=str(metadata.get(WEBUI_TURN_METADATA_KEY) or "") or None,
+                    details={
+                        "chat_id": cid,
+                        "client_turn_id": metadata.get(
+                            ACTIVE_TURN_CLIENT_TURN_METADATA_KEY
+                        ),
+                    },
+                )
             image_generation = envelope.get("image_generation")
             if isinstance(image_generation, dict) and image_generation.get("enabled") is True:
                 aspect_ratio = image_generation.get("aspect_ratio")
@@ -1386,6 +1527,7 @@ class WebSocketChannel(BaseChannel):
         if not self._running:
             return
         self._running = False
+        await self._media.stop_cache_maintenance()
         if self._stop_event:
             self._stop_event.set()
         if self._server_task:
@@ -1405,6 +1547,9 @@ class WebSocketChannel(BaseChannel):
         self._stream_text_buffers.clear()
         self._resumable_streams.clear()
         self._team_runs.clear()
+        from nanobot.browser.mirror import browser_mirror
+
+        browser_mirror.set_event_sink(None)
 
     async def _safe_send_to(self, connection: Any, raw: str, *, label: str = "") -> None:
         """Send a raw frame to one connection, cleaning up on ConnectionClosed."""
@@ -1416,6 +1561,19 @@ class WebSocketChannel(BaseChannel):
         except Exception:
             self.logger.exception("send failed{}", label)
             raise
+
+    async def send_browser_event(self, payload: dict[str, Any]) -> None:
+        """Fan out one ephemeral browser frame/status event to its chat."""
+
+        chat_id = payload.get("chat_id")
+        if not _is_valid_chat_id(chat_id):
+            return
+        conns = list(self._subs.get(chat_id, ()))
+        if not conns:
+            return
+        raw = json.dumps(payload, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" browser_event ")
 
     async def send(self, msg: OutboundMessage) -> None:
         if msg.metadata.get("_runtime_status_updated"):
@@ -1828,6 +1986,13 @@ class WebSocketChannel(BaseChannel):
                         session_key=session_key,
                     )
                     if artifact is None:
+                        await self._log_rejected_artifact_candidate(
+                            session_key=session_key,
+                            chat_id=chat_id,
+                            raw_path=raw_path,
+                            project_root=scope.project_path,
+                            source="file_edit",
+                        )
                         continue
                     record = await asyncio.to_thread(
                         self.gateway.state.register_artifact,
@@ -1923,6 +2088,46 @@ class WebSocketChannel(BaseChannel):
                     "exception_type": type(exc).__name__,
                 },
             )
+
+    async def _log_rejected_artifact_candidate(
+        self,
+        *,
+        session_key: str,
+        chat_id: str,
+        raw_path: str,
+        project_root: Path,
+        source: str,
+    ) -> None:
+        session = self.gateway.state.get_session(session_key)
+        reason = _artifact_rejection_reason(raw_path, project_root)
+        self.logger.warning(
+            "artifact candidate rejected chat_id={} file={} reason={} project_root={}",
+            chat_id,
+            Path(raw_path).name,
+            reason,
+            project_root,
+        )
+        await asyncio.to_thread(
+            self.gateway.logs.write,
+            level="warning",
+            component="artifacts",
+            event_name="artifact_candidate_rejected",
+            message="tool output was not eligible for the current project artifact index",
+            project_id=session.project_id if session is not None else None,
+            session_id=session.id if session is not None else None,
+            error_code=(
+                "ARTIFACT_OUTSIDE_PROJECT"
+                if reason == "outside_project"
+                else "ARTIFACT_NOT_PROJECT_SCOPED"
+            ),
+            details={
+                "chat_id": chat_id,
+                "file_name": Path(raw_path).name,
+                "project_root": str(project_root),
+                "reason": reason,
+                "source": source,
+            },
+        )
 
     async def _register_output_artifacts(
         self,
@@ -2022,6 +2227,13 @@ class WebSocketChannel(BaseChannel):
                     session_key=session_key,
                 )
                 if artifact is None:
+                    await self._log_rejected_artifact_candidate(
+                        session_key=session_key,
+                        chat_id=chat_id,
+                        raw_path=raw_path,
+                        project_root=scope.project_path,
+                        source="tool_output_or_media",
+                    )
                     continue
                 record = await asyncio.to_thread(
                     self.gateway.state.register_artifact,
@@ -2481,7 +2693,7 @@ class WebSocketChannel(BaseChannel):
     async def send_team_member_updated(self, chat_id: str, member: dict[str, Any]) -> None:
         run_id = str(member.get("run_id") or "")
         run = self._team_runs.get((chat_id, run_id))
-        persist_transition = False
+        persist_projection = False
         if run is not None:
             member_id = str(member.get("id") or "")
             projected_member = next(
@@ -2495,6 +2707,7 @@ class WebSocketChannel(BaseChannel):
             if projected_member is not None:
                 incoming_status = str(member.get("status") or "running")
                 previous_status = str(projected_member.get("member_status") or "")
+                previous_activity = str(projected_member.get("activity") or "").strip()
                 projected_member["member_status"] = incoming_status
                 projected_member["status"] = (
                     "running" if incoming_status == "running" else "completed"
@@ -2502,7 +2715,27 @@ class WebSocketChannel(BaseChannel):
                 activity = str(member.get("activity") or "").strip()
                 if activity:
                     projected_member["activity"] = activity
-                persist_transition = incoming_status != previous_status
+                # Running members can spend minutes in the same lifecycle
+                # state while moving through several visible research actions.
+                # Persist a distinct activity as a new workflow revision so
+                # reconnects and canonical-plan clients do not remain stuck on
+                # the initial "starting" description.
+                persist_projection = (
+                    incoming_status != previous_status
+                    or bool(activity and activity != previous_activity)
+                )
+            if (
+                str(run.get("stage") or "members") == "preparation"
+                and str(member.get("status") or "") in {
+                    "running",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }
+            ):
+                run["stage"] = "members"
+                run["note"] = "基础数据包已建立，四位专家正在并行研究"
+                persist_projection = True
             all_members_terminal = bool(run.get("members")) and all(
                 isinstance(item, dict)
                 and str(item.get("member_status") or "")
@@ -2515,8 +2748,8 @@ class WebSocketChannel(BaseChannel):
             ):
                 run["stage"] = "synthesis"
                 run["note"] = "专家研究已全部交付，主笔正在交叉质证与汇总"
-                persist_transition = True
-        if persist_transition:
+                persist_projection = True
+        if persist_projection:
             self._persist_team_run_projection(
                 chat_id,
                 run_id,

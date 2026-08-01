@@ -672,6 +672,21 @@ def _parse_model_capabilities(
     return list(dict.fromkeys(raw)) or list(default or ["text"])
 
 
+def _infer_model_capabilities(provider: str, model: str) -> list[ModelCapability]:
+    """Infer the user-facing purpose from stable provider/model identifiers.
+
+    Model-list APIs rarely return portable capability metadata.  Audio model
+    names are, however, explicit enough to make the normal setup flow
+    automatic while keeping the existing explicit capabilities parameter as
+    an advanced override.
+    """
+    normalized = model.strip().lower()
+    speech_markers = ("whisper", "transcribe", "transcription", "-asr", "_asr", "sensevoice")
+    if any(marker in normalized for marker in speech_markers):
+        return ["speech_to_text"]
+    return ["text"]
+
+
 def _matching_capability_preset(
     config: Any,
     *,
@@ -738,6 +753,11 @@ def ensure_model_capability_defaults(config: Any) -> bool:
             for capability in preset.capabilities
             if capability not in _REMOVED_MODEL_CAPABILITIES
         ]
+        inferred = _infer_model_capabilities(preset.provider, preset.model)
+        # Existing configurations created before automatic detection are
+        # normalized here as well, so users do not need to reclassify them.
+        if capabilities != inferred:
+            capabilities = inferred
         if preset.capabilities != capabilities:
             preset.capabilities = capabilities
             changed = True
@@ -1218,7 +1238,7 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
     raw_name = (_query_first(query, "name") or label).strip()
     model = (_query_first(query, "model") or "").strip()
     provider = (_query_first(query, "provider") or "").strip()
-    capabilities = _parse_model_capabilities(_query_first(query, "capabilities"))
+    raw_capabilities = _query_first(query, "capabilities")
 
     if not label:
         label = raw_name
@@ -1226,6 +1246,12 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
         raise WebUISettingsError("model is required")
     if not provider:
         raise WebUISettingsError("provider is required")
+
+    capabilities = (
+        _parse_model_capabilities(raw_capabilities)
+        if raw_capabilities is not None
+        else _infer_model_capabilities(provider, model)
+    )
 
     name = _model_configuration_slug(raw_name or label)
     config = load_config()
@@ -1247,9 +1273,11 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
         reasoning_effort=base.reasoning_effort,
         capabilities=capabilities,
     )
-    if "text" in capabilities:
+    if "text" in capabilities and not config.model_defaults.text:
         config.agents.defaults.model_preset = name
         config.model_defaults.text = name
+    if "speech_to_text" in capabilities and not config.model_defaults.speech_to_text:
+        config.model_defaults.speech_to_text = name
     save_config(config)
     return settings_payload()
 

@@ -89,6 +89,10 @@ def build_gateway_services(
     media = WebUIMediaGateway(
         workspace_path=workspace_path,
         logger=logger,
+        cache_max_bytes=config.media_cache_max_bytes,
+        cache_ttl_s=config.media_cache_ttl_s,
+        cache_cleanup_interval_s=config.media_cache_cleanup_interval_s,
+        cache_startup_delay_s=config.media_cache_startup_delay_s,
     )
     journal = SessionEventJournal(
         state=state,

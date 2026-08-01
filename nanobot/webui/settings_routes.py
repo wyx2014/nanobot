@@ -64,6 +64,7 @@ _PROJECT_SKILL_VALUES_HEADER_MAX_BYTES = 64 * 1024
 
 _MCP_PRESET_ACTIONS_BY_PATH = {
     "/api/settings/mcp-presets/enable": "enable",
+    "/api/settings/mcp-presets/update": "update",
     "/api/settings/mcp-presets/remove": "remove",
     "/api/settings/mcp-presets/test": "test",
     "/api/settings/mcp-presets/custom": "custom",

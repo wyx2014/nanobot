@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import time
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -132,6 +133,7 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
+    provider_timing_callback: Callable[[dict[str, Any]], Any] | None = None
 
 
 @dataclass(slots=True)
@@ -531,7 +533,13 @@ class AgentRunner:
             live_usage["confirmed_new_tokens"] = confirmed_total - confirmed_cached
             live_usage["new_tokens"] = live_usage["confirmed_new_tokens"]
             await hook.on_usage(context, live_usage, estimated=True)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            response = await self._request_model(
+                spec,
+                messages_for_model,
+                hook,
+                context,
+                prompt_estimate=prompt_estimate,
+            )
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -940,6 +948,8 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         hook: AgentHook,
         context: AgentHookContext,
+        *,
+        prompt_estimate: int | None = None,
     ):
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
@@ -966,6 +976,57 @@ class AgentRunner:
             and spec.progress_callback is not None
             and getattr(self.provider, "supports_progress_deltas", False) is True
         )
+        streaming = wants_streaming or wants_progress_streaming
+        provider_name = type(self.provider).__name__
+        timing_base = {
+            "iteration": context.iteration,
+            "model": spec.model,
+            "provider": provider_name,
+            "prompt_estimate": max(0, int(prompt_estimate or 0)),
+            "prompt_estimate_unit": "tokens",
+            "streaming": streaming,
+        }
+
+        async def _emit_provider_timing(payload: dict[str, Any]) -> None:
+            callback = spec.provider_timing_callback
+            if callback is None:
+                return
+            try:
+                outcome = callback(payload)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception:
+                # Diagnostics must never be able to fail a model request.
+                logger.exception("Provider timing callback failed")
+
+        provider_started_at = 0.0
+        first_event_recorded = False
+
+        async def _mark_first_event(
+            first_event: str,
+            *,
+            observed: bool = True,
+        ) -> None:
+            nonlocal first_event_recorded
+            if first_event_recorded:
+                return
+            first_event_recorded = True
+            provider_ttft_ms = max(
+                0,
+                int(round((time.perf_counter() - provider_started_at) * 1000)),
+            )
+            await _emit_provider_timing({
+                **timing_base,
+                "event": "first_event",
+                "provider_ttft_ms": provider_ttft_ms,
+                "first_event": first_event,
+                "first_event_observed": observed,
+                "measurement": (
+                    "first_stream_event"
+                    if observed
+                    else "response_latency_fallback"
+                ),
+            })
 
         progress_state: dict[str, bool] | None = None
         live_file_edits: StreamingFileEditTracker | None = None
@@ -984,6 +1045,8 @@ class AgentRunner:
             )
 
         async def _tool_call_delta(delta: dict[str, Any]) -> None:
+            if delta:
+                await _mark_first_event("tool_call_delta")
             if live_file_edits is not None:
                 await live_file_edits.update(delta)
 
@@ -992,6 +1055,7 @@ class AgentRunner:
 
             async def _stream(delta: str) -> None:
                 if delta:
+                    await _mark_first_event("content_delta")
                     context.streamed_content = True
                 await hook.on_stream(context, delta)
 
@@ -999,6 +1063,7 @@ class AgentRunner:
                 nonlocal thinking_buf
                 if not delta:
                     return
+                await _mark_first_event("reasoning_delta")
                 prev_clean = strip_reasoning_tags(thinking_buf)
                 thinking_buf += delta
                 new_clean = strip_reasoning_tags(thinking_buf)
@@ -1014,7 +1079,11 @@ class AgentRunner:
                 **kwargs,
                 on_content_delta=_stream,
                 on_thinking_delta=_thinking,
-                on_tool_call_delta=_tool_call_delta if live_file_edits is not None else None,
+                on_tool_call_delta=(
+                    _tool_call_delta
+                    if live_file_edits is not None or spec.provider_timing_callback is not None
+                    else None
+                ),
                 on_stream_recover=_stream_recover,
             )
         elif wants_progress_streaming:
@@ -1026,6 +1095,7 @@ class AgentRunner:
                 nonlocal stream_buf
                 if not delta:
                     return
+                await _mark_first_event("content_delta")
                 prev_clean = strip_think(stream_buf)
                 stream_buf += delta
                 new_clean = strip_think(stream_buf)
@@ -1045,7 +1115,11 @@ class AgentRunner:
             coro = self.provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream_progress,
-                on_tool_call_delta=_tool_call_delta if live_file_edits is not None else None,
+                on_tool_call_delta=(
+                    _tool_call_delta
+                    if live_file_edits is not None or spec.provider_timing_callback is not None
+                    else None
+                ),
             )
         else:
             coro = self.provider.chat_with_retry(**kwargs)
@@ -1055,11 +1129,18 @@ class AgentRunner:
         # LLM timeout here, or healthy long reasoning streams can be killed just
         # because total elapsed time exceeded NANOBOT_LLM_TIMEOUT_S.
         outer_timeout_s = None if (wants_streaming or wants_progress_streaming) else timeout_s
+        await _emit_provider_timing({
+            **timing_base,
+            "event": "request_started",
+        })
+        provider_started_at = time.perf_counter()
         try:
             response = (
                 await coro if outer_timeout_s is None
                 else await asyncio.wait_for(coro, timeout=outer_timeout_s)
             )
+            if not first_event_recorded:
+                await _mark_first_event("response_completed", observed=False)
             if live_file_edits is not None:
                 await live_file_edits.flush()
                 if response.should_execute_tools:
@@ -1069,6 +1150,7 @@ class AgentRunner:
                     "Tool call did not complete.",
                 )
         except asyncio.TimeoutError:
+            await _mark_first_event("timeout", observed=False)
             if outer_timeout_s is None:
                 return LLMResponse(
                     content="Error calling LLM: stream stalled",

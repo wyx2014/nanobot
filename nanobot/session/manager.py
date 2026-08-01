@@ -33,6 +33,14 @@ _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
 _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_PREVIEW_MAX_RECORDS = 200
 _SESSION_LIST_PREVIEW_MAX_CHARS = 1_000_000
+MODEL_REPLAY_POLICY_KEY = "_model_replay_policy"
+MODEL_REPLAY_UI_ONLY = "ui_only"
+_INTERRUPTED_TURN_BOUNDARY = (
+    "The previous turn was interrupted. Its unfinished assistant text, tool calls, "
+    "and tool results were intentionally excluded. Treat the next user message as "
+    "the active task; do not reuse the interrupted turn's subject or data unless "
+    "the user explicitly asks to continue it."
+)
 _FORK_VOLATILE_METADATA_KEYS = {
     "goal_state",
     "pending_user_turn",
@@ -149,6 +157,110 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+    @staticmethod
+    def _interrupted_boundary_message() -> dict[str, str]:
+        return {
+            "role": "assistant",
+            "content": _INTERRUPTED_TURN_BOUNDARY,
+        }
+
+    @classmethod
+    def _append_interrupted_boundary(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        if (
+            messages
+            and messages[-1].get("role") == "assistant"
+            and messages[-1].get("content") == _INTERRUPTED_TURN_BOUNDARY
+        ):
+            return
+        messages.append(cls._interrupted_boundary_message())
+
+    @classmethod
+    def _filter_ui_only_replay(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Replace UI-only checkpoint payloads with one safe model boundary."""
+        filtered: list[dict[str, Any]] = []
+        skipped = False
+        for message in messages:
+            if message.get(MODEL_REPLAY_POLICY_KEY) == MODEL_REPLAY_UI_ONLY:
+                skipped = True
+                continue
+            if skipped:
+                cls._append_interrupted_boundary(filtered)
+                skipped = False
+            filtered.append(message)
+        if skipped:
+            cls._append_interrupted_boundary(filtered)
+        return filtered
+
+    @classmethod
+    def _collapse_legacy_incomplete_tool_turns(
+        cls,
+        messages: list[dict[str, Any]],
+        *,
+        keep_last_active_turn: bool,
+    ) -> list[dict[str, Any]]:
+        """Sanitize checkpoints written before replay policies were persisted.
+
+        A historical user turn that ends with raw tool calls/results and no
+        assistant answer is an interrupted turn, not a reusable example for a
+        later request. Replace that entire provider turn with a compact boundary
+        so neither its subject nor its unfinished payload can steer a new task.
+        The final turn remains intact while ``pending_user_turn`` says it is
+        still actively executing.
+        """
+        user_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "user"
+        ]
+        if not user_indexes:
+            return messages
+
+        out = list(messages[: user_indexes[0]])
+        for turn_number, start in enumerate(user_indexes):
+            end = (
+                user_indexes[turn_number + 1]
+                if turn_number + 1 < len(user_indexes)
+                else len(messages)
+            )
+            turn = messages[start:end]
+            is_last = turn_number == len(user_indexes) - 1
+            if is_last and keep_last_active_turn:
+                out.extend(turn)
+                continue
+
+            tool_indexes = [
+                index
+                for index, message in enumerate(turn)
+                if message.get("role") == "tool"
+                or (
+                    message.get("role") == "assistant"
+                    and bool(message.get("tool_calls"))
+                )
+            ]
+            if not tool_indexes:
+                out.extend(turn)
+                continue
+
+            last_tool_index = max(tool_indexes)
+            has_final_answer = any(
+                message.get("role") == "assistant"
+                and not message.get("tool_calls")
+                and bool(_text_preview(message.get("content")))
+                for message in turn[last_tool_index + 1 :]
+            )
+            if has_final_answer:
+                out.extend(turn)
+                continue
+
+            cls._append_interrupted_boundary(out)
+        return out
+
     def get_history(
         self,
         max_messages: int = 120,
@@ -156,6 +268,7 @@ class Session:
         max_tokens: int = 0,
         include_timestamps: bool = False,
         extend_to_user: bool = False,
+        include_ui_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input.
 
@@ -163,6 +276,8 @@ class Session:
         token budget from the tail (``max_tokens``) when provided.
         """
         unconsolidated = self.messages[self.last_consolidated:]
+        if not include_ui_only:
+            unconsolidated = self._filter_ui_only_replay(unconsolidated)
         max_messages = max_messages if max_messages > 0 else 120
         start_idx = recent_message_start_index(
             unconsolidated,
@@ -180,6 +295,12 @@ class Session:
                     start = i - 1
                 sliced = sliced[start:]
                 break
+
+        if not include_ui_only:
+            sliced = self._collapse_legacy_incomplete_tool_turns(
+                sliced,
+                keep_last_active_turn=bool(self.metadata.get("pending_user_turn")),
+            )
 
         # Drop orphan tool results at the front.
         start = find_legal_message_start(sliced)

@@ -108,3 +108,15 @@ def test_structured_finance_signature_is_stable_for_argument_order() -> None:
     )
 
     assert left == right
+
+
+def test_repeated_browser_navigation_to_same_url_is_blocked() -> None:
+    counts: dict[str, int] = {}
+    arguments = {"url": "https://xueqiu.com/k?q=%E5%8F%AF%E8%BD%AC%E5%80%BA"}
+
+    assert repeated_external_lookup_error("navigate", arguments, counts) is None
+    assert repeated_external_lookup_error("navigate", arguments, counts) is None
+    blocked = repeated_external_lookup_error("navigate", arguments, counts)
+
+    assert blocked is not None
+    assert "meaningfully different source" in blocked

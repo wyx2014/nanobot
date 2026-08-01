@@ -129,6 +129,15 @@ def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
     """Stable signature for repeated external lookups we want to throttle."""
     if not isinstance(arguments, dict):
         return None
+    normalized_tool_name = tool_name.lower()
+    if normalized_tool_name in {
+        "navigate",
+        "browser_navigate",
+        "mcp_playwright_browser_navigate",
+    }:
+        url = str(arguments.get("url") or "").strip()
+        if url:
+            return f"browser_navigate:{url.lower()}"
     if tool_name == "web_fetch":
         url = str(arguments.get("url") or "").strip()
         if url:

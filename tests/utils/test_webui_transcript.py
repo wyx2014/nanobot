@@ -534,6 +534,8 @@ def test_replay_delta_and_turn_end(tmp_path, monkeypatch) -> None:
     assert msgs[1]["role"] == "assistant"
     assert msgs[1]["content"] == "a"
     assert msgs[1]["reasoning"] == "think"
+    assert msgs[1]["reasoningDurationMs"] >= 0
+    assert msgs[1]["reasoningCompletedAt"] >= msgs[1]["reasoningStartedAt"]
     assert msgs[1]["latencyMs"] == 42
     assert msgs[1]["usage"] == {"inputTokens": 120, "outputTokens": 34}
 
@@ -1010,6 +1012,62 @@ def test_replay_replaces_streamed_report_with_authoritative_attachment_message()
     assert len(assistant) == 1
     assert assistant[0]["content"] == "青岛啤酒（600600.SH）投资研究报告"
     assert assistant[0]["media"][0]["name"] == "青岛啤酒投资研究报告.html"
+
+
+def test_replay_replaces_streamed_report_when_terminal_was_persisted_first() -> None:
+    """A durable terminal row must not split its late authoritative answer."""
+    final_text = "中科曙光四视角并行投研报告已完成，数据抽检全部通过（7/7项，偏差0.00%）。"
+    msgs = replay_transcript_to_ui_messages(
+        [
+            {
+                "event": "user",
+                "chat_id": "t-late-report",
+                "text": "帮我分析下中科曙光A股",
+                "turn_id": "turn-late-report",
+            },
+            {
+                "event": "delta",
+                "chat_id": "t-late-report",
+                "text": final_text,
+                "turn_id": "turn-late-report",
+            },
+            {
+                "event": "turn_completed",
+                "chat_id": "t-late-report",
+                "turn_id": "turn-late-report",
+                "turn": {
+                    "id": "turn-late-report",
+                    "status": "completed",
+                },
+            },
+            {
+                "event": "stream_end",
+                "chat_id": "t-late-report",
+                "turn_id": "turn-late-report",
+            },
+            {
+                "event": "message",
+                "chat_id": "t-late-report",
+                "text": final_text,
+                "media_urls": [{
+                    "url": "/api/media/report",
+                    "name": "中科曙光四视角并行投研报告.html",
+                }],
+                "replace_stream": True,
+                "turn_id": "turn-late-report",
+            },
+        ],
+    )
+
+    assistant = [
+        message
+        for message in msgs
+        if message["role"] == "assistant" and message.get("kind") != "trace"
+    ]
+    assert len(assistant) == 1
+    assert assistant[0]["turnId"] == "turn-late-report"
+    assert assistant[0]["content"] == final_text
+    assert assistant[0]["media"][0]["name"] == "中科曙光四视角并行投研报告.html"
 
 
 def test_replay_keeps_structured_progress_after_media_message() -> None:

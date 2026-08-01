@@ -255,6 +255,26 @@ def test_local_markdown_image_is_staged_and_rewritten(
     assert staged[0].read_bytes() == _PNG_BYTES
 
 
+def test_replaying_external_media_reuses_one_staged_copy(tmp_path: Path) -> None:
+    source = tmp_path / "project" / "report.pdf"
+    source.parent.mkdir()
+    source.write_bytes(b"%PDF-1.4\nreport")
+    media = tmp_path / "media"
+    media.mkdir()
+    media_dir = _fake_media_dir(media)
+    secret = b"stable-secret"
+
+    first = sign_or_stage_media_path(source, secret=secret, media_dir=media_dir)
+    second = sign_or_stage_media_path(source, secret=secret, media_dir=media_dir)
+
+    assert first is not None
+    assert second is not None
+    assert first["url"] == second["url"]
+    staged = list((media / "websocket").iterdir())
+    assert len(staged) == 1
+    assert staged[0].name.startswith("cache-v1-")
+
+
 def test_local_markdown_video_is_staged_and_rewritten(
     bus: MagicMock,
     tmp_path: Path,

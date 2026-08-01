@@ -232,6 +232,23 @@ class TestBundledToolContract:
         assert "never private reasoning or hidden chain-of-thought" in prompt
         assert "Keep the final answer separate" in prompt
 
+    def test_current_project_output_boundary_overrides_bootstrap_archive_path(self, tmp_path):
+        external = tmp_path.parent / "other-project" / "reports"
+        (tmp_path / "USER.md").write_text(
+            f"# Habits\n\n- Archive path: `{external}`\n",
+            encoding="utf-8",
+        )
+        builder = _builder(tmp_path)
+
+        prompt = builder.build_system_prompt(channel="websocket")
+
+        boundary = "## Current Project Output Boundary"
+        assert boundary in prompt
+        assert f"The authoritative project root for this turn is: `{tmp_path.resolve()}`" in prompt
+        assert "A default workspace is still a real project boundary" in prompt
+        assert "They never override the current project root" in prompt
+        assert prompt.index(str(external)) < prompt.index(boundary)
+
 
 # ---------------------------------------------------------------------------
 # _build_user_content

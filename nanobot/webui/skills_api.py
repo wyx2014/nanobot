@@ -33,7 +33,7 @@ def webui_skills_payload(
     """Return agent skills without leaking local filesystem paths."""
     loader = SkillsLoader(workspace_path, disabled_skills=disabled_skills)
     entries = sorted(
-        loader.list_skills(filter_unavailable=False),
+        loader.list_skills(filter_unavailable=False, include_disabled=True),
         key=lambda entry: (entry.get("source") != "workspace", entry["name"]),
     )
     return {"skills": [_skill_payload(loader, entry) for entry in entries]}
@@ -47,7 +47,7 @@ def webui_skill_detail_payload(
 ) -> dict[str, Any] | None:
     """Return a single skill's safe detail payload."""
     loader = SkillsLoader(workspace_path, disabled_skills=disabled_skills)
-    entries = loader.list_skills(filter_unavailable=False)
+    entries = loader.list_skills(filter_unavailable=False, include_disabled=True)
     entry = next((item for item in entries if item["name"] == name), None)
     if entry is None:
         return None
@@ -130,7 +130,7 @@ def _skill_info(loader: SkillsLoader, entry: dict[str, str]) -> dict[str, Any]:
 
 def skills_payload(*, include_content: bool = False, name: str | None = None) -> dict[str, Any]:
     loader = _loader()
-    entries = loader.list_skills(filter_unavailable=False)
+    entries = loader.list_skills(filter_unavailable=False, include_disabled=True)
     skills = [_skill_info(loader, entry) for entry in entries]
     skills.sort(key=lambda item: (item["source"] != "builtin", item["name"]))
     if name is not None:
@@ -157,7 +157,7 @@ def skills_action(action: str, query: QueryParams) -> dict[str, Any]:
 
     if action == "enable":
         loader = _loader()
-        if not any(entry["name"] == name for entry in loader.list_skills(filter_unavailable=False)):
+        if not any(entry["name"] == name for entry in loader.list_skills(filter_unavailable=False, include_disabled=True)):
             raise WebUISkillsError("unknown skill", status=404)
         disabled.discard(name)
         config.agents.defaults.disabled_skills = sorted(disabled)
@@ -168,7 +168,7 @@ def skills_action(action: str, query: QueryParams) -> dict[str, Any]:
 
     if action == "disable":
         loader = _loader()
-        if not any(entry["name"] == name for entry in loader.list_skills(filter_unavailable=False)):
+        if not any(entry["name"] == name for entry in loader.list_skills(filter_unavailable=False, include_disabled=True)):
             raise WebUISkillsError("unknown skill", status=404)
         disabled.add(name)
         config.agents.defaults.disabled_skills = sorted(disabled)
@@ -179,7 +179,7 @@ def skills_action(action: str, query: QueryParams) -> dict[str, Any]:
 
     if action == "delete":
         loader = _loader()
-        entries = [entry for entry in loader.list_skills(filter_unavailable=False) if entry["name"] == name]
+        entries = [entry for entry in loader.list_skills(filter_unavailable=False, include_disabled=True) if entry["name"] == name]
         if not entries:
             raise WebUISkillsError("unknown skill", status=404)
         entry = entries[0]

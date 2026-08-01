@@ -1358,11 +1358,16 @@ def replay_transcript_to_ui_messages(
             active_activity_segment_id = segment_id
         return segment_id
 
-    def _turn_fields(rec: dict[str, Any], fallback_phase: str | None = None) -> dict[str, Any]:
+    def _turn_fields(
+        rec: dict[str, Any],
+        fallback_phase: str | None = None,
+        *,
+        preserve_closed_turn: bool = False,
+    ) -> dict[str, Any]:
         fields: dict[str, Any] = {}
         turn_id = rec.get("turn_id")
         if isinstance(turn_id, str) and turn_id:
-            if turn_id in closed_turn_ids:
+            if turn_id in closed_turn_ids and not preserve_closed_turn:
                 fields["turnId"] = replay_turn_aliases.setdefault(
                     turn_id,
                     f"{turn_id}:replay:{idx}",
@@ -1523,6 +1528,11 @@ def replay_transcript_to_ui_messages(
                     **candidate,
                     "reasoning": (str(candidate.get("reasoning") or "")) + chunk,
                     "reasoningStreaming": True,
+                    "reasoningStartedAt": (
+                        candidate.get("reasoningStartedAt") or _created_at(idx)
+                    ),
+                    "reasoningCompletedAt": None,
+                    "reasoningDurationMs": None,
                     "activitySegmentId": candidate.get("activitySegmentId") or _ensure_activity_segment(),
                     **turn_fields,
                 }
@@ -1532,6 +1542,11 @@ def replay_transcript_to_ui_messages(
                     **candidate,
                     "reasoning": chunk,
                     "reasoningStreaming": True,
+                    "reasoningStartedAt": (
+                        candidate.get("reasoningStartedAt") or _created_at(idx)
+                    ),
+                    "reasoningCompletedAt": None,
+                    "reasoningDurationMs": None,
                     "activitySegmentId": candidate.get("activitySegmentId") or _ensure_activity_segment(),
                     **turn_fields,
                 }
@@ -1546,6 +1561,7 @@ def replay_transcript_to_ui_messages(
                 "isStreaming": True,
                 "reasoning": chunk,
                 "reasoningStreaming": True,
+                "reasoningStartedAt": _created_at(idx),
                 "activitySegmentId": segment,
                 **turn_fields,
                 "createdAt": _created_at(idx),
@@ -1604,10 +1620,22 @@ def replay_transcript_to_ui_messages(
                 buffer_parts = []
             return
 
-    def close_reasoning(prev: list[dict[str, Any]]) -> None:
+    def close_reasoning(prev: list[dict[str, Any]], idx: int) -> None:
+        completed_at = _created_at(idx)
         for i in range(len(prev) - 1, -1, -1):
             if prev[i].get("reasoningStreaming"):
-                prev[i] = {**prev[i], "reasoningStreaming": False}
+                started_at = prev[i].get("reasoningStartedAt")
+                if not isinstance(started_at, int | float):
+                    started_at = prev[i].get("createdAt")
+                if not isinstance(started_at, int | float):
+                    started_at = completed_at
+                prev[i] = {
+                    **prev[i],
+                    "reasoningStreaming": False,
+                    "reasoningStartedAt": int(started_at),
+                    "reasoningCompletedAt": completed_at,
+                    "reasoningDurationMs": max(0, completed_at - int(started_at)),
+                }
                 return
 
     def is_reasoning_only_placeholder(m: dict[str, Any]) -> bool:
@@ -2083,7 +2111,7 @@ def replay_transcript_to_ui_messages(
         if ev == "reasoning_end":
             if suppress_until_turn_end:
                 continue
-            close_reasoning(messages)
+            close_reasoning(messages, idx)
             continue
 
         if ev == "message":
@@ -2105,7 +2133,7 @@ def replay_transcript_to_ui_messages(
                     continue
                 close_file_edit_phase_before_activity()
                 attach_reasoning_chunk(messages, line, idx, _turn_fields(rec, "reasoning"))
-                close_reasoning(messages)
+                close_reasoning(messages, idx)
                 continue
             if kind in ("tool_hint", "progress"):
                 visible_structured_events = _filter_covered_file_edit_tool_events(messages, structured_events)
@@ -2196,7 +2224,19 @@ def replay_transcript_to_ui_messages(
             lat = rec.get("latency_ms")
             if isinstance(lat, (int, float)) and lat >= 0:
                 extra["latencyMs"] = int(lat)
-            extra.update(_turn_fields(rec, "answer"))
+            # Lifecycle completion is persisted synchronously, while the final
+            # media-bearing answer travels through the outbound channel queue.
+            # Consequently an authoritative ``replace_stream`` frame can be
+            # recorded just after ``turn_completed`` even though it still
+            # belongs to that completed turn. Keep its original turn id so it
+            # replaces the streamed answer rather than becoming a duplicate
+            # synthetic replay turn. Ordinary post-terminal messages continue
+            # to receive replay aliases (for example scheduled follow-ups).
+            extra.update(_turn_fields(
+                rec,
+                "answer",
+                preserve_closed_turn=rec.get("replace_stream") is True,
+            ))
             extra.update(_source_fields(rec))
             absorb_complete(
                 extra,

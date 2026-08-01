@@ -500,10 +500,32 @@ class MCPToolWrapper(_MCPWrapperBase):
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
+        from nanobot.agent.tools.context import current_request_context
+        from nanobot.browser.mirror import browser_mirror
 
         if violation := _mcp_workspace_violation(kwargs):
             logger.warning("MCP tool '{}' blocked by project scope: {}", self._name, violation)
             return f"(MCP tool call blocked: {violation})"
+
+        request_context = current_request_context()
+        mirror_chat_id = (
+            request_context.chat_id
+            if request_context is not None
+            and request_context.channel == "websocket"
+            and browser_mirror.observes(self._server_name, self._original_name)
+            else None
+        )
+        if mirror_chat_id is not None:
+            blocked = await browser_mirror.before_tool(
+                chat_id=mirror_chat_id,
+                session=self._session,
+                server_cwd=self._server_cwd,
+                message_id=request_context.message_id if request_context is not None else None,
+                tool_name=self._original_name,
+                arguments=kwargs,
+            )
+            if blocked is not None:
+                return blocked
 
         retried_transient = False
         refreshed_session = False
@@ -568,11 +590,24 @@ class MCPToolWrapper(_MCPWrapperBase):
                     else:
                         parts.append(str(block))
                 text = "\n".join(parts) or "(no output)"
-                return _copy_artifacts_to_workspace(
+                copied_text = _copy_artifacts_to_workspace(
                     server_cwd=self._server_cwd,
                     before=artifact_snapshot,
                     result_text=text,
                 )
+                # Capture only after publishing artifacts created by the
+                # requested tool.  The mirror's own rolling screenshot file
+                # must never appear as a user-facing session artifact.
+                if mirror_chat_id is not None:
+                    await browser_mirror.after_tool(
+                        chat_id=mirror_chat_id,
+                        session=self._session,
+                        server_cwd=self._server_cwd,
+                        tool_name=self._original_name,
+                        arguments=kwargs,
+                        result=result,
+                    )
+                return copied_text
 
         return "(MCP tool call failed)"  # Unreachable, but satisfies type checkers
 

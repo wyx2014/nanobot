@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,6 +31,105 @@ def _make_loop(tmp_path):
         MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
+
+
+@pytest.mark.asyncio
+async def test_loop_persists_provider_ttft_with_turn_scope(tmp_path):
+    from nanobot.security.project_context import PROJECT_CONTEXT_METADATA_KEY
+    from nanobot.storage.logs import StructuredLogStore
+
+    loop = _make_loop(tmp_path)
+    logs = StructuredLogStore(tmp_path / ".nanobot" / "logs.sqlite")
+    loop._performance_logs = logs
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="done", tool_calls=[])
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+
+    final_content, _, _, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "hello"}],
+        channel="websocket",
+        message_id="request-1",
+        session_key="websocket:chat-1",
+        metadata={
+            "_runtime_turn_id": "turn-1",
+            PROJECT_CONTEXT_METADATA_KEY: {
+                "project_id": "project-1",
+                "session_id": "session-1",
+                "session_key": "websocket:chat-1",
+            },
+        },
+    )
+
+    assert final_content == "done"
+    records = logs.query(session_id="session-1")
+    ttft = next(record for record in records if record.event_name == "provider_ttft")
+    assert ttft.project_id == "project-1"
+    assert ttft.turn_id == "turn-1"
+    assert ttft.request_id == "request-1"
+    assert ttft.duration_ms is not None
+    assert ttft.details["provider_ttft_ms"] == ttft.duration_ms
+    assert ttft.details["model"] == "test-model"
+    assert ttft.details["iteration"] == 0
+    assert ttft.details["prompt_estimate"] > 0
+
+
+@pytest.mark.asyncio
+async def test_active_turn_correction_is_anchored_and_reviewed_before_final(tmp_path):
+    from nanobot.bus.events import InboundMessage
+    from nanobot.webui.metadata import ACTIVE_TURN_CORRECTION_METADATA_KEY
+
+    loop = _make_loop(tmp_path)
+    loop.context._build_user_content.side_effect = lambda content, _media: content
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.tools.prepare_call = MagicMock(return_value=(None, {"query": "雪球 可转债"}, None))
+    loop.tools.execute = AsyncMock(return_value="雪球页面只有发行数量汇总")
+    responses = [
+        LLMResponse(
+            content="继续查询雪球",
+            tool_calls=[
+                ToolCallRequest(
+                    id="search-1",
+                    name="web_search",
+                    arguments={"query": "雪球 可转债"},
+                )
+            ],
+        ),
+        LLMResponse(content="这里是百度新闻热点摘要。", tool_calls=[]),
+        LLMResponse(content="今年发行的可转债名单如下。", tool_calls=[]),
+    ]
+    seen_messages: list[list[dict[str, Any]]] = []
+
+    async def chat_with_retry(*, messages, **_kwargs):
+        seen_messages.append(messages)
+        return responses.pop(0)
+
+    loop.provider.chat_with_retry = chat_with_retry
+    pending: asyncio.Queue[InboundMessage] = asyncio.Queue()
+    await pending.put(InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="chat-1",
+        content="如果找不到，不要局限在雪球",
+        metadata={ACTIVE_TURN_CORRECTION_METADATA_KEY: True},
+    ))
+
+    final_content, _, _, _, had_injections = await loop._run_agent_loop(
+        [{"role": "user", "content": "帮我找今年发行的可转债，先看雪球"}],
+        pending_queue=pending,
+    )
+
+    assert had_injections is True
+    assert final_content == "今年发行的可转债名单如下。"
+    assert len(seen_messages) == 3
+    second_prompt = str(seen_messages[1])
+    assert "Active objective" in second_prompt
+    assert "帮我找今年发行的可转债，先看雪球" in second_prompt
+    assert "不要局限在雪球" in second_prompt
+    third_prompt = str(seen_messages[2])
+    assert "Active-turn correction review" in third_prompt
+    assert "older or unrelated topic" in third_prompt
+
 
 @pytest.mark.asyncio
 async def test_loop_max_iterations_message_stays_stable(tmp_path):

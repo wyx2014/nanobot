@@ -8,8 +8,6 @@ import hashlib
 import hmac
 import mimetypes
 import re
-import shutil
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -19,7 +17,10 @@ from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
 from nanobot.config.paths import get_media_dir
-from nanobot.utils.helpers import safe_filename
+from nanobot.webui.media_cache import (
+    stage_media_cache_path,
+    touch_media_cache_path,
+)
 from nanobot.webui.http_utils import (
     case_insensitive_header as _case_insensitive_header,
 )
@@ -147,9 +148,7 @@ def sign_or_stage_media_path(
         if not path.is_file():
             return None
         target_dir = media_dir("websocket")
-        safe_name = safe_filename(path.name) or "attachment"
-        staged = target_dir / f"{uuid.uuid4().hex[:12]}-{safe_name}"
-        shutil.copyfile(path, staged)
+        staged = stage_media_cache_path(path, target_dir)
     except OSError as exc:
         if logger is not None:
             logger.warning("failed to stage outbound media {}: {}", path, exc)
@@ -272,6 +271,7 @@ def serve_signed_media(
         return _http_error(404, "not found")
     if not candidate.is_file():
         return _http_error(404, "not found")
+    touch_media_cache_path(candidate)
 
     request_query = parse_qs(urlparse(request.path).query) if request else {}
     mime, _ = mimetypes.guess_type(candidate.name)

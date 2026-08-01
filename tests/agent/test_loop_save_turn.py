@@ -437,8 +437,11 @@ def test_restore_runtime_checkpoint_rehydrates_completed_and_pending_tools() -> 
     assert restored is True
     assert session.metadata.get(AgentLoop._RUNTIME_CHECKPOINT_KEY) is None
     assert session.messages[0]["role"] == "assistant"
+    assert session.messages[0]["_model_replay_policy"] == "ui_only"
     assert session.messages[1]["tool_call_id"] == "call_done"
+    assert session.messages[1]["_model_replay_policy"] == "ui_only"
     assert session.messages[2]["tool_call_id"] == "call_pending"
+    assert session.messages[2]["_model_replay_policy"] == "ui_only"
     assert "interrupted before this tool finished" in session.messages[2]["content"].lower()
 
 
@@ -513,8 +516,11 @@ def test_restore_runtime_checkpoint_dedupes_overlapping_tail() -> None:
     assert session.metadata.get(AgentLoop._RUNTIME_CHECKPOINT_KEY) is None
     assert len(session.messages) == 3
     assert session.messages[0]["role"] == "assistant"
+    assert session.messages[0]["_model_replay_policy"] == "ui_only"
     assert session.messages[1]["tool_call_id"] == "call_done"
+    assert session.messages[1]["_model_replay_policy"] == "ui_only"
     assert session.messages[2]["tool_call_id"] == "call_pending"
+    assert session.messages[2]["_model_replay_policy"] == "ui_only"
 
 
 @pytest.mark.asyncio
@@ -1049,19 +1055,21 @@ async def test_next_turn_after_crash_closes_pending_user_turn_before_new_input(t
     session.metadata[AgentLoop._PENDING_USER_TURN_KEY] = True
     loop.sessions.save(session)
 
-    loop._run_agent_loop = AsyncMock(return_value=(
-        "new answer",
-        None,
-        [
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "old question"},
-            {"role": "assistant", "content": "Error: Task interrupted before a response was generated."},
-            {"role": "user", "content": "new question"},
-            {"role": "assistant", "content": "new answer"},
-        ],
-        "stop",
-        False,
-    ))  # type: ignore[method-assign]
+    async def resumed_after_crash(initial_messages, **_kwargs):
+        assert "old question" not in str(initial_messages)
+        assert any(
+            "previous turn was interrupted" in str(message.get("content", "")).lower()
+            for message in initial_messages
+        )
+        return (
+            "new answer",
+            None,
+            [*initial_messages, {"role": "assistant", "content": "new answer"}],
+            "stop",
+            False,
+        )
+
+    loop._run_agent_loop = resumed_after_crash  # type: ignore[method-assign]
 
     result = await loop._process_message(
         InboundMessage(channel="feishu", sender_id="u1", chat_id="c3", content="new question")
@@ -1080,6 +1088,8 @@ async def test_next_turn_after_crash_closes_pending_user_turn_before_new_input(t
         {"role": "assistant", "content": "new answer"},
     ]
     assert AgentLoop._PENDING_USER_TURN_KEY not in session.metadata
+    assert session.messages[0].get("_model_replay_policy") == "ui_only"
+    assert session.messages[1].get("_model_replay_policy") == "ui_only"
 
 
 @pytest.mark.asyncio
@@ -1186,6 +1196,11 @@ async def test_stop_preserves_runtime_checkpoint_for_next_turn(tmp_path: Path) -
         {"role": "user", "content": "continue here"},
         {"role": "assistant", "content": "next answer"},
     ]
+    interrupted_messages = session.messages[:4]
+    assert all(
+        message.get("_model_replay_policy") == "ui_only"
+        for message in interrupted_messages
+    )
     assert AgentLoop._PENDING_USER_TURN_KEY not in session.metadata
     assert AgentLoop._RUNTIME_CHECKPOINT_KEY not in session.metadata
 

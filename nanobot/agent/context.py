@@ -182,6 +182,10 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
+        parts.append(render_template(
+            "agent/project_output_contract.md",
+            workspace_path=str(root.expanduser().resolve(strict=False)),
+        ))
         parts.append(render_template("agent/tool_contract.md"))
 
         if memory_store is not None:

@@ -1,8 +1,8 @@
 """Tests for /stop preserving partial context from interrupted turns.
 
-When /stop cancels an active task, the runtime checkpoint (tool results,
-assistant messages accumulated so far) should be materialized into session
-history rather than silently discarded.
+When /stop cancels an active task, the runtime checkpoint remains available
+for UI replay but is marked so a later, unrelated model turn cannot consume
+its raw tool calls or results.
 
 See: https://github.com/HKUDS/nanobot/issues/2966
 """
@@ -85,6 +85,10 @@ class TestStopPreservesContext:
         restored = loop._restore_runtime_checkpoint(session)
         assert restored is True
         assert len(session.messages) > 1
+        assert all(
+            message.get("_model_replay_policy") == "ui_only"
+            for message in session.messages
+        )
         assert "runtime_checkpoint" not in session.metadata
 
 
@@ -158,6 +162,10 @@ async def test_dispatch_cancellation_restores_checkpoint():
     assert roles == ["user", "assistant", "tool"], (
         "Expected the assistant message and completed tool result from the "
         f"interrupted turn to be materialized into session.messages; got {roles}"
+    )
+    assert all(
+        message.get("_model_replay_policy") == "ui_only"
+        for message in session.messages
     )
     assert checkpoint_key not in session.metadata, \
         "Checkpoint metadata should be cleared after restore"

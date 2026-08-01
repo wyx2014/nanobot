@@ -170,6 +170,7 @@ async def test_runner_times_out_hung_llm_request():
     provider.chat_with_retry = chat_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
+    timing_events: list[dict] = []
 
     runner = AgentRunner(provider)
     started = time.monotonic()
@@ -180,11 +181,15 @@ async def test_runner_times_out_hung_llm_request():
         max_iterations=1,
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
         llm_timeout_s=0.05,
+        provider_timing_callback=timing_events.append,
     ))
 
     assert (time.monotonic() - started) < 1.0
     assert result.stop_reason == "error"
     assert "timed out" in (result.final_content or "").lower()
+    assert timing_events[-1]["first_event"] == "timeout"
+    assert timing_events[-1]["measurement"] == "response_latency_fallback"
+    assert timing_events[-1]["provider_ttft_ms"] >= 40
 
 
 @pytest.mark.asyncio
@@ -232,6 +237,90 @@ async def test_runner_does_not_apply_outer_wall_timeout_to_streaming_requests():
     assert streamed == ["still ", "alive"]
     provider.chat_with_retry.assert_not_awaited()
     wait_for.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runner_records_first_stream_event_ttft():
+    from nanobot.agent.hook import AgentHook, AgentHookContext
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    timing_events: list[dict] = []
+
+    async def chat_stream_with_retry(
+        *,
+        on_content_delta,
+        on_thinking_delta,
+        **kwargs,
+    ):
+        await asyncio.sleep(0.01)
+        await on_thinking_delta("checking")
+        await on_content_delta("done")
+        return LLMResponse(content="done", tool_calls=[])
+
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    class StreamingHook(AgentHook):
+        def wants_streaming(self) -> bool:
+            return True
+
+        async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+            return None
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        hook=StreamingHook(),
+        provider_timing_callback=timing_events.append,
+    ))
+
+    assert result.final_content == "done"
+    assert [event["event"] for event in timing_events] == [
+        "request_started",
+        "first_event",
+    ]
+    first_event = timing_events[1]
+    assert first_event["first_event"] == "reasoning_delta"
+    assert first_event["first_event_observed"] is True
+    assert first_event["measurement"] == "first_stream_event"
+    assert first_event["provider_ttft_ms"] >= 1
+    assert first_event["prompt_estimate"] > 0
+    assert first_event["streaming"] is True
+
+
+@pytest.mark.asyncio
+async def test_runner_labels_nonstreaming_latency_as_ttft_fallback():
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="done", tool_calls=[])
+    )
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    timing_events: list[dict] = []
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        provider_timing_callback=timing_events.append,
+    ))
+
+    assert result.final_content == "done"
+    first_event = timing_events[1]
+    assert first_event["event"] == "first_event"
+    assert first_event["first_event"] == "response_completed"
+    assert first_event["first_event_observed"] is False
+    assert first_event["measurement"] == "response_latency_fallback"
+    assert first_event["streaming"] is False
 
 
 @pytest.mark.asyncio

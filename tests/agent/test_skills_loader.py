@@ -319,6 +319,23 @@ def test_disabled_skills_excluded_from_list(tmp_path: Path) -> None:
     assert entries[0]["path"] == str(beta_path)
 
 
+def test_disabled_skills_included_when_include_disabled(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    ws_skills = workspace / "skills"
+    ws_skills.mkdir(parents=True)
+    alpha_path = _write_skill(ws_skills, "alpha", body="# Alpha")
+    beta_path = _write_skill(ws_skills, "beta", body="# Beta")
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills={"alpha"})
+    entries = loader.list_skills(filter_unavailable=False, include_disabled=True)
+    assert {entry["name"] for entry in entries} == {"alpha", "beta"}
+    by_name = {entry["name"]: entry for entry in entries}
+    assert by_name["alpha"]["path"] == str(alpha_path)
+    assert by_name["beta"]["path"] == str(beta_path)
+
+
 def test_disabled_skills_empty_set_no_effect(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     ws_skills = workspace / "skills"

@@ -1020,6 +1020,7 @@ def _run_gateway(
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
     from nanobot.session.webui_turns import WebuiTurnCoordinator
+    from nanobot.storage.logs import StructuredLogStore
     from nanobot.webui.token_usage import TokenUsageHook
 
     port = port if port is not None else config.gateway.port
@@ -1034,6 +1035,9 @@ def _run_gateway(
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1) from exc
     session_manager = SessionManager(config.workspace_path)
+    performance_logs = StructuredLogStore(
+        config.workspace_path / ".nanobot" / "logs.sqlite"
+    )
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
@@ -1056,6 +1060,7 @@ def _run_gateway(
         runtime_events=runtime_events,
         provider_signature=provider_snapshot.signature,
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
+        performance_log_store=performance_logs,
     )
     from nanobot.bus.events import OutboundMessage
     from nanobot.session.keys import session_key_for_channel

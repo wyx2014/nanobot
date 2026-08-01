@@ -78,7 +78,12 @@ from nanobot.session.goal_state import (
     sustained_goal_active,
 )
 from nanobot.session.keys import UNIFIED_SESSION_KEY, session_key_for_channel
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import (
+    MODEL_REPLAY_POLICY_KEY,
+    MODEL_REPLAY_UI_ONLY,
+    Session,
+    SessionManager,
+)
 from nanobot.storage.state import StateStore
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
@@ -97,6 +102,11 @@ from nanobot.webui.interactive_prompt import (
     reset_interactive_prompt_requested,
     set_interactive_prompt_requested,
 )
+from nanobot.webui.metadata import (
+    ACTIVE_TURN_CLIENT_TURN_METADATA_KEY,
+    ACTIVE_TURN_CORRECTION_METADATA_KEY,
+    WEBUI_TURN_METADATA_KEY,
+)
 from nanobot.webui.project_skills_api import project_skill_grants
 
 if TYPE_CHECKING:
@@ -106,6 +116,7 @@ if TYPE_CHECKING:
         ToolsConfig,
     )
     from nanobot.cron.service import CronService
+    from nanobot.storage.logs import StructuredLogStore
 
 
 def _project_skill_scope(workspace: Path, project_path: Path | str | None, metadata: dict[str, Any]) -> dict[str, list[str]]:
@@ -125,6 +136,62 @@ def _project_skill_scope(workspace: Path, project_path: Path | str | None, metad
             *team_skills,
         ])),
     }
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = [
+        str(item.get("text") or "").strip()
+        for item in content
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and str(item.get("text") or "").strip()
+    ]
+    return "\n".join(parts)
+
+
+def _active_turn_objective(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        text = _message_content_text(message.get("content"))
+        if text:
+            return truncate_text_fn(text, 1200)
+    return ""
+
+
+def _wrap_active_turn_correction(content: Any, *, objective: str) -> Any:
+    correction = _message_content_text(content)
+    contract = (
+        "[Active-turn user correction]\n"
+        "This is a correction to the task currently in progress, not a new task. "
+        "Keep the active objective and the evidence gathered for it. Do not infer "
+        "a different topic from older conversation history, project memory, browser "
+        "cache, or unrelated files.\n"
+        f"Active objective:\n{objective or '[Use the immediately preceding active user request.]'}\n"
+        f"User correction:\n{correction or '[See the attached content.]'}\n"
+        "Apply this correction now. If it relaxes or changes a requested source, stop "
+        "treating the old source as mandatory. When a preferred source lacks the "
+        "required evidence, use credible alternative sources and clearly distinguish "
+        "what each source supports. Do not search local history or caches as a substitute "
+        "for current external evidence unless the user explicitly asks for that."
+    )
+    if isinstance(content, str):
+        return contract
+    if isinstance(content, list):
+        non_text_blocks = [
+            item
+            for item in content
+            if not (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+            )
+        ]
+        return [{"type": "text", "text": contract}, *non_text_blocks]
+    return contract
 
 
 def _expert_team_binding(
@@ -361,6 +428,7 @@ class AgentLoop:
         thread_runtime_registry: ThreadRuntimeRegistry | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         project_memory_config: Any | None = None,
+        performance_log_store: StructuredLogStore | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -419,6 +487,7 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self._performance_logs = performance_log_store
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -1126,11 +1195,19 @@ class AgentLoop:
         hook: AgentHook = loop_hook
         if run_hooks and (not ephemeral or run_extra_hooks_for_ephemeral):
             hook = CompositeHook([loop_hook, *run_hooks])
+        active_objective = _active_turn_objective(initial_messages)
+        active_corrections: list[str] = []
+        correction_review_generation = 0
+        correction_reviewed_generation = 0
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
                 return
-            self._set_runtime_checkpoint(session, payload)
+            checkpoint = dict(payload)
+            source_turn_id = str((metadata or {}).get("_runtime_turn_id") or "").strip()
+            if source_turn_id:
+                checkpoint["_source_turn_id"] = source_turn_id
+            self._set_runtime_checkpoint(session, checkpoint)
 
         async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
             """Drain follow-up messages from the pending queue.
@@ -1145,12 +1222,25 @@ class AgentLoop:
                 return []
 
             def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
+                nonlocal correction_review_generation
                 content = pending_msg.content
                 media = pending_msg.media if pending_msg.media else None
                 if media:
                     content, media = self._prepare_message_media(content, media)
                     media = media or None
                 user_content = self.context._build_user_content(content, media)
+                if (
+                    isinstance(pending_msg.metadata, dict)
+                    and pending_msg.metadata.get(ACTIVE_TURN_CORRECTION_METADATA_KEY) is True
+                ):
+                    user_content = _wrap_active_turn_correction(
+                        user_content,
+                        objective=active_objective,
+                    )
+                    correction_text = pending_msg.content.strip()
+                    if correction_text:
+                        active_corrections.append(truncate_text_fn(correction_text, 600))
+                    correction_review_generation += 1
                 return {"role": "user", "content": user_content}
 
             expert_team_wait = _expert_team_binding(
@@ -1302,13 +1392,12 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
-        project_context_token = bind_project_context(
-            project_context_from_metadata(
-                (metadata or {}).get(PROJECT_CONTEXT_METADATA_KEY),
-                session_key=active_session_key,
-                root_path=effective_scope.project_path,
-            )
+        bound_project_context = project_context_from_metadata(
+            (metadata or {}).get(PROJECT_CONTEXT_METADATA_KEY),
+            session_key=active_session_key,
+            root_path=effective_scope.project_path,
         )
+        project_context_token = bind_project_context(bound_project_context)
         skill_scope_token = bind_allowed_workspace_skills(
             _project_skill_scope(self.workspace, effective_scope.project_path, metadata or {})
         )
@@ -1335,6 +1424,67 @@ class AgentLoop:
         )
         initial_message_count = len(initial_messages)
 
+        async def _provider_timing(payload: dict[str, Any]) -> None:
+            logs = self._performance_logs
+            if logs is None:
+                return
+            event = str(payload.get("event") or "")
+            duration_ms = (
+                max(0, int(payload.get("provider_ttft_ms") or 0))
+                if event == "first_event"
+                else None
+            )
+            project_id = (
+                bound_project_context.project_id
+                if bound_project_context is not None
+                else None
+            )
+            state_session_id = (
+                bound_project_context.session_id
+                if bound_project_context is not None
+                else None
+            )
+            turn_id = str((metadata or {}).get("_runtime_turn_id") or "").strip() or None
+            details = dict(payload)
+            details["session_key"] = active_session_key
+            if event == "first_event":
+                logger.info(
+                    "provider_ttft_ms={} measurement={} first_event={} provider={} "
+                    "model={} iteration={} prompt_estimate={} project_id={} "
+                    "session_id={} turn_id={}",
+                    duration_ms,
+                    details.get("measurement"),
+                    details.get("first_event"),
+                    details.get("provider"),
+                    details.get("model"),
+                    details.get("iteration"),
+                    details.get("prompt_estimate"),
+                    project_id or "-",
+                    state_session_id or "-",
+                    turn_id or "-",
+                )
+            await asyncio.to_thread(
+                logs.write,
+                level="info",
+                component="provider",
+                event_name=(
+                    "provider_ttft"
+                    if event == "first_event"
+                    else "provider_request_started"
+                ),
+                message=(
+                    f"provider first event after {duration_ms} ms"
+                    if event == "first_event"
+                    else "provider request started"
+                ),
+                request_id=message_id,
+                project_id=project_id,
+                session_id=state_session_id,
+                turn_id=turn_id,
+                duration_ms=duration_ms,
+                details=details,
+            )
+
         def _expert_team_injections_pending() -> bool:
             """Allow team results past the normal cycle cap while work is active."""
             if not expert_team_active or pending_queue is None or session is None:
@@ -1343,6 +1493,33 @@ class AgentLoop:
                 not pending_queue.empty()
                 or self.subagents.get_running_count_by_session(session.key) > 0
             )
+
+        def _final_response_guard(messages: list[dict[str, Any]]) -> str | None:
+            nonlocal correction_reviewed_generation
+            guards: list[str] = []
+            if expert_team_completion is not None:
+                expert_guard = _expert_team_completion_guard_message(
+                    expert_team,
+                    messages[initial_message_count:],
+                )
+                if expert_guard:
+                    guards.append(expert_guard)
+            if correction_review_generation > correction_reviewed_generation:
+                correction_reviewed_generation = correction_review_generation
+                correction_summary = "\n".join(
+                    f"- {item}" for item in active_corrections[-3:]
+                )
+                guards.append(
+                    "[Active-turn correction review]\n"
+                    "Before finalizing, review the draft against the active objective and "
+                    "the user's latest correction below. If the draft answers an older or "
+                    "unrelated topic, discard it and answer the active task instead. Ensure "
+                    "the result contains the requested subject and deliverable, and that any "
+                    "source fallback requested by the user was actually applied.\n"
+                    f"Active objective:\n{active_objective}\n"
+                    f"Corrections:\n{correction_summary or '- Apply the latest injected correction.'}"
+                )
+            return "\n\n".join(guards) or None
 
         try:
             result = await self.runner.run(AgentRunSpec(
@@ -1367,16 +1544,7 @@ class AgentLoop:
                 injection_overflow_predicate=(
                     _expert_team_injections_pending if expert_team_active else None
                 ),
-                final_response_guard=(
-                    (
-                        lambda messages: _expert_team_completion_guard_message(
-                            expert_team,
-                            messages[initial_message_count:],
-                        )
-                    )
-                    if expert_team_completion is not None
-                    else None
-                ),
+                final_response_guard=_final_response_guard,
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
                 llm_timeout_s=runner_wall_llm_timeout_s(
@@ -1391,6 +1559,9 @@ class AgentLoop:
                     pending_queue_available=pending_queue is not None and session is not None,
                     session_metadata=session_metadata,
                     message_metadata=metadata,
+                ),
+                provider_timing_callback=(
+                    _provider_timing if self._performance_logs is not None else None
                 ),
             ))
         finally:
@@ -1485,6 +1656,24 @@ class AgentLoop:
                         pending_msg = dataclasses.replace(
                             msg,
                             session_key_override=effective_key,
+                        )
+                    active_turn = await self.thread_runtime_registry.active_turn(effective_key)
+                    if active_turn is not None:
+                        pending_metadata = dict(pending_msg.metadata or {})
+                        client_turn_id = str(
+                            pending_metadata.get(WEBUI_TURN_METADATA_KEY) or ""
+                        ).strip()
+                        pending_metadata["_runtime_turn_id"] = active_turn.id
+                        pending_metadata[WEBUI_TURN_METADATA_KEY] = active_turn.id
+                        if not pending_metadata.get("injected_event"):
+                            pending_metadata[ACTIVE_TURN_CORRECTION_METADATA_KEY] = True
+                            if client_turn_id and client_turn_id != active_turn.id:
+                                pending_metadata[
+                                    ACTIVE_TURN_CLIENT_TURN_METADATA_KEY
+                                ] = client_turn_id
+                        pending_msg = dataclasses.replace(
+                            pending_msg,
+                            metadata=pending_metadata,
                         )
                     try:
                         self._pending_queues[effective_key].put_nowait(pending_msg)
@@ -1862,6 +2051,10 @@ class AgentLoop:
             "max_tokens": self._replay_token_budget(),
             "include_timestamps": True,
             "extend_to_user": is_subagent,
+            # A subagent result belongs to the still-running logical turn and
+            # may resume its checkpoint. Normal/new user turns never receive
+            # raw interrupted assistant/tool payloads.
+            "include_ui_only": is_subagent,
         }
         history = session.get_history(**_hist_kwargs)
         workspace_scope = self.workspace_scopes.for_message(msg, session.metadata)
@@ -2359,6 +2552,9 @@ class AgentLoop:
             "max_tokens": self._replay_token_budget(),
             "include_timestamps": True,
             "extend_to_user": False,
+            "include_ui_only": turn_continuation.internal_continuation_inbound(
+                ctx.msg.metadata
+            ),
         }
         ctx.history = ctx.session.get_history(**_hist_kwargs)
         self._runtime_events().record_turn_runtime(
@@ -2679,7 +2875,7 @@ class AgentLoop:
         )
 
     def _restore_runtime_checkpoint(self, session: Session) -> bool:
-        """Materialize an unfinished turn into session history before a new request."""
+        """Materialize unfinished work for UI replay, not normal model replay."""
         from datetime import datetime
 
         checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
@@ -2689,23 +2885,40 @@ class AgentLoop:
         assistant_message = checkpoint.get("assistant_message")
         completed_tool_results = checkpoint.get("completed_tool_results") or []
         pending_tool_calls = checkpoint.get("pending_tool_calls") or []
+        source_turn_id = str(checkpoint.get("_source_turn_id") or "").strip() or None
+
+        def _ui_only(message: dict[str, Any]) -> dict[str, Any]:
+            return {
+                **message,
+                MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+                **(
+                    {"_source_turn_id": source_turn_id}
+                    if source_turn_id is not None
+                    else {}
+                ),
+            }
 
         restored_messages: list[dict[str, Any]] = []
+        for index in range(len(session.messages) - 1, -1, -1):
+            if session.messages[index].get("role") != "user":
+                continue
+            session.messages[index] = _ui_only(session.messages[index])
+            break
         if isinstance(assistant_message, dict):
             restored = dict(assistant_message)
             restored.setdefault("timestamp", datetime.now().isoformat())
-            restored_messages.append(restored)
+            restored_messages.append(_ui_only(restored))
         for message in completed_tool_results:
             if isinstance(message, dict):
                 restored = dict(message)
                 restored.setdefault("timestamp", datetime.now().isoformat())
-                restored_messages.append(restored)
+                restored_messages.append(_ui_only(restored))
         for tool_call in pending_tool_calls:
             if not isinstance(tool_call, dict):
                 continue
             tool_id = tool_call.get("id")
             name = ((tool_call.get("function") or {}).get("name")) or "tool"
-            restored_messages.append(
+            restored_messages.append(_ui_only(
                 {
                     "role": "tool",
                     "tool_call_id": tool_id,
@@ -2713,7 +2926,7 @@ class AgentLoop:
                     "content": "Error: Task interrupted before this tool finished.",
                     "timestamp": datetime.now().isoformat(),
                 }
-            )
+            ))
 
         overlap = 0
         max_overlap = min(len(session.messages), len(restored_messages))
@@ -2726,6 +2939,18 @@ class AgentLoop:
             ):
                 overlap = size
                 break
+        if overlap:
+            overlap_start = len(session.messages) - overlap
+            for offset in range(overlap):
+                session.messages[overlap_start + offset] = {
+                    **session.messages[overlap_start + offset],
+                    MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+                    **(
+                        {"_source_turn_id": source_turn_id}
+                        if source_turn_id is not None
+                        else {}
+                    ),
+                }
         session.messages.extend(restored_messages[overlap:])
 
         self._clear_pending_user_turn(session)
@@ -2740,11 +2965,16 @@ class AgentLoop:
             return False
 
         if session.messages and session.messages[-1].get("role") == "user":
+            session.messages[-1] = {
+                **session.messages[-1],
+                MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+            }
             session.messages.append(
                 {
                     "role": "assistant",
                     "content": "Error: Task interrupted before a response was generated.",
                     "timestamp": datetime.now().isoformat(),
+                    MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
                 }
             )
             session.updated_at = datetime.now()

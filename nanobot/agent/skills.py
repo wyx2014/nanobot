@@ -52,12 +52,16 @@ class SkillsLoader:
         self,
         filter_unavailable: bool = True,
         allowed_workspace_skills: set[str] | None = None,
+        include_disabled: bool = False,
     ) -> list[dict[str, str]]:
         """
         List all available skills.
 
         Args:
             filter_unavailable: If True, filter out skills with unmet requirements.
+            allowed_workspace_skills: If provided, only include workspace skills with these names.
+            include_disabled: If True, keep disabled skills in the result (so settings UIs can
+                show and re-enable them). Agent-runtime callers should leave this False.
 
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
@@ -71,7 +75,7 @@ class SkillsLoader:
                 self._skill_entries_from_dir(self.builtin_skills, "builtin", skip_names=all_workspace_names)
             )
 
-        if self.disabled_skills:
+        if self.disabled_skills and not include_disabled:
             skills = [s for s in skills if s["name"] not in self.disabled_skills]
 
         if filter_unavailable:

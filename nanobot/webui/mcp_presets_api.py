@@ -120,7 +120,7 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
         install_supported=True,
         brand_domain="gildata.com",
         brand_color="#B42318",
-        requires="聚源 MCP token",
+        requires="聚源 MCP 服务地址（含 token 参数）",
         server=MCPServerConfig(
             type="streamableHttp",
             url=JUYUAN_MCP_URL,
@@ -136,7 +136,7 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
                 placeholder="请输入聚源 MCP token",
             ),
         ),
-        note="首次安装会预置连接器；填写 token 后才会连接并启用工具。",
+        note="首次安装会预置连接器；请在 MCP 服务地址中附带 token 参数后再启用。",
     ),
     McpPreset(
         name="playwright",
@@ -372,8 +372,13 @@ def _materialize_server(
         raise McpPresetError(f"{preset.display_name} is not supported yet", status=409)
 
     cfg = _clone_server(preset.server)
+    provided_url = _query_first(query, "url")
+    if provided_url is not None and provided_url.strip():
+        cfg.url = provided_url.strip()
     for field_spec in preset.fields:
         value = _resolve_field_value(field_spec, query, existing)
+        if not value:
+            value = _field_value_from_config(field_spec, cfg)
         if field_spec.required and not value:
             raise McpPresetError(f"missing {field_spec.label}")
         if not value:
@@ -388,6 +393,39 @@ def _materialize_server(
         elif target_kind == "url_param":
             cfg.url = _url_with_param(cfg.url, target_name, value)
     return _with_managed_stdio_cwd(preset.name, cfg)
+
+
+def _update_server(existing: MCPServerConfig, query: QueryParams) -> MCPServerConfig:
+    """Apply explicitly supplied connection settings without exposing stored secrets."""
+    command = (_query_first(query, "command") or existing.command).strip()
+    url = (_query_first(query, "url") or existing.url).strip()
+    transport = _normalize_transport(_query_first(query, "transport") or existing.type, command=command, url=url)
+    if transport == "stdio" and not command:
+        raise McpPresetError("stdio MCP servers require a command")
+    if transport in {"sse", "streamableHttp"} and not url:
+        raise McpPresetError("remote MCP servers require a URL")
+    raw_timeout = _query_first(query, "tool_timeout")
+    tool_timeout = existing.tool_timeout
+    if raw_timeout is not None and raw_timeout.strip():
+        try:
+            tool_timeout = max(5, min(int(raw_timeout), 600))
+        except ValueError as exc:
+            raise McpPresetError("tool_timeout must be an integer") from exc
+    raw_args = _query_first(query, "args")
+    raw_env = _query_first(query, "env")
+    raw_headers = _query_first(query, "headers")
+    return MCPServerConfig(
+        type=transport,
+        command=command if transport == "stdio" else "",
+        args=_parse_string_list(raw_args) if raw_args is not None else list(existing.args),
+        env=_parse_string_map(raw_env) if raw_env is not None else dict(existing.env),
+        cwd=(_query_first(query, "cwd") if _query_first(query, "cwd") is not None else existing.cwd).strip() if transport == "stdio" else "",
+        url=url if transport in {"sse", "streamableHttp"} else "",
+        headers=_parse_string_map(raw_headers) if raw_headers is not None else dict(existing.headers),
+        connect_timeout=existing.connect_timeout,
+        tool_timeout=tool_timeout,
+        enabled_tools=list(existing.enabled_tools),
+    )
 
 
 def install_desktop_default_mcp_servers(config: Any) -> bool:
@@ -587,6 +625,16 @@ def _preset_payload(preset: McpPreset, configured_servers: dict[str, MCPServerCo
         "brand_color": preset.brand_color,
         "required_fields": [_field_payload(field, cfg) for field in preset.fields],
         "connection_summary": _connection_summary(cfg),
+        "connection": {
+            "transport": cfg.type if cfg else preset.transport,
+            "command": cfg.command if cfg else "",
+            "args": list(cfg.args) if cfg else [],
+            "cwd": cfg.cwd if cfg else "",
+            "url": cfg.url if cfg else "",
+            "tool_timeout": cfg.tool_timeout if cfg else (preset.server.tool_timeout if preset.server else 30),
+            "has_env": bool(cfg and cfg.env),
+            "has_headers": bool(cfg and cfg.headers),
+        },
         "enabled_tools": _tool_allowlist(cfg),
         "source": "preset",
         "manifest": _preset_manifest(preset, logo_url=logo_url),
@@ -997,6 +1045,15 @@ def custom_mcp_action(action: str, query: QueryParams) -> dict[str, Any]:
         config.tools.mcp_servers[name] = cfg
         save_config(config)
         payload = mcp_presets_payload(last_action=_server_action_message(action, name))
+        payload["requires_restart"] = True
+        return payload
+
+    if action == "update":
+        if existing is None:
+            raise McpPresetError("install the MCP preset before editing it", status=409)
+        config.tools.mcp_servers[name] = _update_server(existing, query)
+        save_config(config)
+        payload = mcp_presets_payload(last_action=_action_message(action, preset) if preset is not None else _server_action_message(action, name))
         payload["requires_restart"] = True
         return payload
 

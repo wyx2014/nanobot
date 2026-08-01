@@ -498,7 +498,10 @@ class WriteFileTool(_FsTool):
         return (
             "Create a new file or intentionally replace an entire file with "
             "the provided content. Overwrites existing files and creates parent "
-            "directories as needed. For code changes or partial edits, prefer "
+            "directories as needed. For newly generated reports and other "
+            "user-facing artifacts, use a path relative to the current project "
+            "unless the user explicitly requested an exact external destination "
+            "in their current message. For code changes or partial edits, prefer "
             "apply_patch; use edit_file only for small exact replacements."
         )
 

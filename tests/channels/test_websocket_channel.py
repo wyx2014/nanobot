@@ -16,6 +16,7 @@ from websockets.frames import Close
 
 from nanobot.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.browser.mirror import browser_mirror
 from nanobot.channels.websocket import (
     WebSocketChannel,
     WebSocketConfig,
@@ -115,6 +116,31 @@ async def test_stop_treats_cancelled_server_task_as_shutdown() -> None:
 
     assert channel._server_task is None
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_browser_control_envelope_routes_to_nanobot_browser_runtime(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    bus = MessageBus()
+    gateway = _basic_handler(bus, workspace_path=tmp_path)
+    channel = WebSocketChannel(WebSocketConfig(), bus, gateway=gateway)
+    connection = AsyncMock()
+    control = AsyncMock()
+    monkeypatch.setattr(browser_mirror, "control", control)
+
+    await channel._dispatch_envelope(
+        connection,
+        "desktop",
+        {
+            "type": "browser_control",
+            "chat_id": "chat-browser",
+            "action": "pause",
+        },
+    )
+
+    control.assert_awaited_once_with("chat-browser", "pause")
 
 
 @pytest.fixture()
@@ -388,6 +414,43 @@ async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> 
     assert lines[0]["event_seq"] >= 1
     assert lines[0]["project_id"].startswith("prj_")
     assert lines[0]["session_id"].startswith("ses_")
+
+
+@pytest.mark.asyncio
+async def test_webui_followup_reuses_active_turn_identity(bus: MagicMock) -> None:
+    from nanobot.webui.metadata import (
+        ACTIVE_TURN_CLIENT_TURN_METADATA_KEY,
+        ACTIVE_TURN_CORRECTION_METADATA_KEY,
+    )
+    from nanobot.webui.transcript import read_transcript_lines
+
+    channel = _ch(bus)
+    channel.gateway.state.active_turn_id = MagicMock(return_value="turn-active")
+    conn = MagicMock()
+    conn.remote_address = ("127.0.0.1", 50124)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "message",
+            "chat_id": "chat-followup",
+            "content": "不要局限在雪球",
+            "webui": True,
+            "turn_id": "turn-client-followup",
+        },
+    )
+
+    msg = bus.publish_inbound.await_args.args[0]
+    assert msg.metadata["webui_turn_id"] == "turn-active"
+    assert msg.metadata[ACTIVE_TURN_CORRECTION_METADATA_KEY] is True
+    assert (
+        msg.metadata[ACTIVE_TURN_CLIENT_TURN_METADATA_KEY]
+        == "turn-client-followup"
+    )
+    lines = read_transcript_lines("websocket:chat-followup")
+    assert len(lines) == 1
+    assert lines[0]["turn_id"] == "turn-active"
 
 
 @pytest.mark.asyncio
@@ -1226,6 +1289,66 @@ async def test_send_registers_structured_tool_output_files_as_artifacts(
 
 
 @pytest.mark.asyncio
+async def test_send_rejects_and_logs_tool_output_outside_session_project(
+    tmp_path: Path,
+) -> None:
+    bus = MagicMock()
+    project = tmp_path / "project"
+    project.mkdir()
+    external_report = tmp_path / "other-project" / "travel.html"
+    external_report.parent.mkdir()
+    external_report.write_text("<h1>travel</h1>", encoding="utf-8")
+    gateway = _basic_handler(bus, workspace_path=project)
+    project_record = gateway.state.ensure_project(project)
+    session = gateway.state.bind_session("websocket:chat-1", project_record.id)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=gateway,
+    )
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="done",
+        metadata={
+            "_tool_events": [{
+                "version": 1,
+                "phase": "end",
+                "call_id": "call-write",
+                "name": "write_file",
+                "arguments": {"path": str(external_report)},
+                "result": {
+                    "files": [{
+                        "path": str(external_report),
+                        "name": external_report.name,
+                        "mime_type": "text/html",
+                    }],
+                },
+                "error": None,
+                "files": [],
+                "embeds": [],
+            }],
+        },
+    ))
+
+    assert gateway.state.list_session_artifacts("websocket:chat-1") == []
+    [rejected] = gateway.logs.query(error_code="ARTIFACT_OUTSIDE_PROJECT")
+    assert rejected.event_name == "artifact_candidate_rejected"
+    assert rejected.project_id == project_record.id
+    assert rejected.session_id == session.id
+    assert rejected.details["file_name"] == external_report.name
+    assert rejected.details["reason"] == "outside_project"
+    assert rejected.details["source"] == "tool_output_or_media"
+    assert [
+        json.loads(call.args[0])["event"]
+        for call in mock_ws.send.await_args_list
+    ] == ["message"]
+
+
+@pytest.mark.asyncio
 async def test_send_file_edit_progress_uses_file_edit_event(tmp_path: Path) -> None:
     bus = MagicMock()
     project = tmp_path / "project"
@@ -1757,6 +1880,132 @@ async def test_expert_team_progress_persists_without_subscribers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_expert_team_terminalizes_active_synthesis_projection() -> None:
+    from nanobot.webui.transcript import build_webui_thread_response
+
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    channel._start_team_run_projection(
+        "chat-failed-synthesis",
+        run_id="run-failed-synthesis",
+        team_id="asset-research-team",
+        team_name="资产投研团队",
+        members=[
+            {
+                "id": "financial-analyst",
+                "name": "财务分析师",
+                "description": "分析财务与估值",
+            },
+        ],
+    )
+    channel._persist_team_run_projection(
+        "chat-failed-synthesis",
+        "run-failed-synthesis",
+        activity="资产投研团队已启动",
+    )
+    await channel.send_team_member_updated(
+        "chat-failed-synthesis",
+        {
+            "run_id": "run-failed-synthesis",
+            "team_id": "asset-research-team",
+            "id": "financial-analyst",
+            "name": "财务分析师",
+            "status": "completed",
+            "activity": "研究完成，结果已交付",
+        },
+    )
+    assert (
+        channel._team_runs[
+            ("chat-failed-synthesis", "run-failed-synthesis")
+        ]["stage"]
+        == "synthesis"
+    )
+
+    await channel.send_team_run_completed(
+        "chat-failed-synthesis",
+        run_id="run-failed-synthesis",
+        team_id="asset-research-team",
+        status="failed",
+    )
+
+    body = build_webui_thread_response("websocket:chat-failed-synthesis")
+    assert body is not None
+    progress = [
+        message["agentUI"]
+        for message in body["messages"]
+        if isinstance(message.get("agentUI"), dict)
+        and message["agentUI"].get("team_run_id") == "run-failed-synthesis"
+    ]
+    terminal = progress[-1]
+    steps = {step["id"]: step for step in terminal["steps"]}
+    assert terminal["status"] == "failed"
+    assert terminal["active_step_ids"] == []
+    assert terminal["current_step_id"] is None
+    assert steps["team-lead"]["status"] == "error"
+    assert steps["report-audit"]["status"] == "error"
+    assert "未完成" in steps["team-lead"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_expert_team_running_activity_persists_without_status_change() -> None:
+    from nanobot.webui.transcript import build_webui_thread_response
+
+    bus = MagicMock()
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"]},
+        bus,
+        gateway=_basic_handler(bus),
+    )
+    channel._start_team_run_projection(
+        "chat-live-activity",
+        run_id="run-live-activity",
+        team_id="industry-research-team",
+        team_name="行业深度研究",
+        members=[
+            {
+                "id": "industry-researcher",
+                "name": "行业研究员",
+                "description": "分析行业格局",
+            },
+        ],
+    )
+    channel._persist_team_run_projection(
+        "chat-live-activity",
+        "run-live-activity",
+        activity="行业深度研究已启动",
+    )
+
+    await channel.send_team_member_updated(
+        "chat-live-activity",
+        {
+            "run_id": "run-live-activity",
+            "team_id": "industry-research-team",
+            "id": "industry-researcher",
+            "name": "行业研究员",
+            "status": "running",
+            "activity": "正在查询聚源行业与可比公司数据",
+        },
+    )
+
+    body = build_webui_thread_response("websocket:chat-live-activity")
+    assert body is not None
+    progress = [
+        message["agentUI"]
+        for message in body["messages"]
+        if isinstance(message.get("agentUI"), dict)
+        and message["agentUI"].get("team_run_id") == "run-live-activity"
+    ]
+    assert len(progress) == 2
+    assert progress[-1]["revision"] > progress[0]["revision"]
+    assert progress[-1]["steps"][0]["status"] == "running"
+    assert progress[-1]["steps"][0]["detail"] == "正在查询聚源行业与可比公司数据"
+
+
+@pytest.mark.asyncio
 async def test_expert_team_all_members_terminal_advances_runtime_to_synthesis() -> None:
     bus = MagicMock()
     channel = WebSocketChannel(
@@ -1774,6 +2023,29 @@ async def test_expert_team_all_members_terminal_advances_runtime_to_synthesis() 
             {"id": "finance", "name": "财务分析师"},
         ],
     )
+    initial = channel._team_runs[("chat-plan-stage", "run-stage")]
+    assert initial["stage"] == "preparation"
+    assert initial["has_data_package"] is True
+    assert all(member["status"] == "pending" for member in initial["members"])
+    channel._persist_team_run_projection(
+        "chat-plan-stage",
+        "run-stage",
+        activity="资产投研团队已启动",
+    )
+    from nanobot.webui.transcript import build_webui_thread_response
+
+    initial_body = build_webui_thread_response("websocket:chat-plan-stage")
+    assert initial_body is not None
+    initial_plan = initial_body["messages"][-1]["agentUI"]
+    assert [step["id"] for step in initial_plan["steps"]] == [
+        "data-package",
+        "business",
+        "finance",
+        "team-lead",
+        "report-audit",
+    ]
+    assert initial_plan["steps"][0]["status"] == "running"
+    assert initial_plan["steps"][1]["status"] == "pending"
 
     await channel.send_team_member_updated(
         "chat-plan-stage",

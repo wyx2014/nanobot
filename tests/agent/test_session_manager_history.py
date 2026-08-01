@@ -1,6 +1,11 @@
 import json
 
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import (
+    MODEL_REPLAY_POLICY_KEY,
+    MODEL_REPLAY_UI_ONLY,
+    Session,
+    SessionManager,
+)
 
 
 def _assert_no_orphans(history: list[dict]) -> None:
@@ -35,6 +40,7 @@ def _tool_turn(prefix: str, idx: int) -> list[dict]:
 
 def test_get_history_repairs_legacy_structured_tool_content():
     session = Session(key="test:legacy-structured-tool")
+    session.metadata["pending_user_turn"] = True
     session.messages.extend([
         {"role": "user", "content": "create report"},
         {
@@ -59,6 +65,130 @@ def test_get_history_repairs_legacy_structured_tool_content():
     tool_message = next(message for message in history if message["role"] == "tool")
     assert isinstance(tool_message["content"], str)
     assert json.loads(tool_message["content"])["text"] == "created"
+
+
+def test_get_history_replaces_ui_only_interrupted_turn_with_safe_boundary():
+    session = Session(key="test:interrupted-ui-only")
+    session.messages.extend([
+        {
+            "role": "user",
+            "content": "帮我分析下中科曙光A股",
+            MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+        },
+        {
+            "role": "assistant",
+            "content": "启动中科曙光研究团队",
+            "tool_calls": [{
+                "id": "spawn-old",
+                "type": "function",
+                "function": {
+                    "name": "spawn",
+                    "arguments": "{\"task\":\"中科曙光 84.18 元\"}",
+                },
+            }],
+            MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "spawn-old",
+            "name": "spawn",
+            "content": "Subagent started",
+            MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+        },
+    ])
+
+    history = session.get_history(max_messages=500)
+
+    assert len(history) == 1
+    assert history[0]["role"] == "assistant"
+    assert "previous turn was interrupted" in history[0]["content"].lower()
+    assert "中科曙光" not in json.dumps(history, ensure_ascii=False)
+    assert "spawn-old" not in json.dumps(history, ensure_ascii=False)
+
+
+def test_get_history_can_include_ui_only_payload_for_internal_same_turn_resume():
+    session = Session(key="test:interrupted-internal-resume")
+    session.messages.extend([
+        {
+            "role": "user",
+            "content": "研究目标",
+            MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }],
+            MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "same-turn evidence",
+            MODEL_REPLAY_POLICY_KEY: MODEL_REPLAY_UI_ONLY,
+        },
+    ])
+
+    history = session.get_history(max_messages=500, include_ui_only=True)
+
+    assert history[0] == {"role": "user", "content": "研究目标"}
+    assert history[1]["tool_calls"][0]["id"] == "call-1"
+    assert history[2]["content"] == "same-turn evidence"
+
+
+def test_get_history_sanitizes_legacy_incomplete_tool_turns():
+    session = Session(key="test:legacy-interrupted")
+    session.messages.extend([
+        {"role": "user", "content": "帮我分析下中科曙光A股"},
+        {
+            "role": "assistant",
+            "content": "先启动团队",
+            "tool_calls": [{
+                "id": "spawn-legacy",
+                "type": "function",
+                "function": {
+                    "name": "spawn",
+                    "arguments": "{\"task\":\"中科曙光旧数据\"}",
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "spawn-legacy",
+            "name": "spawn",
+            "content": "Subagent started",
+        },
+        {"role": "user", "content": "帮我分析下工商银行A股"},
+        {
+            "role": "assistant",
+            "content": "误用了旧任务参数",
+            "tool_calls": [{
+                "id": "spawn-contaminated",
+                "type": "function",
+                "function": {
+                    "name": "spawn",
+                    "arguments": "{\"task\":\"仍然研究中科曙光\"}",
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "spawn-contaminated",
+            "name": "spawn",
+            "content": "Subagent started",
+        },
+    ])
+
+    history = session.get_history(max_messages=500)
+
+    assert len(history) == 1
+    assert "previous turn was interrupted" in history[0]["content"].lower()
+    assert "中科曙光" not in json.dumps(history, ensure_ascii=False)
+    assert "工商银行" not in json.dumps(history, ensure_ascii=False)
 
 
 def test_list_sessions_includes_metadata_title(tmp_path):
@@ -206,10 +336,11 @@ def test_retain_recent_legal_suffix_keeps_legal_tool_boundary():
 
     session.retain_recent_legal_suffix(4)
 
+    assert session.messages[0]["role"] == "user"
     history = session.get_history(max_messages=500)
     _assert_no_orphans(history)
-    assert history[0]["role"] == "user"
-    assert history[0]["content"] == "keep"
+    assert history[0]["role"] == "assistant"
+    assert "previous turn was interrupted" in history[0]["content"].lower()
 
 
 # --- last_consolidated > 0 ---
@@ -360,6 +491,7 @@ def test_get_history_does_not_annotate_proactive_assistant_deliveries_with_times
 
 def test_get_history_does_not_annotate_tool_results_with_timestamps():
     session = Session(key="test:tool-timestamps")
+    session.metadata["pending_user_turn"] = True
     session.messages.append({"role": "user", "content": "run tool"})
     session.messages.extend(_tool_turn("ts", 0))
     session.messages[-1]["timestamp"] = "2026-04-26T22:00:10"

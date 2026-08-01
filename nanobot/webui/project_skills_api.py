@@ -64,7 +64,7 @@ def _workspace_skill_names(workspace: Path) -> set[str]:
     loader = SkillsLoader(workspace)
     return {
         entry["name"]
-        for entry in loader.list_skills(filter_unavailable=False)
+        for entry in loader.list_skills(filter_unavailable=False, include_disabled=True)
         if entry.get("source") == "workspace"
     }
 
