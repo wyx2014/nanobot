@@ -3676,6 +3676,30 @@ class StateStore:
                 """,
                 params,
             ).fetchall()
+            # Terminal turn events (``turn_completed`` / ``turn_end``) carry the
+            # turn's ``usage`` (and duration), but they are not message rows and
+            # therefore never surface through the ``messages`` join above. Fetch
+            # them within the same page window so the transcript replay can stamp
+            # usage onto the final assistant reply, matching the persisted
+            # transcript path.
+            terminal_rows: list[Any] = []
+            if rows:
+                row_min_seq = int(rows[-1]["event_seq"])
+                row_max_seq = int(rows[0]["event_seq"])
+                # A terminal event is typically recorded a few seqs after the
+                # final message of its turn; widen the upper bound so the last
+                # reply in the page also receives its usage.
+                terminal_rows = connection.execute(
+                    """
+                    SELECT event_id, event_seq, event_type, recorded_at, payload_json
+                    FROM projected_events
+                    WHERE project_id = ? AND session_id = ?
+                      AND event_type IN ('turn_completed', 'turn_end')
+                      AND event_seq BETWEEN ? AND ?
+                    ORDER BY event_seq ASC
+                    """,
+                    (session.project_id, session.id, row_min_seq, row_max_seq + 8),
+                ).fetchall()
         events: list[dict[str, Any]] = []
         for row in reversed(rows):
             payload: dict[str, Any] = {}
@@ -3700,6 +3724,48 @@ class StateStore:
                 }
             )
             events.append(payload)
+        # Merge the terminal turn events back into the envelope stream at their
+        # event-seq position (after the last message of their turn) so the
+        # transcript replay path can stamp per-message usage.
+        if events and terminal_rows:
+            terminal_by_seq: dict[int, dict[str, Any]] = {}
+            for row in terminal_rows:
+                payload: dict[str, Any] = {}
+                raw = row["payload_json"]
+                if raw:
+                    try:
+                        decoded = json.loads(str(raw))
+                        if isinstance(decoded, dict):
+                            payload = decoded
+                    except json.JSONDecodeError:
+                        payload = {}
+                payload.update(
+                    {
+                        "schema_version": int(payload.get("schema_version") or 3),
+                        "event_id": str(row["event_id"]),
+                        "event_seq": int(row["event_seq"]),
+                        "event": str(payload.get("event") or row["event_type"]),
+                        "recorded_at": int(row["recorded_at"]),
+                        "project_id": session.project_id,
+                        "session_id": session.id,
+                        "session_key": session.session_key,
+                    }
+                )
+                terminal_by_seq[int(row["event_seq"])] = payload
+            if terminal_by_seq:
+                merged: list[dict[str, Any]] = []
+                max_seq = int(events[-1].get("event_seq") or 0) + 8
+                for index, entry in enumerate(events):
+                    merged.append(entry)
+                    upper = (
+                        int(events[index + 1].get("event_seq") or 0)
+                        if index + 1 < len(events)
+                        else max_seq
+                    )
+                    for seq in sorted(terminal_by_seq):
+                        if int(entry.get("event_seq") or 0) < seq < upper:
+                            merged.append(terminal_by_seq[seq])
+                events = merged
         return events
 
     def session_artifact_revision(self, session_key: str) -> int:

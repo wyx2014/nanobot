@@ -118,8 +118,16 @@ async def test_terminal_barrier_persists_before_registry_becomes_idle(
     assert latest is not None
     assert latest["status"] == "completed"
     display_events = state.session_display_event_envelopes(session.session_key)
-    assert [event["event"] for event in display_events] == ["message"]
-    assert display_events[0]["event_seq"] < rows[-1]["event_seq"]
+    # The terminal event is merged back into the display stream so the
+    # transcript replay can stamp per-message usage (turn.usage lives on the
+    # turn_completed record, which is not a message row).
+    assert [event["event"] for event in display_events] == ["message", "turn_completed"]
+    assert display_events[0]["event_seq"] < display_events[-1]["event_seq"]
+    assert display_events[-1]["turn"]["usage"] == {
+        "prompt_tokens": 1200,
+        "completion_tokens": 34,
+        "total_tokens": 1234,
+    }
     assert (await registry.snapshot(session.session_key)).thread_status == {
         "type": "idle"
     }
