@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -30,6 +30,9 @@ from nanobot.security.workspace_access import (
     workspace_sandbox_status,
 )
 from nanobot.utils.prompt_templates import render_template
+
+if TYPE_CHECKING:
+    from nanobot.observability.trace_collector import TraceCollector
 
 _EXPERT_TEAM_MAX_ITERATIONS = 100
 _EXPERT_TEAM_MEMBER_TIMEOUT_S = 540
@@ -164,6 +167,7 @@ class SubagentManager:
         max_concurrent_subagents: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         parent_tools: ToolRegistry | None = None,
+        trace_collector: "TraceCollector | None" = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -184,7 +188,8 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
-        self.runner = AgentRunner(provider)
+        self.runner = AgentRunner(provider, trace_collector=trace_collector)
+        self.trace_collector = trace_collector
         self.parent_tools = parent_tools
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -480,6 +485,8 @@ class SubagentManager:
                     session_key=sess_key,
                     workspace=root,
                     llm_timeout_s=llm_timeout,
+                    agent_kind="subagent",
+                    agent_label=label,
                 )
                 result = (
                     await asyncio.wait_for(

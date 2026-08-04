@@ -1,6 +1,11 @@
 """Durable gateway state projections."""
 
 from nanobot.storage.journal import EVENT_SCHEMA_VERSION, SessionEventJournal
+from nanobot.storage.session_events import (
+    InvalidSessionEvent,
+    SessionEventFileStore,
+    SessionEventService,
+)
 from nanobot.storage.logs import StructuredLogRecord, StructuredLogStore
 from nanobot.storage.state import (
     ArtifactRecord,
@@ -21,6 +26,9 @@ __all__ = [
     "SessionProjectMismatch",
     "SessionRecord",
     "SessionEventJournal",
+    "SessionEventService",
+    "SessionEventFileStore",
+    "InvalidSessionEvent",
     "StateStore",
     "StateStoreRecovery",
     "StructuredLogRecord",

@@ -36,7 +36,8 @@ from nanobot.storage.state import (
     StateStoreError,
 )
 from nanobot.storage.logs import StructuredLogRecord, StructuredLogStore
-from nanobot.storage.journal import SessionEventJournal
+from nanobot.observability.trace_store import TraceStore
+from nanobot.storage.session_events import SessionEventService
 from nanobot.utils.subagent_channel_display import scrub_subagent_messages_for_channel
 from nanobot.webui.file_preview import WebUIFilePreviewError, file_preview_payload
 from nanobot.webui.gateway_tokens import GatewayTokenStore, token_response_payload
@@ -194,7 +195,8 @@ class GatewayHTTPHandler:
         workspaces: WebUIWorkspaceController,
         state_store: StateStore,
         logs_store: StructuredLogStore,
-        journal_store: SessionEventJournal,
+        trace_store: TraceStore,
+        journal_store: SessionEventService,
         skills_workspace_path: Path,
         disabled_skills: set[str] | None = None,
         cron_service: CronService | None = None,
@@ -215,6 +217,7 @@ class GatewayHTTPHandler:
         self.workspaces = workspaces
         self.state = state_store
         self.logs = logs_store
+        self.traces = trace_store
         self.journal = journal_store
         self.skills_workspace_path = skills_workspace_path
         self.disabled_skills = disabled_skills or set()
@@ -439,6 +442,10 @@ class GatewayHTTPHandler:
         if m:
             return self._handle_session_messages(request, m.group(1))
 
+        m = re.match(r"^/api/sessions/([^/]+)/thread$", got)
+        if m:
+            return await self._handle_session_thread(request, m.group(1))
+
         m = re.match(r"^/api/sessions/([^/]+)/runtime-snapshot$", got)
         if m:
             return await self._handle_session_runtime_snapshot(request, m.group(1))
@@ -500,11 +507,233 @@ class GatewayHTTPHandler:
         if decoded_key is None:
             return _http_error(400, "invalid session key")
         if not _is_webui_readable_session_key(decoded_key):
+            state_session = self.state.get_session_by_id(decoded_key)
+            if state_session is not None:
+                decoded_key = state_session.session_key
+        if not _is_webui_readable_session_key(decoded_key):
             return _http_error(404, "session not found")
         session_data = self.session_manager.read_session_file(decoded_key)
         if not isinstance(session_data, dict):
             return _http_error(404, "session not found")
         return decoded_key, session_data
+
+    async def _handle_session_thread(
+        self,
+        request: WsRequest,
+        key: str,
+    ) -> Response:
+        """Return the single, session-partitioned Thread Resource read model."""
+        context = self._session_route_context(request, key)
+        if isinstance(context, Response):
+            return context
+        session_key, session_data = context
+        scope = self.workspaces.scope_for_session_key(session_key)
+        try:
+            state_session = self._ensure_state_session(
+                session_key,
+                session_data,
+                scope,
+            )
+        except SessionProjectMismatch:
+            return _http_error(409, "session_project_mismatch")
+
+        try:
+            await asyncio.to_thread(self.journal.ensure_recovered, session_key)
+        except Exception:
+            self._log.exception(
+                "thread resource journal recovery failed session={}",
+                session_key,
+            )
+            return _http_error(503, "thread projection unavailable")
+
+        raw_messages = session_data.get("messages")
+        session_messages = (
+            [item for item in raw_messages if isinstance(item, dict)]
+            if isinstance(raw_messages, list)
+            else None
+        )
+        query = _parse_query(request.path)
+        raw_message_limit = _query_first(query, "message_limit")
+        try:
+            message_limit = int(raw_message_limit) if raw_message_limit else 200
+        except ValueError:
+            return _http_error(400, "invalid message_limit")
+        message_limit = max(1, min(message_limit, 500))
+        raw_before_message = _query_first(query, "before_message_event_seq")
+        before_message_event_seq: int | None = None
+        if raw_before_message is not None and raw_before_message.strip():
+            try:
+                before_message_event_seq = int(raw_before_message)
+            except ValueError:
+                return _http_error(400, "invalid before_message_event_seq")
+            if before_message_event_seq <= 0:
+                return _http_error(400, "invalid before_message_event_seq")
+        event_rows = await asyncio.to_thread(
+            self.state.session_display_event_envelopes,
+            session_key,
+            limit=message_limit + 1,
+            before_event_seq=before_message_event_seq,
+        )
+        has_more_messages = len(event_rows) > message_limit
+        if has_more_messages:
+            event_rows = event_rows[-message_limit:]
+        message_before_cursor = (
+            int(event_rows[0].get("event_seq") or 0)
+            if event_rows
+            else None
+        )
+        thread = build_webui_thread_response(
+            session_key,
+            event_rows=event_rows,
+            session_messages=session_messages,
+            augment_user_media=self.media.augment_transcript_media,
+            augment_assistant_media=self.media.augment_transcript_media,
+            augment_assistant_text=lambda text: self.media.rewrite_local_markdown_images(
+                text,
+                workspace_path=scope.project_path,
+            ),
+        ) or {
+            "schemaVersion": 3,
+            "sessionKey": session_key,
+            "messages": [],
+            "has_pending_tool_calls": False,
+        }
+
+        if self.thread_runtime_registry is None:
+            runtime = {
+                "session_key": session_key,
+                "runtime_epoch": None,
+                "snapshot_revision": 0,
+                "thread_status": {"type": "notLoaded"},
+                "active_turn": None,
+                "latest_turn": None,
+            }
+        else:
+            runtime = (
+                await self.thread_runtime_registry.snapshot(session_key)
+            ).payload()
+
+        active_turn = runtime.get("active_turn")
+        if isinstance(active_turn, dict) and active_turn.get("id"):
+            if active_turn.get("project_id") not in {None, state_session.project_id}:
+                return _http_error(409, "runtime snapshot project mismatch")
+            if active_turn.get("session_id") not in {None, state_session.id}:
+                return _http_error(409, "runtime snapshot session mismatch")
+            active_plan = self.state.turn_plan_snapshot(
+                session_key=session_key,
+                turn_id=str(active_turn["id"]),
+            )
+            if active_plan is not None:
+                active_turn["plan"] = active_plan
+
+        latest_turn = self.state.latest_turn_snapshot(session_key)
+        plan_turn = active_turn if isinstance(active_turn, dict) else latest_turn
+        plan = (
+            self.state.turn_plan_snapshot(
+                session_key=session_key,
+                turn_id=str(plan_turn["id"]),
+            )
+            if isinstance(plan_turn, dict) and plan_turn.get("id")
+            else None
+        )
+        artifact_migration = await self._ensure_session_artifact_index(
+            session_key,
+            session_data,
+            scope,
+            state_session,
+        )
+        artifacts = await asyncio.to_thread(
+            self.state.list_session_artifacts,
+            session_key,
+        )
+        watermark = self.state.projector_watermark(session_key) or {}
+        last_event_seq = int(watermark.get("last_event_seq") or 0)
+
+        raw_after = _query_first(query, "after_event_seq")
+        after_event_seq = 0
+        if raw_after is not None and raw_after.strip():
+            try:
+                after_event_seq = int(raw_after)
+            except ValueError:
+                return _http_error(400, "invalid after_event_seq")
+            if after_event_seq < 0:
+                return _http_error(400, "invalid after_event_seq")
+        incremental = (
+            await asyncio.to_thread(
+                self.state.session_event_envelopes,
+                session_key,
+                after_event_seq=after_event_seq,
+                limit=501,
+            )
+            if raw_after is not None
+            else []
+        )
+        has_more = len(incremental) > 500
+        incremental = incremental[:500]
+        first_seq = (
+            int(incremental[0].get("event_seq") or 0)
+            if incremental
+            else None
+        )
+        resync_required = bool(
+            raw_after is not None
+            and (
+                after_event_seq > last_event_seq
+                or (
+                    after_event_seq < last_event_seq
+                    and first_seq != after_event_seq + 1
+                )
+            )
+        )
+
+        metadata = session_data.get("metadata")
+        expert_team = (
+            public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
+            if isinstance(metadata, dict)
+            else None
+        )
+        artifact_revision = self.state.session_artifact_revision(session_key)
+        snapshot_revision = (
+            last_event_seq * 1_000_000
+            + min(artifact_revision, 999_999)
+        )
+        payload: dict[str, Any] = {
+            "schema_version": 3,
+            "project_id": state_session.project_id,
+            "session_id": state_session.id,
+            "session_key": session_key,
+            "last_event_seq": last_event_seq,
+            "snapshot_revision": snapshot_revision,
+            "runtime_snapshot_revision": int(runtime.get("snapshot_revision") or 0),
+            "runtime_epoch": runtime.get("runtime_epoch"),
+            "thread_status": runtime.get("thread_status") or {"type": "idle"},
+            "active_turn": active_turn,
+            "latest_turn": latest_turn,
+            "messages": thread.get("messages") or [],
+            "message_page": {
+                "before_event_seq": message_before_cursor,
+                "has_more_before": has_more_messages,
+                "loaded_message_count": len(thread.get("messages") or []),
+            },
+            "has_pending_tool_calls": bool(thread.get("has_pending_tool_calls")),
+            "plan": plan,
+            "artifact_revision": artifact_revision,
+            "artifacts": [registered_artifact_row(record) for record in artifacts],
+            "artifact_index_truncated": artifact_migration["truncated"],
+            "workspace_scope": scope.payload(),
+            "from_event_seq": after_event_seq,
+            "to_event_seq": (
+                int(incremental[-1].get("event_seq") or after_event_seq)
+                if incremental
+                else after_event_seq
+            ),
+            "events": incremental,
+            "has_more": has_more,
+            "resync_required": resync_required,
+        }
+        if expert_team is not None:
+            payload["expert_team"] = expert_team
+        return _http_json_response(payload)
 
     async def _handle_session_runtime_snapshot(
         self,
@@ -634,6 +863,59 @@ class GatewayHTTPHandler:
             }
         )
 
+    async def _ensure_session_artifact_index(
+        self,
+        session_key: str,
+        session_data: dict[str, Any],
+        scope: Any,
+        state_session: Any,
+    ) -> dict[str, int | bool]:
+        """One-time migration of legacy file references into the registry.
+
+        Thread Resource is now the primary renderer endpoint, so it must run
+        the same bounded migration that the compatibility artifacts endpoint
+        used to own.  Keeping it in one helper prevents the two reads from
+        producing different artifact sets for the same session.
+        """
+        stats: dict[str, int | bool] = {
+            "truncated": False,
+            "migrated_count": 0,
+            "migration_failures": 0,
+        }
+        if state_session.artifact_indexed_at is not None:
+            return stats
+
+        legacy_payload = await asyncio.to_thread(
+            discover_session_artifacts,
+            session_key,
+            session_data,
+            scope=scope,
+        )
+        stats["truncated"] = legacy_payload.get("truncated") is True
+        for row in legacy_payload.get("artifacts", []):
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                continue
+            try:
+                await asyncio.to_thread(
+                    self.state.register_artifact,
+                    session_key,
+                    scope.project_path / row["path"],
+                    relation_type="referenced",
+                    artifact_kind=str(row.get("kind") or "file"),
+                    mime_type=str(row.get("mime_type") or "application/octet-stream"),
+                )
+                stats["migrated_count"] = int(stats["migrated_count"]) + 1
+            except (OSError, StateStoreError):
+                stats["migration_failures"] = int(stats["migration_failures"]) + 1
+                self._log.debug(
+                    "legacy artifact registration failed session={} path={}",
+                    session_key,
+                    row.get("path"),
+                    exc_info=True,
+                )
+        await asyncio.to_thread(self.state.mark_artifact_indexed, session_key)
+        return stats
+
     async def _handle_session_artifacts(self, request: WsRequest, key: str) -> Response:
         context = self._session_artifact_context(request, key)
         if isinstance(context, Response):
@@ -649,41 +931,15 @@ class GatewayHTTPHandler:
         except SessionProjectMismatch:
             return _http_error(409, "session_project_mismatch")
 
-        truncated = False
-        migrated_count = 0
-        migration_failures = 0
-        if state_session.artifact_indexed_at is None:
-            legacy_payload = await asyncio.to_thread(
-                discover_session_artifacts,
-                decoded_key,
-                session_data,
-                scope=scope,
-            )
-            truncated = legacy_payload.get("truncated") is True
-            for row in legacy_payload.get("artifacts", []):
-                if not isinstance(row, dict) or not isinstance(row.get("path"), str):
-                    continue
-                try:
-                    await asyncio.to_thread(
-                        self.state.register_artifact,
-                        decoded_key,
-                        scope.project_path / row["path"],
-                        relation_type="referenced",
-                        artifact_kind=str(row.get("kind") or "file"),
-                        mime_type=str(
-                            row.get("mime_type") or "application/octet-stream"
-                        ),
-                    )
-                    migrated_count += 1
-                except (OSError, StateStoreError):
-                    migration_failures += 1
-                    self._log.debug(
-                        "legacy artifact registration failed session={} path={}",
-                        decoded_key,
-                        row.get("path"),
-                        exc_info=True,
-                    )
-            await asyncio.to_thread(self.state.mark_artifact_indexed, decoded_key)
+        migration = await self._ensure_session_artifact_index(
+            decoded_key,
+            session_data,
+            scope,
+            state_session,
+        )
+        truncated = bool(migration["truncated"])
+        migrated_count = int(migration["migrated_count"])
+        migration_failures = int(migration["migration_failures"])
 
         records = await asyncio.to_thread(
             self.state.list_session_artifacts,
@@ -1447,6 +1703,20 @@ class GatewayHTTPHandler:
             return await self._handle_project_memories(request, m.group(1))
         if got == "/api/diagnostics/logs":
             return await self._handle_diagnostic_logs(request)
+        if got == "/api/traces":
+            return await self._handle_traces_list(request)
+        m = re.match(r"^/api/traces/(trc_[A-Za-z0-9_-]+)/spans$", got)
+        if m:
+            return await self._handle_trace_spans(request, m.group(1))
+        m = re.match(r"^/api/traces/(trc_[A-Za-z0-9_-]+)/context$", got)
+        if m:
+            return await self._handle_trace_context(request, m.group(1))
+        m = re.match(r"^/api/traces/(trc_[A-Za-z0-9_-]+)/export$", got)
+        if m:
+            return await self._handle_trace_export(request, m.group(1))
+        m = re.match(r"^/api/traces/(trc_[A-Za-z0-9_-]+)$", got)
+        if m:
+            return await self._handle_trace_get(request, m.group(1))
         if got == "/api/commands":
             return self._handle_commands(request)
         if got == "/api/workspaces":
@@ -1461,6 +1731,83 @@ class GatewayHTTPHandler:
         if got == "/api/webui/sidebar-state/update":
             return self._handle_webui_sidebar_state_update(request)
         return None
+
+    async def _handle_traces_list(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        query = _parse_query(request.path)
+        raw_limit = _query_first(query, "limit")
+        try:
+            limit = int(raw_limit) if raw_limit else 100
+        except ValueError:
+            return _http_error(400, "invalid limit")
+        traces = await asyncio.to_thread(
+            self.traces.list_traces,
+            project_id=_query_first(query, "project_id"),
+            session_id=_query_first(query, "session_id"),
+            turn_id=_query_first(query, "turn_id"),
+            status=_query_first(query, "status"),
+            limit=limit,
+        )
+        return _http_json_response({"schema_version": 1, "traces": traces})
+
+    async def _handle_trace_get(
+        self,
+        request: WsRequest,
+        trace_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        trace = await asyncio.to_thread(self.traces.get_trace, trace_id)
+        if trace is None:
+            return _http_error(404, "trace not found")
+        return _http_json_response({"schema_version": 1, "trace": trace})
+
+    async def _handle_trace_spans(
+        self,
+        request: WsRequest,
+        trace_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        trace = await asyncio.to_thread(self.traces.get_trace, trace_id)
+        if trace is None:
+            return _http_error(404, "trace not found")
+        spans = await asyncio.to_thread(self.traces.list_spans, trace_id)
+        return _http_json_response(
+            {"schema_version": 1, "trace_id": trace_id, "spans": spans}
+        )
+
+    async def _handle_trace_context(
+        self,
+        request: WsRequest,
+        trace_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        trace = await asyncio.to_thread(self.traces.get_trace, trace_id)
+        if trace is None:
+            return _http_error(404, "trace not found")
+        items = await asyncio.to_thread(self.traces.context_manifest, trace_id)
+        return _http_json_response(
+            {
+                "schema_version": 1,
+                "trace_id": trace_id,
+                "context_manifest": items,
+            }
+        )
+
+    async def _handle_trace_export(
+        self,
+        request: WsRequest,
+        trace_id: str,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        payload = await asyncio.to_thread(self.traces.export_trace, trace_id)
+        if payload is None:
+            return _http_error(404, "trace not found")
+        return _http_json_response(payload)
 
     async def _handle_projects_list(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):

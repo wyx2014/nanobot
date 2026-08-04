@@ -6,6 +6,7 @@ import pytest
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.bus.runtime_events import TurnFinalAnswerCommitted, TurnLifecycleCompleted
 from nanobot.providers.base import GenerationSettings, LLMResponse
 from nanobot.session.webui_turns import WebuiTurnCoordinator
 
@@ -61,6 +62,26 @@ async def test_process_direct_websocket_clears_run_status(tmp_path) -> None:
     assert [status["goal_status"] for status in statuses] == ["running", "idle"]
     assert isinstance(statuses[0].get("started_at"), float)
     assert "started_at" not in statuses[1]
+
+
+@pytest.mark.asyncio
+async def test_process_direct_commits_final_answer_before_turn_terminal(tmp_path) -> None:
+    loop = _make_loop(tmp_path)
+    seen: list[object] = []
+    loop.runtime_events.subscribe(seen.append)
+
+    response = await loop.process_direct(
+        "deliver reminder",
+        session_key="websocket:chat-final-order",
+        channel="websocket",
+        chat_id="chat-final-order",
+    )
+
+    assert response is not None
+    event_types = [type(event) for event in seen]
+    assert event_types.index(TurnFinalAnswerCommitted) < event_types.index(
+        TurnLifecycleCompleted
+    )
 
 
 @pytest.mark.asyncio

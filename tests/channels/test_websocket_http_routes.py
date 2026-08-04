@@ -499,6 +499,16 @@ async def test_session_artifact_routes_list_and_serve_workspace_file(
 
         boot = await _http_get("http://127.0.0.1:29938/webui/bootstrap")
         auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+        thread = await _http_get(
+            "http://127.0.0.1:29938/api/sessions/"
+            "websocket%3Aartifact-chat/thread",
+            headers=auth,
+        )
+        assert thread.status_code == 200
+        assert any(
+            artifact["path"] == "reports/market.pdf"
+            for artifact in thread.json()["artifacts"]
+        )
         listing = await _http_get(
             "http://127.0.0.1:29938/api/sessions/"
             "websocket%3Aartifact-chat/artifacts",
@@ -563,6 +573,71 @@ async def test_session_artifact_routes_list_and_serve_workspace_file(
             headers=auth,
         )
         assert traversal.status_code in {403, 404}
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_thread_resource_pages_messages_by_canonical_event_sequence(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    session_key = "websocket:thread-page"
+    sm = _seed_session(tmp_path, key=session_key)
+    port = _free_port()
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+        port=port,
+    )
+    project = channel.gateway.state.ensure_project(tmp_path)
+    channel.gateway.state.bind_session(session_key, project.id)
+    for index in range(1, 6):
+        channel.gateway.journal.commit(
+            session_key,
+            {
+                "event": "user",
+                "turn_id": f"turn-{index}",
+                "text": f"canonical-{index}",
+            },
+        )
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get(f"http://127.0.0.1:{port}/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+        base = (
+            f"http://127.0.0.1:{port}/api/sessions/"
+            "websocket%3Athread-page/thread"
+        )
+        latest = await _http_get(f"{base}?message_limit=2", headers=auth)
+        assert latest.status_code == 200
+        latest_payload = latest.json()
+        assert [message["content"] for message in latest_payload["messages"]] == [
+            "canonical-4",
+            "canonical-5",
+        ]
+        assert latest_payload["message_page"] == {
+            "before_event_seq": 4,
+            "has_more_before": True,
+            "loaded_message_count": 2,
+        }
+
+        older = await _http_get(
+            f"{base}?message_limit=2&before_message_event_seq=4",
+            headers=auth,
+        )
+        assert older.status_code == 200
+        older_payload = older.json()
+        assert [message["content"] for message in older_payload["messages"]] == [
+            "canonical-2",
+            "canonical-3",
+        ]
+        assert older_payload["message_page"]["before_event_seq"] == 2
+        assert older_payload["message_page"]["has_more_before"] is True
     finally:
         await channel.stop()
         await server_task

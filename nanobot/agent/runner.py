@@ -19,6 +19,13 @@ from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.request_user_input import InteractivePromptRequested
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.runtime.trace_context import (
+    TraceContext,
+    current_trace_context,
+    reset_trace_context,
+    set_trace_context,
+)
+from nanobot.security.project_context import current_project_context
 from nanobot.runtime.plan_policy import (
     PLAN_TOOL_NAME,
     PlanPolicyState,
@@ -134,6 +141,12 @@ class AgentRunSpec:
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
     provider_timing_callback: Callable[[dict[str, Any]], Any] | None = None
+    trace_id: str | None = None
+    run_id: str | None = None
+    parent_run_id: str | None = None
+    parent_span_id: str | None = None
+    agent_kind: str = "main"
+    agent_label: str | None = None
 
 
 @dataclass(slots=True)
@@ -154,8 +167,9 @@ class AgentRunResult:
 class AgentRunner:
     """Run a tool-capable LLM loop without product-layer concerns."""
 
-    def __init__(self, provider: LLMProvider):
+    def __init__(self, provider: LLMProvider, trace_collector: Any | None = None):
         self.provider = provider
+        self.trace_collector = trace_collector
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -362,6 +376,74 @@ class AgentRunner:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
+        inherited_trace = current_trace_context()
+        trace_id = spec.trace_id or (
+            inherited_trace.trace_id if inherited_trace is not None else None
+        )
+        trace_run_id: str | None = None
+        trace_token = None
+        trace_status = "completed"
+        trace_stop_reason: str | None = None
+        trace_error: dict[str, Any] | None = None
+
+        if self.trace_collector is not None and trace_id is not None:
+            project_context = current_project_context()
+            request_context = current_request_context()
+            request_metadata = (
+                request_context.metadata
+                if request_context is not None
+                and isinstance(request_context.metadata, dict)
+                else {}
+            )
+            trace_run_id = await self.trace_collector.begin_run(
+                trace_id=trace_id,
+                run_id=spec.run_id,
+                parent_run_id=(
+                    spec.parent_run_id
+                    or (inherited_trace.run_id if inherited_trace is not None else None)
+                ),
+                parent_span_id=(
+                    spec.parent_span_id
+                    or (inherited_trace.span_id if inherited_trace is not None else None)
+                ),
+                agent_kind=spec.agent_kind,
+                agent_label=spec.agent_label,
+                project_id=(project_context.project_id if project_context else None),
+                session_id=(project_context.session_id if project_context else None),
+                turn_id=(
+                    str(request_metadata.get("_runtime_turn_id") or "").strip()
+                    or None
+                ),
+                provider=type(self.provider).__name__,
+                model=spec.model,
+            )
+            trace_token = set_trace_context(
+                TraceContext(trace_id=trace_id, run_id=trace_run_id)
+            )
+            try:
+                tool_definitions = spec.tools.get_definitions()
+            except Exception:
+                tool_definitions = None
+            context_span_id = await self.trace_collector.begin_span(
+                kind="context",
+                name="context.build",
+                attributes={
+                    "message_count": len(messages),
+                    "tool_count": len(tool_definitions or []),
+                },
+            )
+            try:
+                await self.trace_collector.record_prompt_manifest(
+                    trace_id=trace_id,
+                    run_id=trace_run_id,
+                    messages=messages,
+                    tool_definitions=tool_definitions,
+                )
+            finally:
+                await self.trace_collector.end_span(
+                    context_span_id,
+                    status="completed",
+                )
 
         try:
             await hook.before_run(context)
@@ -371,12 +453,17 @@ class AgentRunner:
             context.stop_reason = "cancelled"
             context.error = None
             context.exception = exc
+            trace_status = "cancelled"
+            trace_stop_reason = "cancelled"
             raise
         except Exception as exc:
             context.messages = deepcopy(messages)
             context.stop_reason = "error"
             context.error = f"Error: {type(exc).__name__}: {exc}"
             context.exception = exc
+            trace_status = "failed"
+            trace_stop_reason = "error"
+            trace_error = {"type": type(exc).__name__, "message": str(exc)}
             await hook.on_error(context)
             raise
         else:
@@ -389,22 +476,44 @@ class AgentRunner:
             context.tool_events = deepcopy(result.tool_events)
             context.had_injections = result.had_injections
             context.exception = None
+            trace_stop_reason = result.stop_reason
+            if result.stop_reason in {"error", "tool_error"} or result.error:
+                trace_status = "failed"
+                trace_error = {"message": result.error or result.stop_reason}
+            elif result.stop_reason in {"cancelled", "interrupted", "stopped"}:
+                trace_status = "cancelled"
             if context.error is not None:
                 await hook.on_error(context)
             await hook.after_run(context)
             return result
         finally:
             context.messages = deepcopy(messages)
-            if context.exception is None:
-                await hook.on_finally(context)
-            else:
-                try:
+            try:
+                if context.exception is None:
                     await hook.on_finally(context)
-                except Exception:
-                    logger.exception(
-                        "AgentHook.on_finally error after {}",
-                        context.stop_reason or "run exception",
-                    )
+                else:
+                    try:
+                        await hook.on_finally(context)
+                    except Exception:
+                        logger.exception(
+                            "AgentHook.on_finally error after {}",
+                            context.stop_reason or "run exception",
+                        )
+            finally:
+                # Trace cleanup is deliberately nested under hook cleanup.  A
+                # user hook may fail, but it must never leave the Agent Run in
+                # ``running`` state or leak its ContextVar into a later turn.
+                try:
+                    if self.trace_collector is not None and trace_run_id is not None:
+                        await self.trace_collector.end_run(
+                            run_id=trace_run_id,
+                            status=trace_status,
+                            stop_reason=trace_stop_reason or context.stop_reason,
+                            error=trace_error,
+                        )
+                finally:
+                    if trace_token is not None:
+                        reset_trace_context(trace_token)
 
     async def _run_core(
         self,
@@ -1001,13 +1110,14 @@ class AgentRunner:
 
         provider_started_at = 0.0
         first_event_recorded = False
+        provider_ttft_ms_value: int | None = None
 
         async def _mark_first_event(
             first_event: str,
             *,
             observed: bool = True,
         ) -> None:
-            nonlocal first_event_recorded
+            nonlocal first_event_recorded, provider_ttft_ms_value
             if first_event_recorded:
                 return
             first_event_recorded = True
@@ -1015,6 +1125,7 @@ class AgentRunner:
                 0,
                 int(round((time.perf_counter() - provider_started_at) * 1000)),
             )
+            provider_ttft_ms_value = provider_ttft_ms
             await _emit_provider_timing({
                 **timing_base,
                 "event": "first_event",
@@ -1129,6 +1240,15 @@ class AgentRunner:
         # LLM timeout here, or healthy long reasoning streams can be killed just
         # because total elapsed time exceeded NANOBOT_LLM_TIMEOUT_S.
         outer_timeout_s = None if (wants_streaming or wants_progress_streaming) else timeout_s
+        llm_span_id = (
+            await self.trace_collector.begin_span(
+                kind="llm",
+                name="llm.call",
+                attributes=timing_base,
+            )
+            if self.trace_collector is not None
+            else None
+        )
         await _emit_provider_timing({
             **timing_base,
             "event": "request_started",
@@ -1151,6 +1271,15 @@ class AgentRunner:
                 )
         except asyncio.TimeoutError:
             await _mark_first_event("timeout", observed=False)
+            if self.trace_collector is not None:
+                await self.trace_collector.end_span(
+                    llm_span_id,
+                    status="failed",
+                    ttft_ms=provider_ttft_ms_value,
+                    error_code="LLM_TIMEOUT",
+                    attributes={"timeout_s": outer_timeout_s},
+                    error={"type": "TimeoutError"},
+                )
             if outer_timeout_s is None:
                 return LLMResponse(
                     content="Error calling LLM: stream stalled",
@@ -1161,6 +1290,46 @@ class AgentRunner:
                 content=f"Error calling LLM: timed out after {outer_timeout_s:g}s",
                 finish_reason="error",
                 error_kind="timeout",
+            )
+        except asyncio.CancelledError:
+            if self.trace_collector is not None:
+                await self.trace_collector.end_span(
+                    llm_span_id,
+                    status="cancelled",
+                    ttft_ms=provider_ttft_ms_value,
+                    error_code="CANCELLED",
+                )
+            raise
+        except BaseException as exc:
+            if self.trace_collector is not None:
+                await self.trace_collector.end_span(
+                    llm_span_id,
+                    status="failed",
+                    ttft_ms=provider_ttft_ms_value,
+                    error_code=type(exc).__name__,
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            raise
+        if self.trace_collector is not None:
+            llm_status = "failed" if response.finish_reason == "error" else "completed"
+            await self.trace_collector.end_span(
+                llm_span_id,
+                status=llm_status,
+                usage=self._trace_usage(response.usage),
+                ttft_ms=provider_ttft_ms_value,
+                error_code=(response.error_kind if llm_status == "failed" else None),
+                attributes={
+                    "finish_reason": response.finish_reason,
+                    "tool_call_count": len(response.tool_calls),
+                },
+                error=(
+                    {
+                        "status_code": response.error_status_code,
+                        "kind": response.error_kind,
+                    }
+                    if llm_status == "failed"
+                    else None
+                ),
             )
         if progress_state and progress_state.get("reasoning_open"):
             await hook.emit_reasoning_end()
@@ -1268,7 +1437,61 @@ class AgentRunner:
         messages: list[dict[str, Any]],
     ) -> LLMResponse:
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
-        return await self.provider.chat_with_retry(**kwargs)
+        provider_name = type(self.provider).__name__
+        span_id = (
+            await self.trace_collector.begin_span(
+                kind="llm",
+                name="llm.call",
+                attributes={
+                    "model": spec.model,
+                    "provider": provider_name,
+                    "streaming": False,
+                    "tools_enabled": False,
+                    "request_kind": "finalization",
+                },
+            )
+            if self.trace_collector is not None
+            else None
+        )
+        started_at = time.perf_counter()
+        try:
+            response = await self.provider.chat_with_retry(**kwargs)
+        except asyncio.CancelledError:
+            if self.trace_collector is not None:
+                await self.trace_collector.end_span(
+                    span_id,
+                    status="cancelled",
+                    ttft_ms=max(0, int((time.perf_counter() - started_at) * 1_000)),
+                    error_code="CANCELLED",
+                )
+            raise
+        except BaseException as exc:
+            if self.trace_collector is not None:
+                await self.trace_collector.end_span(
+                    span_id,
+                    status="failed",
+                    ttft_ms=max(0, int((time.perf_counter() - started_at) * 1_000)),
+                    error_code=type(exc).__name__,
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            raise
+        if self.trace_collector is not None:
+            status = "failed" if response.finish_reason == "error" else "completed"
+            await self.trace_collector.end_span(
+                span_id,
+                status=status,
+                usage=self._trace_usage(response.usage),
+                # Non-streaming providers expose no first-byte callback.  The
+                # completed response latency is the explicit fallback metric.
+                ttft_ms=max(0, int((time.perf_counter() - started_at) * 1_000)),
+                error_code=(response.error_kind if status == "failed" else None),
+                attributes={
+                    "finish_reason": response.finish_reason,
+                    "tool_call_count": len(response.tool_calls),
+                    "ttft_measurement": "response_latency_fallback",
+                },
+            )
+        return response
 
     @staticmethod
     def _budget_exhausted_finalization_messages(
@@ -1345,6 +1568,40 @@ class AgentRunner:
             except (TypeError, ValueError):
                 continue
         return result
+
+    @classmethod
+    def _trace_usage(cls, usage: dict[str, Any] | None) -> dict[str, int]:
+        """Normalize provider-confirmed usage for Trace aggregation.
+
+        Estimated UI counters are deliberately excluded: an observability
+        trace must never present an estimate as a provider-confirmed charge.
+        """
+        raw = cls._usage_dict(usage)
+        input_tokens = max(
+            0,
+            raw.get("input_tokens", raw.get("prompt_tokens", 0)),
+        )
+        output_tokens = max(
+            0,
+            raw.get("output_tokens", raw.get("completion_tokens", 0)),
+        )
+        cached_input_tokens = max(
+            0,
+            raw.get(
+                "cached_input_tokens",
+                raw.get("cached_tokens", raw.get("cache_read_input_tokens", 0)),
+            ),
+        )
+        total_tokens = max(
+            0,
+            raw.get("total_tokens", input_tokens + output_tokens),
+        )
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_input_tokens": min(cached_input_tokens, input_tokens),
+            "total_tokens": total_tokens,
+        }
 
     @staticmethod
     def _usage_total(usage: dict[str, int]) -> int:
@@ -1492,6 +1749,88 @@ class AgentRunner:
         return results, events, fatal_error, interactive_prompt_requested
 
     async def _run_tool(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+        external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
+        local_lookup_state: dict[str, Any],
+    ) -> tuple[Any, dict[str, str], BaseException | None]:
+        span_id = (
+            await self.trace_collector.begin_span(
+                kind="tool",
+                name="tool.call",
+                attributes={
+                    "tool_name": tool_call.name,
+                    "call_id": tool_call.id,
+                    **self.trace_collector.summarize_tool_arguments(
+                        tool_call.arguments
+                    ),
+                },
+            )
+            if self.trace_collector is not None
+            else None
+        )
+        inherited = current_trace_context()
+        span_token = None
+        if inherited is not None and span_id is not None:
+            span_token = set_trace_context(
+                TraceContext(
+                    trace_id=inherited.trace_id,
+                    run_id=inherited.run_id,
+                    span_id=span_id,
+                )
+            )
+        try:
+            result, event, error = await self._run_tool_impl(
+                spec,
+                tool_call,
+                external_lookup_counts,
+                workspace_violation_counts,
+                local_lookup_state,
+            )
+        except asyncio.CancelledError:
+            if self.trace_collector is not None:
+                await self.trace_collector.end_span(
+                    span_id,
+                    status="cancelled",
+                    error_code="CANCELLED",
+                )
+            raise
+        except BaseException as exc:
+            if self.trace_collector is not None:
+                await self.trace_collector.end_span(
+                    span_id,
+                    status="failed",
+                    error_code=type(exc).__name__,
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            raise
+        finally:
+            if span_token is not None:
+                reset_trace_context(span_token)
+
+        if self.trace_collector is not None:
+            result_text = "" if result is None else str(result)
+            await self.trace_collector.end_span(
+                span_id,
+                status="failed" if event.get("status") == "error" else "completed",
+                error_code=(type(error).__name__ if error is not None else None),
+                attributes={
+                    "result_chars": len(result_text),
+                    "result_truncated": len(result_text) > spec.max_tool_result_chars,
+                    "event_status": event.get("status"),
+                    "event_detail": str(event.get("detail") or "")[:300],
+                },
+                error=(
+                    {"type": type(error).__name__, "message": str(error)}
+                    if error is not None
+                    else None
+                ),
+            )
+        return result, event, error
+
+    async def _run_tool_impl(
         self,
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,

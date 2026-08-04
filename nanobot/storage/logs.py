@@ -24,6 +24,9 @@ class StructuredLogRecord:
     project_id: str | None
     session_id: str | None
     turn_id: str | None
+    trace_id: str | None
+    run_id: str | None
+    span_id: str | None
     tool_call_id: str | None
     artifact_id: str | None
     error_code: str | None
@@ -43,6 +46,9 @@ CREATE TABLE IF NOT EXISTS logs (
     project_id      TEXT,
     session_id      TEXT,
     turn_id         TEXT,
+    trace_id        TEXT,
+    run_id          TEXT,
+    span_id         TEXT,
     tool_call_id    TEXT,
     artifact_id     TEXT,
     error_code      TEXT,
@@ -58,6 +64,7 @@ ON logs(artifact_id, timestamp DESC);
 
 CREATE INDEX IF NOT EXISTS logs_error_time
 ON logs(error_code, timestamp DESC);
+
 """
 
 
@@ -71,13 +78,22 @@ class StructuredLogStore:
         with self._lock, self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = NORMAL")
+            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
             connection.executescript(_LOG_SCHEMA)
+            self._ensure_column(connection, "logs", "trace_id", "TEXT")
+            self._ensure_column(connection, "logs", "run_id", "TEXT")
+            self._ensure_column(connection, "logs", "span_id", "TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS logs_trace_time "
+                "ON logs(trace_id, timestamp DESC)"
+            )
             connection.commit()
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         try:
             yield connection
@@ -95,12 +111,24 @@ class StructuredLogStore:
         project_id: str | None = None,
         session_id: str | None = None,
         turn_id: str | None = None,
+        trace_id: str | None = None,
+        run_id: str | None = None,
+        span_id: str | None = None,
         tool_call_id: str | None = None,
         artifact_id: str | None = None,
         error_code: str | None = None,
         duration_ms: int | None = None,
         details: dict[str, Any] | None = None,
     ) -> int:
+        if trace_id is None or run_id is None or span_id is None:
+            # Import lazily so logs remain usable by low-level recovery code.
+            from nanobot.runtime.trace_context import current_trace_context
+
+            trace_context = current_trace_context()
+            if trace_context is not None:
+                trace_id = trace_id or trace_context.trace_id
+                run_id = run_id or trace_context.run_id
+                span_id = span_id or trace_context.span_id
         timestamp = time.time_ns() // 1_000_000
         safe_details = self._redact(details or {})
         with self._lock, self._connection() as connection:
@@ -109,9 +137,10 @@ class StructuredLogStore:
                 INSERT INTO logs(
                     timestamp, level, component, event_name, message,
                     request_id, project_id, session_id, turn_id,
+                    trace_id, run_id, span_id,
                     tool_call_id, artifact_id, error_code, duration_ms,
                     details_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp,
@@ -123,6 +152,9 @@ class StructuredLogStore:
                     project_id,
                     session_id,
                     turn_id,
+                    trace_id,
+                    run_id,
+                    span_id,
                     tool_call_id,
                     artifact_id,
                     error_code,
@@ -140,6 +172,7 @@ class StructuredLogStore:
         session_id: str | None = None,
         artifact_id: str | None = None,
         error_code: str | None = None,
+        trace_id: str | None = None,
         limit: int = 200,
     ) -> list[StructuredLogRecord]:
         filters: list[str] = []
@@ -149,6 +182,7 @@ class StructuredLogStore:
             ("session_id", session_id),
             ("artifact_id", artifact_id),
             ("error_code", error_code),
+            ("trace_id", trace_id),
         ):
             if value:
                 filters.append(f"{column} = ?")
@@ -220,9 +254,26 @@ class StructuredLogStore:
             project_id=str(row["project_id"]) if row["project_id"] else None,
             session_id=str(row["session_id"]) if row["session_id"] else None,
             turn_id=str(row["turn_id"]) if row["turn_id"] else None,
+            trace_id=str(row["trace_id"]) if row["trace_id"] else None,
+            run_id=str(row["run_id"]) if row["run_id"] else None,
+            span_id=str(row["span_id"]) if row["span_id"] else None,
             tool_call_id=str(row["tool_call_id"]) if row["tool_call_id"] else None,
             artifact_id=str(row["artifact_id"]) if row["artifact_id"] else None,
             error_code=str(row["error_code"]) if row["error_code"] else None,
             duration_ms=int(row["duration_ms"]) if row["duration_ms"] is not None else None,
             details=details if isinstance(details, dict) else {},
         )
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

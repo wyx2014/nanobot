@@ -161,6 +161,67 @@ async def test_task_progress_tool_accepts_zero_running_for_all_terminal_snapshot
     assert "current_step_id" not in sent[0].metadata[OUTBOUND_META_AGENT_UI]
 
 
+async def test_task_progress_tool_normalizes_stale_current_step_to_sole_running_step():
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    tool = TaskProgressTool(send_callback=send)
+    tool.set_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="chat-1",
+            message_id="m1",
+            session_key="websocket:chat-1",
+        )
+    )
+
+    result = await tool.execute(
+        steps=[
+            {"id": "research", "title": "完成行业研究", "status": "completed"},
+            {"id": "report", "title": "交付分析报告", "status": "running"},
+        ],
+        current_step_id="research",
+    )
+
+    assert result == "Task progress updated"
+    agent_ui = sent[0].metadata[OUTBOUND_META_AGENT_UI]
+    assert agent_ui["current_step_id"] == "report"
+    assert agent_ui["active_step_ids"] == ["report"]
+
+
+async def test_task_progress_tool_clears_stale_current_step_on_terminal_snapshot():
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    tool = TaskProgressTool(send_callback=send)
+    tool.set_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="chat-1",
+            message_id="m1",
+            session_key="websocket:chat-1",
+        )
+    )
+
+    result = await tool.execute(
+        steps=[
+            {"id": "research", "title": "完成行业研究", "status": "completed"},
+            {"id": "report", "title": "交付分析报告", "status": "completed"},
+        ],
+        current_step_id="report",
+    )
+
+    assert result == "Task progress updated"
+    agent_ui = sent[0].metadata[OUTBOUND_META_AGENT_UI]
+    assert agent_ui["status"] == "completed"
+    assert agent_ui["active_step_ids"] == []
+    assert "current_step_id" not in agent_ui
+
+
 async def test_task_progress_tool_rejects_partial_or_ambiguous_plan():
     sent = []
 

@@ -10,12 +10,14 @@ from typing import Any, Callable
 from loguru import logger as default_logger
 
 from nanobot.storage.logs import StructuredLogStore
+from nanobot.observability.trace_store import TraceStore
 from nanobot.storage.journal import SessionEventJournal
+from nanobot.storage.session_events import SessionEventFileStore, SessionEventService
 from nanobot.storage.state import StateStore, open_state_store_with_recovery
 from nanobot.webui.gateway_tokens import GatewayTokenStore
 from nanobot.webui.media_gateway import WebUIMediaGateway
 from nanobot.webui.transcript import WebUITranscriptRecorder
-from nanobot.webui.transcript import append_transcript_object, read_transcript_lines
+from nanobot.webui.transcript import read_transcript_lines
 from nanobot.webui.workspaces import WebUIWorkspaceController
 from nanobot.webui.ws_http import GatewayHTTPHandler
 
@@ -31,7 +33,8 @@ class GatewayServices:
     workspaces: WebUIWorkspaceController
     state: StateStore
     logs: StructuredLogStore
-    journal: SessionEventJournal
+    traces: TraceStore
+    journal: SessionEventService
     session_manager: Any | None
     cron_service: Any | None
     cron_pending_job_ids: Callable[[str], set[str]] | None
@@ -63,6 +66,7 @@ def build_gateway_services(
     )
     state = state_recovery.store
     logs = StructuredLogStore(workspace_path / ".nanobot" / "logs.sqlite")
+    traces = TraceStore(logs.path)
     if state_recovery.backup_dir is not None:
         logs.write(
             level="error",
@@ -94,12 +98,17 @@ def build_gateway_services(
         cache_cleanup_interval_s=config.media_cache_cleanup_interval_s,
         cache_startup_delay_s=config.media_cache_startup_delay_s,
     )
-    journal = SessionEventJournal(
+    event_files = SessionEventFileStore(
+        workspace_path / ".nanobot" / "session-events",
+        legacy_reader=read_transcript_lines,
+    )
+    journal_store = SessionEventJournal(
         state=state,
         logs=logs,
-        append_record=append_transcript_object,
-        read_records=read_transcript_lines,
+        append_record=event_files.append,
+        read_records=event_files.read,
     )
+    journal = SessionEventService(journal_store)
     transcripts = WebUITranscriptRecorder(log=logger, journal=journal)
     workspaces = WebUIWorkspaceController(
         session_manager=session_manager,
@@ -122,6 +131,7 @@ def build_gateway_services(
         workspaces=workspaces,
         state_store=state,
         logs_store=logs,
+        trace_store=traces,
         journal_store=journal,
         skills_workspace_path=workspace_path,
         disabled_skills=disabled_skills,
@@ -155,7 +165,7 @@ def build_gateway_services(
                 continue
             completed_at = time.time_ns() // 1_000_000
             runtime_epoch = str(stale.get("runtime_epoch") or "previous-runtime")
-            journal.append(
+            journal.commit(
                 session_key,
                 {
                     "event": "turn_completed",
@@ -217,6 +227,7 @@ def build_gateway_services(
         workspaces=workspaces,
         state=state,
         logs=logs,
+        traces=traces,
         journal=journal,
         session_manager=session_manager,
         cron_service=cron_service,

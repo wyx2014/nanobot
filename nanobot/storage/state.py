@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
-STATE_SCHEMA_VERSION = 6
+STATE_SCHEMA_VERSION = 7
 _ID_NAMESPACE = uuid.UUID("8b77d594-7dc0-4f27-b76c-7b96e80743c9")
 _ARTIFACT_RELATIONS = {
     "generated",
@@ -83,6 +83,7 @@ class SessionRecord:
     status: str
     event_log_path: str | None
     artifact_indexed_at: int | None
+    artifact_revision: int
     created_at: int
     updated_at: int
 
@@ -150,6 +151,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_provider      TEXT,
     model_name          TEXT,
     artifact_indexed_at INTEGER,
+    artifact_revision   INTEGER NOT NULL DEFAULT 0,
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL,
     completed_at        INTEGER,
@@ -184,6 +186,7 @@ CREATE TABLE IF NOT EXISTS turns (
     error_code          TEXT,
     error_message       TEXT,
     usage_json          TEXT,
+    trace_id            TEXT,
     UNIQUE (id, project_id),
     UNIQUE (session_id, turn_index),
     FOREIGN KEY (session_id, project_id)
@@ -201,6 +204,9 @@ CREATE TABLE IF NOT EXISTS messages (
     message_kind        TEXT NOT NULL DEFAULT 'answer',
     content_json        TEXT NOT NULL,
     is_final            INTEGER NOT NULL DEFAULT 1,
+    event_id            TEXT,
+    segment_id          TEXT,
+    revision            INTEGER NOT NULL DEFAULT 0,
     created_at          INTEGER NOT NULL,
     UNIQUE (session_id, sequence_no),
     FOREIGN KEY (session_id, project_id)
@@ -581,6 +587,7 @@ CREATE TABLE IF NOT EXISTS projected_events (
     session_id          TEXT NOT NULL,
     event_seq           INTEGER NOT NULL,
     event_type          TEXT NOT NULL,
+    payload_json        TEXT,
     recorded_at         INTEGER NOT NULL,
     projected_at        INTEGER NOT NULL,
     UNIQUE (session_id, event_seq),
@@ -590,6 +597,7 @@ CREATE TABLE IF NOT EXISTS projected_events (
 
 CREATE INDEX IF NOT EXISTS projected_events_session_seq
 ON projected_events(project_id, session_id, event_seq);
+
 """
 
 
@@ -609,6 +617,15 @@ def _coerce_timestamp_ms(value: Any, fallback: int) -> int:
         return fallback
     timestamp = int(value)
     return timestamp if timestamp > 0 else fallback
+
+
+def _coerce_nonnegative_int(value: Any, fallback: int = 0) -> int:
+    if isinstance(value, bool):
+        return fallback
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return fallback
 
 
 def _stable_id(prefix: str, value: str) -> str:
@@ -640,7 +657,18 @@ def _redact_json_value(value: Any) -> Any:
             if any(
                 marker in normalized
                 for marker in ("token", "authorization", "cookie", "api_key", "password")
-            ):
+            ) and normalized not in {
+                "prompt_tokens",
+                "completion_tokens",
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "total_tokens",
+                "new_tokens",
+                "confirmed_new_tokens",
+            }:
                 output[str(key)] = "[REDACTED]"
             else:
                 output[str(key)] = _redact_json_value(item)
@@ -660,6 +688,47 @@ def _safe_json(value: Any) -> str:
         ensure_ascii=False,
         sort_keys=True,
     )[:64_000]
+
+
+def _redact_event_value(value: Any) -> Any:
+    """Redact credentials while preserving complete committed message text."""
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in list(value.items())[:1_000]:
+            normalized = str(key).lower().replace("-", "_")
+            if any(
+                marker in normalized
+                for marker in (
+                    "authorization",
+                    "cookie",
+                    "api_key",
+                    "password",
+                    "secret",
+                )
+            ):
+                output[str(key)] = "[REDACTED]"
+            else:
+                output[str(key)] = _redact_event_value(item)
+        return output
+    if isinstance(value, list):
+        return [_redact_event_value(item) for item in value[:10_000]]
+    if isinstance(value, str):
+        return value[:4_000_000]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:64_000]
+
+
+def _event_json(value: Any) -> str:
+    encoded = json.dumps(
+        _redact_event_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > 8 * 1024 * 1024:
+        raise EventProjectionError("event payload exceeds 8 MiB")
+    return encoded
 
 
 class StateStore:
@@ -714,6 +783,7 @@ class StateStore:
                 "INTEGER",
             )
             self._ensure_column(connection, "turns", "runtime_epoch", "TEXT")
+            self._ensure_column(connection, "turns", "trace_id", "TEXT")
             self._ensure_column(connection, "turns", "finish_reason", "TEXT")
             self._ensure_column(connection, "turns", "terminal_event_id", "TEXT")
             self._ensure_column(connection, "turn_progress", "plan_id", "TEXT")
@@ -748,6 +818,66 @@ class StateStore:
             self._ensure_column(connection, "turn_steps", "step_kind", "TEXT")
             self._ensure_column(connection, "turn_steps", "stage_key", "TEXT")
             self._ensure_column(connection, "turn_steps", "warning", "TEXT")
+            self._ensure_column(
+                connection,
+                "sessions",
+                "artifact_revision",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(connection, "messages", "event_id", "TEXT")
+            self._ensure_column(connection, "messages", "segment_id", "TEXT")
+            self._ensure_column(
+                connection,
+                "messages",
+                "revision",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(connection, "projected_events", "payload_json", "TEXT")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS messages_origin_event_unique
+                ON messages(event_id)
+                WHERE event_id IS NOT NULL
+                """
+            )
+            connection.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS artifact_links_revision_insert
+                AFTER INSERT ON artifact_links
+                BEGIN
+                    UPDATE sessions
+                    SET artifact_revision = artifact_revision + 1,
+                        updated_at = MAX(updated_at, NEW.created_at)
+                    WHERE id = NEW.session_id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS artifact_links_revision_delete
+                AFTER DELETE ON artifact_links
+                BEGIN
+                    UPDATE sessions
+                    SET artifact_revision = artifact_revision + 1,
+                        updated_at = MAX(
+                            updated_at,
+                            CAST(strftime('%s','now') AS INTEGER) * 1000
+                        )
+                    WHERE id = OLD.session_id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS artifacts_revision_update
+                AFTER UPDATE OF status, relative_path, display_name,
+                    validation_json, updated_at ON artifacts
+                BEGIN
+                    UPDATE sessions
+                    SET artifact_revision = artifact_revision + 1,
+                        updated_at = MAX(updated_at, NEW.updated_at)
+                    WHERE id IN (
+                        SELECT session_id FROM artifact_links
+                        WHERE artifact_id = NEW.id
+                          AND project_id = NEW.project_id
+                    );
+                END;
+                """
+            )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS turns_terminal_event_unique
@@ -1010,6 +1140,14 @@ class StateStore:
             row = connection.execute(
                 "SELECT * FROM sessions WHERE session_key = ?",
                 (session_key,),
+            ).fetchone()
+        return self._session_record(row) if row is not None else None
+
+    def get_session_by_id(self, session_id: str) -> SessionRecord | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,),
             ).fetchone()
         return self._session_record(row) if row is not None else None
 
@@ -2448,8 +2586,8 @@ class StateStore:
                 """
                 INSERT INTO projected_events(
                     event_id, project_id, session_id, event_seq,
-                    event_type, recorded_at, projected_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    event_type, payload_json, recorded_at, projected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -2457,6 +2595,7 @@ class StateStore:
                     session.id,
                     raw_seq,
                     event_type,
+                    _event_json(event),
                     recorded_at,
                     now,
                 ),
@@ -2575,6 +2714,7 @@ class StateStore:
                 SET status = 'running',
                     started_at = COALESCE(?, started_at),
                     runtime_epoch = COALESCE(?, runtime_epoch),
+                    trace_id = COALESCE(?, trace_id),
                     ended_at = NULL,
                     finish_reason = NULL,
                     terminal_event_id = NULL,
@@ -2585,6 +2725,9 @@ class StateStore:
                 (
                     _coerce_timestamp_ms(turn_payload.get("started_at"), recorded_at),
                     _optional_text(turn_payload.get("runtime_epoch")),
+                    _optional_text(
+                        turn_payload.get("trace_id") or event.get("trace_id")
+                    ),
                     turn_id,
                     session.project_id,
                 ),
@@ -2648,6 +2791,7 @@ class StateStore:
                 UPDATE turns
                 SET status = ?, ended_at = ?,
                     runtime_epoch = COALESCE(?, runtime_epoch),
+                    trace_id = COALESCE(?, trace_id),
                     finish_reason = ?,
                     terminal_event_id = ?,
                     usage_json = COALESCE(?, usage_json),
@@ -2665,6 +2809,9 @@ class StateStore:
                     status,
                     ended_at,
                     _optional_text(turn_payload.get("runtime_epoch")),
+                    _optional_text(
+                        turn_payload.get("trace_id") or event.get("trace_id")
+                    ),
                     finish_reason,
                     terminal_event_id,
                     usage_json,
@@ -2852,8 +2999,9 @@ class StateStore:
             """
             INSERT OR IGNORE INTO messages(
                 id, project_id, session_id, turn_id, sequence_no,
-                role, message_kind, content_json, is_final, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                role, message_kind, content_json, is_final,
+                event_id, segment_id, revision, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -2865,6 +3013,13 @@ class StateStore:
                 message_kind[:64],
                 _safe_json(content),
                 1 if is_final else 0,
+                str(event.get("event_id") or "") or None,
+                str(event.get("segment_id") or event.get("stream_id") or "") or None,
+                _coerce_nonnegative_int(
+                    event.get("revision")
+                    or event.get("snapshot_revision")
+                    or 0
+                ),
                 recorded_at,
             ),
         )
@@ -3376,6 +3531,184 @@ class StateStore:
             "last_projected_at": row["last_projected_at"],
             "error": error,
         }
+
+    def backfill_projected_event_payloads(
+        self,
+        session_key: str,
+        events: list[dict[str, Any]],
+    ) -> int:
+        """Attach canonical payloads to already-projected legacy envelopes.
+
+        Schema v6 recorded only identity/type metadata.  During lazy journal
+        recovery we already have the exact source envelopes, so upgrading the
+        read model does not require re-projecting business rows.
+        """
+        session = self.get_session(session_key)
+        if session is None or not events:
+            return 0
+        updated = 0
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for event in events:
+                event_id = _optional_text(event.get("event_id"))
+                event_seq = event.get("event_seq")
+                if (
+                    event_id is None
+                    or isinstance(event_seq, bool)
+                    or not isinstance(event_seq, int)
+                ):
+                    continue
+                cursor = connection.execute(
+                    """
+                    UPDATE projected_events
+                    SET payload_json = ?
+                    WHERE event_id = ? AND project_id = ? AND session_id = ?
+                      AND event_seq = ?
+                      AND (payload_json IS NULL OR payload_json = '')
+                    """,
+                    (
+                        _event_json(event),
+                        event_id,
+                        session.project_id,
+                        session.id,
+                        event_seq,
+                    ),
+                )
+                updated += max(0, int(cursor.rowcount))
+            connection.commit()
+        return updated
+
+    def session_event_envelopes(
+        self,
+        session_key: str,
+        *,
+        after_event_seq: int = 0,
+        limit: int = 2_000,
+    ) -> list[dict[str, Any]]:
+        """Return canonical envelopes from the SQLite read model in order."""
+        session = self.get_session(session_key)
+        if session is None:
+            return []
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, event_seq, event_type, recorded_at, payload_json
+                FROM projected_events
+                WHERE project_id = ? AND session_id = ? AND event_seq > ?
+                ORDER BY event_seq
+                LIMIT ?
+                """,
+                (
+                    session.project_id,
+                    session.id,
+                    max(0, int(after_event_seq)),
+                    max(1, min(int(limit), 10_000)),
+                ),
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            payload: dict[str, Any] = {}
+            raw = row["payload_json"]
+            if raw:
+                try:
+                    decoded = json.loads(str(raw))
+                    if isinstance(decoded, dict):
+                        payload = decoded
+                except json.JSONDecodeError:
+                    payload = {}
+            payload.update(
+                {
+                    "schema_version": int(payload.get("schema_version") or 3),
+                    "event_id": str(row["event_id"]),
+                    "event_seq": int(row["event_seq"]),
+                    "event": str(payload.get("event") or row["event_type"]),
+                    "recorded_at": int(row["recorded_at"]),
+                    "project_id": session.project_id,
+                    "session_id": session.id,
+                    "session_key": session.session_key,
+                }
+            )
+            events.append(payload)
+        return events
+
+    def session_display_event_envelopes(
+        self,
+        session_key: str,
+        *,
+        limit: int = 200,
+        before_event_seq: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return only recent message-bearing events for Thread rendering.
+
+        A Thread snapshot must not scan every token/progress event ever written
+        by a long conversation.  The messages projection already identifies
+        the durable user-visible rows, while ``projected_events.payload_json``
+        retains the exact rich WebUI envelope needed by the compatibility
+        renderer.
+        """
+        session = self.get_session(session_key)
+        if session is None:
+            return []
+        before_clause = ""
+        params: list[Any] = [session.project_id, session.id]
+        if before_event_seq is not None:
+            before_clause = "AND m.sequence_no < ?"
+            params.append(max(0, int(before_event_seq)))
+        params.append(max(1, min(int(limit), 1_001)))
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    pe.event_id,
+                    pe.event_seq,
+                    pe.event_type,
+                    pe.recorded_at,
+                    pe.payload_json
+                FROM messages AS m
+                JOIN projected_events AS pe
+                  ON pe.project_id = m.project_id
+                 AND pe.session_id = m.session_id
+                 AND pe.event_seq = m.sequence_no
+                WHERE m.project_id = ? AND m.session_id = ?
+                {before_clause}
+                ORDER BY m.sequence_no DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            payload: dict[str, Any] = {}
+            raw = row["payload_json"]
+            if raw:
+                try:
+                    decoded = json.loads(str(raw))
+                    if isinstance(decoded, dict):
+                        payload = decoded
+                except json.JSONDecodeError:
+                    payload = {}
+            payload.update(
+                {
+                    "schema_version": int(payload.get("schema_version") or 3),
+                    "event_id": str(row["event_id"]),
+                    "event_seq": int(row["event_seq"]),
+                    "event": str(payload.get("event") or row["event_type"]),
+                    "recorded_at": int(row["recorded_at"]),
+                    "project_id": session.project_id,
+                    "session_id": session.id,
+                    "session_key": session.session_key,
+                }
+            )
+            events.append(payload)
+        return events
+
+    def session_artifact_revision(self, session_key: str) -> int:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT artifact_revision FROM sessions WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+        return int(row["artifact_revision"] or 0) if row is not None else 0
 
     def mark_artifact_indexed(self, session_key: str) -> None:
         now = _now_ms()
@@ -4031,6 +4364,32 @@ class StateStore:
             return None
         return str(row["active_turn_id"])
 
+    def turn_runtime_identity(
+        self,
+        session_key: str,
+        turn_id: str,
+    ) -> dict[str, str | None] | None:
+        """Resolve durable Trace/runtime identity for one session-owned Turn."""
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT t.trace_id, t.runtime_epoch
+                FROM turns AS t
+                JOIN sessions AS s
+                  ON s.id = t.session_id AND s.project_id = t.project_id
+                WHERE s.session_key = ? AND t.id = ?
+                """,
+                (session_key, turn_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "trace_id": str(row["trace_id"]) if row["trace_id"] else None,
+            "runtime_epoch": (
+                str(row["runtime_epoch"]) if row["runtime_epoch"] else None
+            ),
+        }
+
     def latest_turn_snapshot(self, session_key: str) -> dict[str, Any] | None:
         """Return the latest durable turn as a public lifecycle resource.
 
@@ -4059,6 +4418,7 @@ class StateStore:
         payload: dict[str, Any] = {
             "id": str(row["id"]),
             "runtime_epoch": row["runtime_epoch"],
+            "trace_id": row["trace_id"],
             "project_id": str(row["project_id"]),
             "session_id": str(row["session_id"]),
             "status": status,
@@ -4073,6 +4433,13 @@ class StateStore:
             ),
             "finish_reason": row["finish_reason"],
         }
+        if row["usage_json"]:
+            try:
+                usage = json.loads(str(row["usage_json"]))
+            except json.JSONDecodeError:
+                usage = None
+            if isinstance(usage, dict):
+                payload["usage"] = usage
         if row["error_code"] or row["error_message"]:
             payload["error"] = {
                 "code": str(row["error_code"] or "TURN_FAILED"),
@@ -4353,6 +4720,7 @@ class StateStore:
                 if row["artifact_indexed_at"] is not None
                 else None
             ),
+            artifact_revision=int(row["artifact_revision"] or 0),
             created_at=int(row["created_at"]),
             updated_at=int(row["updated_at"]),
         )

@@ -11,9 +11,9 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -24,6 +24,10 @@ from nanobot.bus.runtime_events import (
     TurnLifecycleCompleted,
     TurnLifecycleStarted,
 )
+from nanobot.runtime.trace_context import activate_turn_trace, clear_trace_context
+
+if TYPE_CHECKING:
+    from nanobot.observability.trace_collector import TraceCollector
 
 
 class TurnStatus(StrEnum):
@@ -78,6 +82,7 @@ class TurnError:
 @dataclass
 class ActiveTurn:
     id: str
+    trace_id: str
     context: RuntimeEventContext
     runtime_epoch: str
     project_id: str | None
@@ -90,6 +95,7 @@ class ActiveTurn:
     def payload(self) -> dict[str, Any]:
         return {
             "id": self.id,
+            "trace_id": self.trace_id,
             "runtime_epoch": self.runtime_epoch,
             "project_id": self.project_id,
             "session_id": self.session_id,
@@ -104,6 +110,7 @@ class ActiveTurn:
 @dataclass(frozen=True)
 class TerminalTurn:
     id: str
+    trace_id: str
     runtime_epoch: str
     project_id: str | None
     session_id: str | None
@@ -118,6 +125,7 @@ class TerminalTurn:
         duration_ms = max(0, round((self.completed_at - self.started_at) * 1000))
         return {
             "id": self.id,
+            "trace_id": self.trace_id,
             "runtime_epoch": self.runtime_epoch,
             "project_id": self.project_id,
             "session_id": self.session_id,
@@ -178,12 +186,18 @@ class ThreadRuntimeRegistry:
         *,
         runtime_events: RuntimeEventBus | None = None,
         runtime_epoch: str | None = None,
+        trace_collector: "TraceCollector | None" = None,
     ) -> None:
         self.runtime_epoch = runtime_epoch or uuid.uuid4().hex
         self._runtime_events = runtime_events
+        self._trace_collector = trace_collector
         self._facts: dict[str, _RuntimeFacts] = {}
         self._lock = asyncio.Lock()
         self._listeners: set[SnapshotListener] = set()
+
+    def set_trace_collector(self, collector: "TraceCollector | None") -> None:
+        """Attach the best-effort collector used by the owning AgentLoop."""
+        self._trace_collector = collector
 
     def subscribe(self, listener: SnapshotListener) -> Callable[[], None]:
         self._listeners.add(listener)
@@ -213,14 +227,18 @@ class ThreadRuntimeRegistry:
                 if current.id == normalized_turn_id:
                     if task is not None:
                         current.task = task
+                    activate_turn_trace(current.trace_id)
                     return current
                 raise TurnLifecycleError(
                     "TURN_ALREADY_ACTIVE",
                     f"session {context.session_key!r} already has active turn {current.id!r}",
                 )
+            trace_id = f"trc_{uuid.uuid4().hex}"
+            trace_context = replace(context, trace_id=trace_id, run_id=None)
             active = ActiveTurn(
                 id=normalized_turn_id,
-                context=context,
+                trace_id=trace_id,
+                context=trace_context,
                 runtime_epoch=self.runtime_epoch,
                 project_id=project_id,
                 session_id=session_id,
@@ -233,10 +251,24 @@ class ThreadRuntimeRegistry:
             facts.terminalizing_turn_id = None
             facts.snapshot_revision += 1
             snapshot = self._snapshot_locked(context.session_key, facts)
+        activate_turn_trace(active.trace_id)
+        if self._trace_collector is not None:
+            await self._trace_collector.begin_trace(
+                trace_id=active.trace_id,
+                project_id=project_id,
+                session_id=session_id,
+                turn_id=active.id,
+                runtime_epoch=self.runtime_epoch,
+                started_at=int(active.started_at * 1_000),
+                attributes={
+                    "channel": active.context.channel,
+                    "session_key": active.context.session_key,
+                },
+            )
         if self._runtime_events is not None:
             await self._runtime_events.publish(
                 TurnLifecycleStarted(
-                    context=context,
+                    context=active.context,
                     turn=active.payload(),
                     snapshot_revision=snapshot.snapshot_revision,
                 )
@@ -327,6 +359,7 @@ class ThreadRuntimeRegistry:
                 )
             terminal = TerminalTurn(
                 id=active.id,
+                trace_id=active.trace_id,
                 runtime_epoch=active.runtime_epoch,
                 project_id=active.project_id,
                 session_id=active.session_id,
@@ -400,6 +433,19 @@ class ThreadRuntimeRegistry:
             task_name=active.task.get_name() if active.task is not None else None,
         ).info("turn lifecycle completed")
         await self._publish_snapshot(snapshot)
+        if self._trace_collector is not None:
+            trace_status = {
+                TurnStatus.COMPLETED: "completed",
+                TurnStatus.FAILED: "failed",
+                TurnStatus.INTERRUPTED: "cancelled",
+            }[terminal.status]
+            await self._trace_collector.end_trace(
+                trace_id=terminal.trace_id,
+                status=trace_status,
+                error_code=terminal.error.code if terminal.error is not None else None,
+                error=terminal.error.payload() if terminal.error is not None else None,
+            )
+        clear_trace_context()
         return terminal
 
     async def set_system_error(
@@ -408,8 +454,11 @@ class ThreadRuntimeRegistry:
         *,
         error_code: str,
     ) -> ThreadRuntimeSnapshot:
+        active_trace_id: str | None = None
         async with self._lock:
             facts = self._facts.setdefault(session_key, _RuntimeFacts())
+            if facts.active_turn is not None:
+                active_trace_id = facts.active_turn.trace_id
             facts.is_loaded = True
             facts.active_turn = None
             facts.pending_approval_count = 0
@@ -419,11 +468,22 @@ class ThreadRuntimeRegistry:
             facts.snapshot_revision += 1
             snapshot = self._snapshot_locked(session_key, facts)
         await self._publish_snapshot(snapshot)
+        if active_trace_id is not None and self._trace_collector is not None:
+            await self._trace_collector.end_trace(
+                trace_id=active_trace_id,
+                status="failed",
+                error_code=error_code,
+                error={"code": error_code},
+            )
+        clear_trace_context()
         return snapshot
 
     async def unload_thread(self, session_key: str) -> ThreadRuntimeSnapshot:
+        active_trace_id: str | None = None
         async with self._lock:
             facts = self._facts.setdefault(session_key, _RuntimeFacts())
+            if facts.active_turn is not None:
+                active_trace_id = facts.active_turn.trace_id
             facts.is_loaded = False
             facts.active_turn = None
             facts.pending_approval_count = 0
@@ -432,6 +492,13 @@ class ThreadRuntimeRegistry:
             facts.snapshot_revision += 1
             snapshot = self._snapshot_locked(session_key, facts)
         await self._publish_snapshot(snapshot)
+        if active_trace_id is not None and self._trace_collector is not None:
+            await self._trace_collector.end_trace(
+                trace_id=active_trace_id,
+                status="abandoned",
+                error_code="THREAD_UNLOADED",
+            )
+        clear_trace_context()
         return snapshot
 
     async def snapshot(self, session_key: str) -> ThreadRuntimeSnapshot:

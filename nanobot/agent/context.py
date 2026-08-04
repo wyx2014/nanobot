@@ -19,6 +19,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
 from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.runtime.trace_context import record_pending_context_item
 from nanobot.webui.interactive_prompt import interactive_prompt_answer_session_extra
 from nanobot.webui.expert_teams import expert_team_system_prompt
 from nanobot.utils.helpers import (
@@ -194,13 +195,19 @@ class ContextBuilder:
                 memory = _filter_disallowed_skill_text(memory, disallowed_markers)
             if memory:
                 parts.append(f"# Memory\n\n{memory}")
+                record_pending_context_item(
+                    item_kind="semantic_memory",
+                    source_id=project_id or "global",
+                    source_locator=str(memory_store.memory_file),
+                    content=memory,
+                    selected_reason="active_memory_context",
+                )
 
-        available_skills = {
-            entry["name"]
-            for entry in self.skills.list_skills(
-                allowed_workspace_skills=allowed_workspace_skills,
-            )
-        }
+        skill_entries = self.skills.list_skills(
+            allowed_workspace_skills=allowed_workspace_skills,
+        )
+        available_skills = {entry["name"] for entry in skill_entries}
+        skill_entries_by_name = {entry["name"]: entry for entry in skill_entries}
         requested_skills = [*(skill_names or []), *explicit_skills_from_scope(skill_scope)]
         selected_skills = list(dict.fromkeys(name for name in requested_skills if name in available_skills))
         always_skills = self.skills.get_always_skills(allowed_workspace_skills=allowed_workspace_skills)
@@ -209,6 +216,20 @@ class ContextBuilder:
             always_content = self.skills.load_skills_for_context(active_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
+                for skill_name in active_skills:
+                    entry = skill_entries_by_name.get(skill_name, {})
+                    record_pending_context_item(
+                        item_kind="procedural_skill",
+                        source_id=skill_name,
+                        source_locator=entry.get("path"),
+                        content=self.skills.load_skill(skill_name) or "",
+                        selected_reason=(
+                            "explicit_skill"
+                            if skill_name in selected_skills
+                            else "always_skill"
+                        ),
+                        metadata={"source": entry.get("source")},
+                    )
 
         skills_summary = self.skills.build_skills_summary(
             exclude=set(active_skills),
@@ -240,9 +261,22 @@ class ContextBuilder:
                     )
                     history_text = truncate_text_to_tokens(history_text, self._MAX_HISTORY_TOKENS)
                     parts.append("# Recent History\n\n" + history_text)
+                    record_pending_context_item(
+                        item_kind="episodic_recent_history",
+                        source_id=session_key,
+                        content=history_text,
+                        selected_reason="recent_history_window",
+                        metadata={"entry_count": len(capped)},
+                    )
 
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+            record_pending_context_item(
+                item_kind="session_summary",
+                source_id=session_key,
+                content=session_summary,
+                selected_reason="archived_context_summary",
+            )
 
         return "\n\n---\n\n".join(parts)
 
@@ -343,6 +377,16 @@ class ContextBuilder:
             )
         if not rows:
             return ""
+        for row in rows:
+            record_pending_context_item(
+                item_kind="project_document",
+                source_id=str(row.get("chunk_id") or row.get("id") or ""),
+                source_locator=str(row.get("relative_path") or ""),
+                content=str(row.get("text") or ""),
+                selected_reason="project_scoped_keyword_search",
+                rank=(float(row["rank"]) if row.get("rank") is not None else None),
+                metadata={"ordinal": int(row.get("ordinal") or 0)},
+            )
         excerpts = "\n\n".join(
             f"[{row['relative_path']}#{int(row['ordinal']) + 1}]\n{row['text']}"
             for row in rows
@@ -393,6 +437,15 @@ class ContextBuilder:
             excerpts.append(
                 f"[memory:{row['id']}{source_note}] {title}\n{row['content']}"
             )
+            record_pending_context_item(
+                item_kind="project_memory",
+                source_id=str(row["id"]),
+                source_locator=sources or None,
+                content=str(row.get("content") or ""),
+                selected_reason="project_scoped_memory_search",
+                rank=(float(row["rank"]) if row.get("rank") is not None else None),
+                metadata={"title": title, "kind": row.get("kind")},
+            )
         source_summaries = state.project_memory_source_summaries(
             normalized_id,
             memory_ids,
@@ -409,6 +462,14 @@ class ContextBuilder:
                     for row in source_summaries
                 )
             )
+            for row in source_summaries:
+                record_pending_context_item(
+                    item_kind="rollout_summary",
+                    source_id=str(row["id"]),
+                    source_locator=str(row["source_session_key"]),
+                    content=str(row.get("rollout_summary") or ""),
+                    selected_reason="supporting_project_memory",
+                )
         for path in sorted(memory_store.memory_skills_dir.glob("*.md")):
             try:
                 skill_text = path.read_text(encoding="utf-8")
@@ -420,6 +481,13 @@ class ContextBuilder:
             excerpts.append(
                 f"# Relevant Memory-Derived Project Skill\n\n"
                 f"[memory-skill:{path.stem}]\n{skill_text}"
+            )
+            record_pending_context_item(
+                item_kind="memory_derived_skill",
+                source_id=path.stem,
+                source_locator=str(path),
+                content=skill_text,
+                selected_reason="project_memory_keyword_match",
             )
             break
         body = "\n\n".join(excerpts)
@@ -503,6 +571,13 @@ class ContextBuilder:
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
+                record_pending_context_item(
+                    item_kind="bootstrap_file",
+                    source_id=filename,
+                    source_locator=str(file_path),
+                    content=content,
+                    selected_reason="workspace_bootstrap",
+                )
 
         return "\n\n".join(parts) if parts else ""
 

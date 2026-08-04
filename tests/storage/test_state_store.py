@@ -58,7 +58,7 @@ def test_schema_initializes_with_wal_and_core_relations(tmp_path: Path) -> None:
             "projected_events",
         } <= tables
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
 
 
 def test_project_and_session_ids_are_stable_and_session_project_is_immutable(
@@ -636,6 +636,7 @@ def test_v2_lifecycle_projection_has_one_stable_terminal(tmp_path: Path) -> None
     }
     assert store.latest_turn_snapshot(session.session_key) == {
         "id": "turn-v2",
+        "trace_id": None,
         "runtime_epoch": "epoch-a",
         "project_id": project.id,
         "session_id": session.id,
@@ -644,6 +645,11 @@ def test_v2_lifecycle_projection_has_one_stable_terminal(tmp_path: Path) -> None
         "completed_at": 1_500,
         "duration_ms": 600,
         "finish_reason": "userInterrupted",
+        "usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 34,
+            "total_tokens": 1234,
+        },
     }
     with pytest.raises(EventProjectionError, match="another terminal event"):
         store.project_event(

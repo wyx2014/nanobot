@@ -697,7 +697,7 @@ class WebUITranscriptRecorder:
         phase: str | None = None,
         include_source: bool = False,
         transcript_overrides: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         self.prepare_event(
             chat_id,
             event,
@@ -708,7 +708,24 @@ class WebUITranscriptRecorder:
         record = dict(event)
         if transcript_overrides:
             record.update(transcript_overrides)
-        self.append(chat_id, record, metadata=metadata)
+        envelope = self.append(chat_id, record, metadata=metadata)
+        if envelope is not None:
+            for key in (
+                "schema_version",
+                "event_id",
+                "event_seq",
+                "recorded_at",
+                "project_id",
+                "session_id",
+                "session_key",
+                "turn_id",
+                "trace_id",
+                "runtime_epoch",
+                "visibility",
+            ):
+                if key in envelope:
+                    event[key] = envelope[key]
+        return envelope
 
     def append_user_message(
         self,
@@ -743,7 +760,7 @@ class WebUITranscriptRecorder:
         event: dict[str, Any],
         *,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         session_key = self._session_key_for_append(chat_id, metadata)
         try:
             dup = json.loads(json.dumps(event, ensure_ascii=False))
@@ -751,13 +768,28 @@ class WebUITranscriptRecorder:
                 self._journal is not None
                 and self._journal.state.get_session(session_key) is not None
             ):
-                self._journal.append(session_key, dup)
+                commit = getattr(self._journal, "commit", self._journal.append)
+                envelope = commit(session_key, dup)
+                # Compatibility transcript is a disposable display cache.  It
+                # is written only after the canonical event and SQLite
+                # projection commit, and a cache failure cannot change the
+                # business outcome or WebSocket event identity.
+                try:
+                    append_transcript_object(session_key, envelope)
+                except (OSError, ValueError, TypeError) as cache_error:
+                    self._log.warning(
+                        "webui transcript cache append failed: {}",
+                        cache_error,
+                    )
+                return envelope
             else:
                 append_transcript_object(session_key, dup)
+                return dup
         except (OSError, ValueError, TypeError) as e:
             self._log.warning("webui transcript append failed: {}", e)
             if self._journal is not None:
                 raise
+        return None
 
     def _next_turn_seq(self, chat_id: str, turn_id: str) -> int:
         key = (chat_id, turn_id)
@@ -2546,6 +2578,7 @@ def apply_session_generated_artifacts(
 def build_webui_thread_response(
     session_key: str,
     *,
+    event_rows: list[dict[str, Any]] | None = None,
     session_messages: list[dict[str, Any]] | None = None,
     augment_user_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
     augment_assistant_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
@@ -2555,9 +2588,14 @@ def build_webui_thread_response(
     before: str | None = None,
 ) -> dict[str, Any] | None:
     """Return a payload compatible with ``WebuiThreadPersistedPayload``."""
-    paginated = limit is not None or direction is not None or before is not None
+    paginated = (
+        event_rows is None
+        and (limit is not None or direction is not None or before is not None)
+    )
     page: dict[str, Any] | None = None
-    if paginated:
+    if event_rows is not None:
+        lines = [dict(row) for row in event_rows if isinstance(row, dict)]
+    elif paginated:
         lines, page = _select_transcript_page(session_key, limit=limit, before=before)
     else:
         lines = read_transcript_lines(session_key)

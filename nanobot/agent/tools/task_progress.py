@@ -19,7 +19,8 @@ _STATUSES = ("pending", "running", "completed", "error")
             "tool call before business tools, normally with 2-4 outcome-oriented steps. "
             "Expert-team workflows are runtime-owned and ignore this tool. Re-send the full "
             "ordered list on every update, preserving every id and title. Every non-terminal snapshot "
-            "must have exactly one running step; only a final all-terminal snapshot may have none."
+            "must have exactly one running step; only a final all-terminal snapshot may have none. "
+            "Omit current_step_id for that final all-terminal snapshot."
         ),
         steps=ArraySchema(
             ObjectSchema(
@@ -83,7 +84,8 @@ class TaskProgressTool(Tool, ContextAware):
             "tool, or running a command. Keep ids and titles unchanged across updates, and use "
             "exactly one running step in every non-terminal snapshot. Zero running steps is valid "
             "only when every step is terminal (completed or error), immediately before the final "
-            "answer. Use note only for concise public narration, never private reasoning."
+            "answer; omit current_step_id in that snapshot. Use note only for concise public "
+            "narration, never private reasoning."
         )
 
     @property
@@ -142,14 +144,14 @@ class TaskProgressTool(Tool, ContextAware):
         valid_step_ids = {step["id"] for step in normalized}
         if current_id and current_id not in valid_step_ids:
             return "Error: current_step_id must match a task-plan step id"
-        if current_id:
-            current_status = next(
-                step["status"] for step in normalized if step["id"] == current_id
-            )
-            if current_status != "running":
-                return "Error: current_step_id must identify the running step"
-        elif running_steps:
-            current_id = running_steps[0]["id"]
+        # ``steps`` is the complete authoritative snapshot. Models sometimes
+        # advance the running step correctly but leave ``current_step_id`` on
+        # the just-completed step, or keep it on the final completed step. A
+        # valid-but-stale pointer must not reject an otherwise unambiguous
+        # snapshot: derive it from the sole running step, or clear it when the
+        # plan is fully terminal. Unknown ids remain an error because they can
+        # indicate a different/partial plan rather than a stale pointer.
+        current_id = running_steps[0]["id"] if running_steps else ""
 
         metadata = dict(self._metadata)
         metadata["_progress"] = True

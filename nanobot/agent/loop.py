@@ -51,6 +51,8 @@ from nanobot.cron.session_turns import (
     is_cron_turn,
 )
 from nanobot.memories.project import ProjectMemoryPipeline, ProjectMemoryPipelineConfig
+from nanobot.observability.trace_collector import TraceCollector
+from nanobot.observability.trace_store import TraceStore
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.runtime.turn_lifecycle import (
@@ -437,9 +439,23 @@ class AgentLoop:
         self.bus = bus
         self.runtime_events = runtime_events or RuntimeEventBus()
         self.runtime_event_publisher = RuntimeEventPublisher(self.runtime_events)
+        self._performance_logs = performance_log_store
+        self.trace_store = (
+            TraceStore(performance_log_store.path)
+            if performance_log_store is not None
+            else None
+        )
+        self.trace_collector = (
+            TraceCollector(self.trace_store)
+            if self.trace_store is not None
+            else None
+        )
         self.thread_runtime_registry = thread_runtime_registry or ThreadRuntimeRegistry(
             runtime_events=self.runtime_events,
+            trace_collector=self.trace_collector,
         )
+        if thread_runtime_registry is not None:
+            self.thread_runtime_registry.set_trace_collector(self.trace_collector)
         self.turn_lifecycle = TurnLifecycleManager(self.thread_runtime_registry)
         self.channels_config = channels_config
         self.provider = provider
@@ -487,15 +503,13 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
-        self._performance_logs = performance_log_store
-
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
-        self.runner = AgentRunner(provider)
+        self.runner = AgentRunner(provider, trace_collector=self.trace_collector)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -509,6 +523,7 @@ class AgentLoop:
             max_concurrent_subagents=max_concurrent_subagents,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
             parent_tools=self.tools,
+            trace_collector=self.trace_collector,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -969,6 +984,43 @@ class AgentLoop:
                 session_key,
                 error_code="TURN_TERMINAL_PERSIST_FAILED",
             )
+
+    async def _commit_runtime_final_answer(
+        self,
+        msg: InboundMessage,
+        session_key: str,
+        response: OutboundMessage,
+    ) -> OutboundMessage:
+        """Durably commit one final answer before entering the terminal barrier."""
+        turn_id = str((msg.metadata or {}).get("_runtime_turn_id") or "").strip()
+        if not turn_id:
+            raise TurnLifecycleError(
+                "TURN_ID_REQUIRED",
+                f"cannot commit a final answer for {session_key!r} without a turn id",
+            )
+        metadata = {
+            **dict(msg.metadata or {}),
+            **dict(response.metadata or {}),
+        }
+        prepared = dataclasses.replace(response, metadata=metadata)
+        await self.turn_lifecycle.commit_final_answer(
+            session_key=session_key,
+            expected_turn_id=turn_id,
+        )
+        canonical_event = await self._runtime_events().final_answer_committed(
+            prepared,
+            session_key,
+        )
+        if canonical_event is None:
+            return prepared
+        return dataclasses.replace(
+            prepared,
+            metadata={
+                **prepared.metadata,
+                "_final_answer_persisted": True,
+                "_canonical_event": canonical_event,
+            },
+        )
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         return await self._cron_turns.submit(msg)
@@ -1592,6 +1644,13 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         self._mcp_shutdown_event = asyncio.Event()
+        if self.trace_collector is not None:
+            abandoned = await self.trace_collector.recover_abandoned(
+                runtime_epoch=self.thread_runtime_registry.runtime_epoch,
+            )
+            if abandoned:
+                logger.warning("Recovered {} abandoned runtime trace(s)", abandoned)
+            self._schedule_background(self.trace_collector.apply_retention())
         if self._mcp_servers:
             self._mcp_warmup_complete = False
             self._mcp_owner_task = asyncio.create_task(
@@ -1779,11 +1838,10 @@ class AgentLoop:
                     completed_chat_id = msg.chat_id
                     if response is not None:
                         if not continuing:
-                            await self.turn_lifecycle.commit_final_answer(
-                                session_key=session_key,
-                                expected_turn_id=str(
-                                    (msg.metadata or {}).get("_runtime_turn_id") or ""
-                                ),
+                            response = await self._commit_runtime_final_answer(
+                                msg,
+                                session_key,
+                                response,
                             )
                         await self.bus.publish_outbound(response)
                         completed_channel = response.channel
@@ -2005,6 +2063,8 @@ class AgentLoop:
 
         await DEFAULT_EXEC_SESSION_MANAGER.shutdown()
         await self.close_mcp()
+        if self.trace_collector is not None:
+            await self.trace_collector.close()
 
     async def _process_system_message(
         self,
@@ -3043,11 +3103,10 @@ class AgentLoop:
                 if channel != "system":
                     await self.subagents.cancel_by_session(session_key)
                     if response is not None:
-                        await self.turn_lifecycle.commit_final_answer(
-                            session_key=session_key,
-                            expected_turn_id=str(
-                                (msg.metadata or {}).get("_runtime_turn_id") or ""
-                            ),
+                        response = await self._commit_runtime_final_answer(
+                            msg,
+                            session_key,
+                            response,
                         )
                     terminal_status, finish_reason, terminal_error = (
                         self._terminal_status_for_response(response)

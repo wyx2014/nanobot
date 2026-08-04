@@ -11,7 +11,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.bus import progress as bus_progress
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import OUTBOUND_META_AGENT_UI, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import (
     GoalStateChanged,
@@ -21,6 +21,7 @@ from nanobot.bus.runtime_events import (
     SessionTurnStarted,
     ThreadRuntimeStatusChanged,
     TurnCompleted,
+    TurnFinalAnswerCommitted,
     TurnLifecycleCompleted,
     TurnLifecycleStarted,
     TurnRunStatusChanged,
@@ -31,6 +32,10 @@ from nanobot.session.goal_state import goal_state_ws_blob
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.helpers import strip_think, truncate_text
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.webui.interactive_prompt import (
+    OUTBOUND_META_INTERACTIVE_PROMPT,
+    normalize_interactive_prompt,
+)
 
 WEBUI_SESSION_METADATA_KEY = "webui"
 WEBUI_TITLE_METADATA_KEY = "title"
@@ -258,6 +263,11 @@ class WebuiTurnCoordinator:
                 TurnCompleted,
             ),
             runtime_events.subscribe(
+                self._handle_final_answer_committed,
+                TurnFinalAnswerCommitted,
+                required=self.transcripts is not None,
+            ),
+            runtime_events.subscribe(
                 self._handle_goal_state_changed,
                 GoalStateChanged,
             ),
@@ -328,6 +338,69 @@ class WebuiTurnCoordinator:
         )
         self._schedule_title_update_from_event(event)
 
+    async def _handle_final_answer_committed(
+        self,
+        event: TurnFinalAnswerCommitted,
+    ) -> None:
+        """Persist the authoritative answer before the Turn terminal barrier."""
+        if not self._is_websocket_event(event.context) or self.transcripts is None:
+            return
+        message = event.message
+        metadata = dict(message.metadata or {})
+        text = message.content if isinstance(message.content, str) else ""
+        interactive_prompt = normalize_interactive_prompt(
+            metadata.get(OUTBOUND_META_INTERACTIVE_PROMPT)
+        )
+        agent_ui = metadata.get(OUTBOUND_META_AGENT_UI)
+        has_structured_payload = (
+            bool(message.media)
+            or bool(metadata.get("_tool_events"))
+            or interactive_prompt is not None
+            or agent_ui is not None
+        )
+        if not text.strip() and not has_structured_payload:
+            return
+
+        payload: dict[str, Any] = {
+            "event": "message",
+            "chat_id": event.context.chat_id,
+            "text": text,
+        }
+        if metadata.get("_streamed"):
+            payload["replace_stream"] = True
+        if message.media:
+            payload["media"] = list(message.media)
+        if message.reply_to:
+            payload["reply_to"] = message.reply_to
+        latency = metadata.get("latency_ms")
+        if isinstance(latency, (int, float)):
+            payload["latency_ms"] = int(latency)
+        if metadata.get("_tool_events"):
+            payload["tool_events"] = metadata["_tool_events"]
+        if interactive_prompt is not None:
+            payload["interactive_prompt"] = interactive_prompt
+        if agent_ui is not None:
+            payload["agent_ui"] = agent_ui
+
+        turn_id = str(
+            metadata.get("_runtime_turn_id")
+            or metadata.get("webui_turn_id")
+            or ""
+        ).strip()
+        overrides: dict[str, Any] = {"text": text}
+        if turn_id:
+            overrides["event_id"] = f"assistant_final_{turn_id}"
+        canonical_event = self.transcripts.prepare_and_append(
+            event.context.chat_id,
+            payload,
+            metadata=metadata,
+            phase="answer",
+            include_source=True,
+            transcript_overrides=overrides,
+        )
+        if canonical_event is not None:
+            event.receipt.update(canonical_event)
+
     async def _handle_goal_state_changed(self, event: GoalStateChanged) -> None:
         if not self._is_websocket_event(event.context):
             return
@@ -367,8 +440,9 @@ class WebuiTurnCoordinator:
         if not self._is_websocket_event(event.context):
             return
         persisted = False
+        canonical_event: dict[str, Any] | None = None
         if self.transcripts is not None:
-            self.transcripts.prepare_and_append(
+            canonical_event = self.transcripts.prepare_and_append(
                 event.context.chat_id,
                 {
                     "event": "turn_started",
@@ -389,6 +463,7 @@ class WebuiTurnCoordinator:
                     **event.context.metadata,
                     "_turn_lifecycle_started": True,
                     "_turn_lifecycle_persisted": persisted,
+                    "_canonical_event": canonical_event,
                     "turn": dict(event.turn),
                     "snapshot_revision": event.snapshot_revision,
                 },
@@ -402,6 +477,7 @@ class WebuiTurnCoordinator:
         if not self._is_websocket_event(event.context):
             return
         persisted = False
+        canonical_event: dict[str, Any] | None = None
         if self.transcripts is not None:
             turn_id = str(event.turn.get("id") or "").strip()
             runtime_epoch = str(event.turn.get("runtime_epoch") or "").strip()
@@ -410,7 +486,7 @@ class WebuiTurnCoordinator:
                 if turn_id and runtime_epoch
                 else None
             )
-            self.transcripts.prepare_and_append(
+            canonical_event = self.transcripts.prepare_and_append(
                 event.context.chat_id,
                 {
                     "event": "turn_completed",
@@ -432,6 +508,7 @@ class WebuiTurnCoordinator:
                     **event.context.metadata,
                     "_turn_lifecycle_completed": True,
                     "_turn_lifecycle_persisted": persisted,
+                    "_canonical_event": canonical_event,
                     "turn": dict(event.turn),
                     "snapshot_revision": event.snapshot_revision,
                 },

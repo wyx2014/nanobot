@@ -44,8 +44,11 @@ async def test_active_turn_is_the_only_source_of_active_status() -> None:
     )
     active = await registry.snapshot("websocket:chat-a")
     assert active.thread_status == {"type": "active", "active_flags": []}
+    assert active.active_turn is not None
+    assert active.active_turn["trace_id"].startswith("trc_")
     assert active.active_turn == {
         "id": "turn-a",
+        "trace_id": active.active_turn["trace_id"],
         "runtime_epoch": "epoch-a",
         "project_id": "project-a",
         "session_id": "session-a",

@@ -16,7 +16,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class RuntimeEventContext:
     chat_id: str
     session_key: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    trace_id: str | None = None
+    run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,21 @@ class TurnCompleted:
     context: RuntimeEventContext
     latency_ms: int | None = None
     runtime: Any | None = None
+
+
+@dataclass(frozen=True)
+class TurnFinalAnswerCommitted:
+    """A single final answer must be durably committed before Turn terminal.
+
+    ``receipt`` is an in-process return channel populated by required durable
+    subscribers. It carries the canonical event envelope back to the outbound
+    transport so the already-committed answer can be delivered without a
+    second journal append.
+    """
+
+    context: RuntimeEventContext
+    message: OutboundMessage
+    receipt: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -100,6 +117,7 @@ RuntimeEvent = (
     SessionTurnStarted
     | TurnRunStatusChanged
     | TurnCompleted
+    | TurnFinalAnswerCommitted
     | GoalStateChanged
     | RuntimeModelChanged
     | TurnLifecycleStarted
@@ -110,6 +128,7 @@ RuntimeEventType = (
     type[SessionTurnStarted]
     | type[TurnRunStatusChanged]
     | type[TurnCompleted]
+    | type[TurnFinalAnswerCommitted]
     | type[GoalStateChanged]
     | type[RuntimeModelChanged]
     | type[TurnLifecycleStarted]
@@ -271,6 +290,32 @@ class RuntimeEventPublisher:
                 runtime=self._turn_runtime.pop(session_key, None),
             )
         )
+
+    async def final_answer_committed(
+        self,
+        message: OutboundMessage,
+        session_key: str,
+    ) -> dict[str, Any] | None:
+        """Commit one final answer through required runtime subscribers.
+
+        Delivery remains asynchronous, but the returned canonical envelope
+        proves that the answer's business fact is durable before the caller
+        enters the Turn terminal barrier.
+        """
+        receipt: dict[str, Any] = {}
+        await self.bus.publish(
+            TurnFinalAnswerCommitted(
+                context=self._context(
+                    channel=message.channel,
+                    chat_id=message.chat_id,
+                    session_key=session_key,
+                    metadata=message.metadata,
+                ),
+                message=message,
+                receipt=receipt,
+            )
+        )
+        return dict(receipt) if receipt else None
 
     def runtime_model_changed(self, model: str, model_preset: str | None) -> None:
         self.bus.publish_nowait(

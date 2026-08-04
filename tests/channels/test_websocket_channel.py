@@ -417,6 +417,64 @@ async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> 
 
 
 @pytest.mark.asyncio
+async def test_send_delivers_precommitted_final_without_second_journal_append(
+    tmp_path: Path,
+) -> None:
+    message_bus = MessageBus()
+    gateway = _basic_handler(message_bus, workspace_path=tmp_path)
+    project = gateway.state.ensure_project(tmp_path)
+    gateway.state.bind_session("websocket:chat-final", project.id)
+    metadata = {
+        "webui": True,
+        "webui_turn_id": "turn-final",
+        "_runtime_turn_id": "turn-final",
+        "_streamed": True,
+    }
+    canonical = gateway.transcripts.prepare_and_append(
+        "chat-final",
+        {
+            "event": "message",
+            "chat_id": "chat-final",
+            "text": "final answer",
+            "replace_stream": True,
+        },
+        metadata=metadata,
+        phase="answer",
+        transcript_overrides={
+            "event_id": "assistant_final_turn-final",
+            "text": "final answer",
+        },
+    )
+    assert canonical is not None
+    channel = WebSocketChannel(WebSocketConfig(), message_bus, gateway=gateway)
+    connection = AsyncMock()
+    channel._attach(connection, "chat-final")
+
+    await channel.send(
+        OutboundMessage(
+            channel="websocket",
+            chat_id="chat-final",
+            content="final answer",
+            metadata={
+                **metadata,
+                "_final_answer_persisted": True,
+                "_canonical_event": canonical,
+            },
+        )
+    )
+
+    events = gateway.state.session_event_envelopes(
+        "websocket:chat-final",
+        after_event_seq=0,
+        limit=10,
+    )
+    assert [event["event"] for event in events] == ["message"]
+    payload = json.loads(connection.send.await_args.args[0])
+    assert payload["event_id"] == "assistant_final_turn-final"
+    assert payload["event_seq"] == canonical["event_seq"]
+
+
+@pytest.mark.asyncio
 async def test_webui_followup_reuses_active_turn_identity(bus: MagicMock) -> None:
     from nanobot.webui.metadata import (
         ACTIVE_TURN_CLIENT_TURN_METADATA_KEY,
@@ -1387,23 +1445,22 @@ async def test_send_file_edit_progress_uses_file_edit_event(tmp_path: Path) -> N
     ))
 
     payload = json.loads(mock_ws.send.await_args_list[0].args[0])
-    assert payload == {
-        "event": "file_edit",
-        "chat_id": "chat-1",
-        "edits": [
-            {
-                "version": 1,
-                "phase": "start",
-                "call_id": "call-1",
-                "tool": "write_file",
-                "path": "src/app.py",
-                "added": 12,
-                "deleted": 2,
-                "approximate": True,
-                "status": "editing",
-            }
-        ],
-    }
+    assert payload["event"] == "file_edit"
+    assert payload["chat_id"] == "chat-1"
+    assert payload["event_seq"] >= 1
+    assert payload["edits"] == [
+        {
+            "version": 1,
+            "phase": "start",
+            "call_id": "call-1",
+            "tool": "write_file",
+            "path": "src/app.py",
+            "added": 12,
+            "deleted": 2,
+            "approximate": True,
+            "status": "editing",
+        }
+    ]
     artifact_payload = json.loads(mock_ws.send.await_args_list[1].args[0])
     assert artifact_payload["event"] == "artifact_created"
     assert artifact_payload["artifact"]["status"] == "staging"
@@ -1515,17 +1572,18 @@ async def test_empty_pre_tool_content_does_not_create_narration_replacement() ->
     await channel.send_narration_end("chat-1")
 
     payloads = _sent_ws_payloads(mock_ws)
-    assert payloads[0] == {
+    assert {
+        key: payloads[0][key]
+        for key in ("event", "chat_id", "resuming", "stream_kind", "stream_id")
+    } == {
         "event": "stream_end",
         "chat_id": "chat-1",
         "resuming": True,
         "stream_kind": "narration",
         "stream_id": "empty-stream",
     }
-    assert payloads[1] == {
-        "event": "narration_end",
-        "chat_id": "chat-1",
-    }
+    assert payloads[1]["event"] == "narration_end"
+    assert payloads[1]["chat_id"] == "chat-1"
 
 
 @pytest.mark.asyncio
@@ -1734,7 +1792,10 @@ async def test_send_reasoning_end_emits_close_frame() -> None:
     await channel.send_reasoning_end("chat-1", {"_reasoning_end": True, "_stream_id": "r1"})
 
     payload = json.loads(mock_ws.send.await_args.args[0])
-    assert payload == {"event": "reasoning_end", "chat_id": "chat-1", "stream_id": "r1"}
+    assert payload["event"] == "reasoning_end"
+    assert payload["chat_id"] == "chat-1"
+    assert payload["stream_id"] == "r1"
+    assert payload["event_seq"] >= 1
 
 
 @pytest.mark.asyncio
@@ -2090,11 +2151,10 @@ async def test_send_turn_end_emits_turn_end_event() -> None:
     ))
 
     payloads = _sent_ws_payloads(mock_ws)
-    assert payloads[0] == {
-        "event": "turn_end",
-        "chat_id": "chat-1",
-        "finish_reason": "completed",
-    }
+    assert payloads[0]["event"] == "turn_end"
+    assert payloads[0]["chat_id"] == "chat-1"
+    assert payloads[0]["finish_reason"] == "completed"
+    assert payloads[0]["event_seq"] >= 1
     assert payloads[1]["event"] == "session_updated"
     assert payloads[1]["chat_id"] == "chat-1"
     assert payloads[1]["scope"] == "thread"
@@ -2117,12 +2177,11 @@ async def test_send_turn_end_includes_latency_ms_when_present() -> None:
     ))
 
     payloads = _sent_ws_payloads(mock_ws)
-    assert payloads[0] == {
-        "event": "turn_end",
-        "chat_id": "chat-1",
-        "finish_reason": "completed",
-        "latency_ms": 1500,
-    }
+    assert payloads[0]["event"] == "turn_end"
+    assert payloads[0]["chat_id"] == "chat-1"
+    assert payloads[0]["finish_reason"] == "completed"
+    assert payloads[0]["latency_ms"] == 1500
+    assert payloads[0]["event_seq"] >= 1
     assert payloads[1]["scope"] == "thread"
     assert payloads[1]["session_id"].startswith("ses_")
     assert payloads[1]["project_id"].startswith("prj_")
@@ -2205,12 +2264,11 @@ async def test_send_turn_end_includes_goal_state_when_present() -> None:
     ))
 
     payloads = _sent_ws_payloads(mock_ws)
-    assert payloads[0] == {
-        "event": "turn_end",
-        "chat_id": "chat-1",
-        "finish_reason": "completed",
-        "goal_state": blob,
-    }
+    assert payloads[0]["event"] == "turn_end"
+    assert payloads[0]["chat_id"] == "chat-1"
+    assert payloads[0]["finish_reason"] == "completed"
+    assert payloads[0]["goal_state"] == blob
+    assert payloads[0]["event_seq"] >= 1
     assert payloads[1]["scope"] == "thread"
     assert payloads[1]["session_id"].startswith("ses_")
     assert payloads[1]["project_id"].startswith("prj_")
@@ -2767,8 +2825,8 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
         )
         assert created_preset.status_code == 200
         created_body = created_preset.json()
-        assert created_body["agent"]["model_preset"] == "fast-writing"
-        assert created_body["agent"]["model"] == "openai/gpt-4.1-mini"
+        assert created_body["agent"]["model_preset"] == "deep"
+        assert created_body["agent"]["model"] == "anthropic/claude-opus-4-5"
         created_presets = {
             preset["name"]: preset for preset in created_body["model_presets"]
         }

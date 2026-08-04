@@ -1766,14 +1766,38 @@ class WebSocketChannel(BaseChannel):
         elif msg.metadata.get("_progress"):
             payload["kind"] = "progress"
         phase = "activity" if payload.get("kind") in ("tool_hint", "progress") else "answer"
-        self._transcripts.prepare_and_append(
-            msg.chat_id,
-            payload,
-            metadata=msg.metadata,
-            phase=phase,
-            include_source=True,
-            transcript_overrides={"text": text},
-        )
+        persisted_final = msg.metadata.get("_canonical_event")
+        if (
+            msg.metadata.get("_final_answer_persisted") is True
+            and isinstance(persisted_final, dict)
+        ):
+            # The final answer was journaled synchronously before the Turn
+            # terminal barrier. This outbound pass is delivery-only; preserve
+            # its canonical identity and never append a second message event.
+            for field in (
+                "schema_version",
+                "event_id",
+                "event_seq",
+                "recorded_at",
+                "project_id",
+                "session_id",
+                "session_key",
+                "turn_id",
+                "trace_id",
+                "runtime_epoch",
+                "visibility",
+            ):
+                if field in persisted_final:
+                    payload[field] = persisted_final[field]
+        else:
+            self._transcripts.prepare_and_append(
+                msg.chat_id,
+                payload,
+                metadata=msg.metadata,
+                phase=phase,
+                include_source=True,
+                transcript_overrides={"text": text},
+            )
         raw = json.dumps(payload, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" ")
@@ -2451,6 +2475,23 @@ class WebSocketChannel(BaseChannel):
             "snapshot_revision": snapshot_revision,
             "turn": turn,
         }
+        persisted_event = (metadata or {}).get("_canonical_event")
+        if isinstance(persisted_event, dict):
+            for field in (
+                "schema_version",
+                "event_id",
+                "event_seq",
+                "recorded_at",
+                "project_id",
+                "session_id",
+                "session_key",
+                "turn_id",
+                "trace_id",
+                "runtime_epoch",
+                "visibility",
+            ):
+                if field in persisted_event:
+                    body[field] = persisted_event[field]
         if not (metadata or {}).get("_turn_lifecycle_persisted"):
             self._transcripts.prepare_and_append(
                 chat_id,
@@ -2501,6 +2542,23 @@ class WebSocketChannel(BaseChannel):
             "snapshot_revision": snapshot_revision,
             "turn": enriched_turn,
         }
+        persisted_event = (metadata or {}).get("_canonical_event")
+        if isinstance(persisted_event, dict):
+            for field in (
+                "schema_version",
+                "event_id",
+                "event_seq",
+                "recorded_at",
+                "project_id",
+                "session_id",
+                "session_key",
+                "turn_id",
+                "trace_id",
+                "runtime_epoch",
+                "visibility",
+            ):
+                if field in persisted_event:
+                    body[field] = persisted_event[field]
         turn_id = str(turn.get("id") or "").strip()
         runtime_epoch = str(turn.get("runtime_epoch") or "").strip()
         transcript_overrides = None

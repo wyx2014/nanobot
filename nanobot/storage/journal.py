@@ -13,7 +13,7 @@ from typing import Any
 from nanobot.storage.logs import StructuredLogStore
 from nanobot.storage.state import EventProjectionError, StateStore
 
-EVENT_SCHEMA_VERSION = 2
+EVENT_SCHEMA_VERSION = 3
 _EVENT_NAMESPACE = uuid.UUID("c3012948-955b-485f-8f07-7d6670e827e7")
 
 
@@ -59,7 +59,53 @@ class SessionEventJournal:
                     "recorded_at": time.time_ns() // 1_000_000,
                     "project_id": session.project_id,
                     "session_id": session.id,
+                    "session_key": session.session_key,
                 }
+            )
+            turn_payload = envelope.get("turn")
+            if isinstance(turn_payload, dict):
+                trace_id = turn_payload.get("trace_id")
+                runtime_epoch = turn_payload.get("runtime_epoch")
+                if isinstance(trace_id, str) and trace_id.strip():
+                    envelope["trace_id"] = trace_id.strip()
+                if isinstance(runtime_epoch, str) and runtime_epoch.strip():
+                    envelope["runtime_epoch"] = runtime_epoch.strip()
+            turn_id = envelope.get("turn_id")
+            if isinstance(turn_id, str) and turn_id.strip():
+                runtime_identity = self.state.turn_runtime_identity(
+                    session_key,
+                    turn_id.strip(),
+                )
+                if runtime_identity:
+                    if runtime_identity.get("trace_id"):
+                        envelope.setdefault("trace_id", runtime_identity["trace_id"])
+                    if runtime_identity.get("runtime_epoch"):
+                        envelope.setdefault(
+                            "runtime_epoch",
+                            runtime_identity["runtime_epoch"],
+                        )
+            envelope.setdefault("visibility", "public")
+            envelope.setdefault(
+                "payload",
+                {
+                    key: value
+                    for key, value in envelope.items()
+                    if key
+                    not in {
+                        "schema_version",
+                        "event_id",
+                        "event_seq",
+                        "recorded_at",
+                        "project_id",
+                        "session_id",
+                        "session_key",
+                        "turn_id",
+                        "trace_id",
+                        "runtime_epoch",
+                        "visibility",
+                        "payload",
+                    }
+                },
             )
             self._append_record(session_key, envelope)
             try:
@@ -157,9 +203,46 @@ class SessionEventJournal:
                     "recorded_at": recorded_at,
                     "project_id": session.project_id,
                     "session_id": session.id,
+                    "session_key": session.session_key,
                 }
             )
+            turn_payload = event.get("turn")
+            if isinstance(turn_payload, dict):
+                trace_id = turn_payload.get("trace_id")
+                runtime_epoch = turn_payload.get("runtime_epoch")
+                if isinstance(trace_id, str) and trace_id.strip():
+                    event["trace_id"] = trace_id.strip()
+                if isinstance(runtime_epoch, str) and runtime_epoch.strip():
+                    event["runtime_epoch"] = runtime_epoch.strip()
+            event.setdefault("visibility", "public")
+            event.setdefault(
+                "payload",
+                {
+                    key: value
+                    for key, value in event.items()
+                    if key
+                    not in {
+                        "schema_version",
+                        "event_id",
+                        "event_seq",
+                        "recorded_at",
+                        "project_id",
+                        "session_id",
+                        "session_key",
+                        "turn_id",
+                        "trace_id",
+                        "runtime_epoch",
+                        "visibility",
+                        "payload",
+                    }
+                },
+            )
             normalized_events.append(event)
+
+        # Schema v7 stores the full envelope in projected_events.  Backfill
+        # rows below the existing projector watermark from their append-only
+        # source without replaying business projections or changing sequence.
+        self.state.backfill_projected_event_payloads(session_key, normalized_events)
 
         # SQLite already records the last successfully projected journal
         # envelope.  A restarted gateway only needs to project the suffix
