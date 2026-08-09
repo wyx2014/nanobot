@@ -104,3 +104,100 @@ def test_display_event_envelopes_page_backwards_by_event_sequence(
         before_event_seq=4,
     )
     assert [event["event_seq"] for event in older] == [2, 3]
+
+
+def test_display_event_envelopes_keep_only_latest_task_progress_per_plan(
+    tmp_path: Path,
+) -> None:
+    state, session = _state(tmp_path)
+    files = SessionEventFileStore(tmp_path / "runtime" / "session-events")
+    service = SessionEventService(SessionEventJournal(
+        state=state,
+        logs=StructuredLogStore(tmp_path / "runtime" / "logs.sqlite"),
+        append_record=files.append,
+        read_records=files.read,
+    ))
+
+    service.commit(
+        session.session_key,
+        {"event": "user", "turn_id": "turn-a", "text": "research"},
+    )
+    service.commit(
+        session.session_key,
+        {
+            "event": "message",
+            "turn_id": "turn-a",
+            "kind": "progress",
+            "text": "",
+            "agent_ui": {
+                "kind": "task_progress",
+                "plan_id": "plan-a",
+                "revision": 1,
+                "steps": [{
+                    "id": "research",
+                    "title": "Research",
+                    "status": "running",
+                }],
+            },
+        },
+    )
+    service.commit(
+        session.session_key,
+        {
+            "event": "message",
+            "turn_id": "turn-a",
+            "kind": "tool_hint",
+            "text": "searching",
+        },
+    )
+    service.commit(
+        session.session_key,
+        {
+            "event": "message",
+            "turn_id": "turn-a",
+            "kind": "progress",
+            "text": "",
+            "agent_ui": {
+                "kind": "task_progress",
+                "plan_id": "plan-a",
+                "revision": 2,
+                "steps": [{
+                    "id": "research",
+                    "title": "Research",
+                    "status": "completed",
+                }],
+            },
+        },
+    )
+    service.commit(
+        session.session_key,
+        {
+            "event": "message",
+            "turn_id": "turn-a",
+            "kind": "progress",
+            "text": "",
+            "agent_ui": {
+                "kind": "task_progress",
+                "plan_id": "plan-b",
+                "revision": 1,
+                "steps": [{
+                    "id": "delivery",
+                    "title": "Delivery",
+                    "status": "running",
+                }],
+            },
+        },
+    )
+
+    display = state.session_display_event_envelopes(session.session_key)
+    assert [event["event_seq"] for event in display] == [1, 3, 4, 5]
+    progress = [
+        event for event in display
+        if event.get("agent_ui", {}).get("kind") == "task_progress"
+    ]
+    assert len(progress) == 2
+    assert [event["agent_ui"]["plan_id"] for event in progress] == [
+        "plan-a",
+        "plan-b",
+    ]
+    assert progress[0]["agent_ui"]["revision"] == 2

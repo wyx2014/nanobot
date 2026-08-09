@@ -95,6 +95,22 @@ class AutoCompact:
         finally:
             self._archiving.discard(key)
 
+    @classmethod
+    def summary_for_session(cls, session: Session) -> str | None:
+        """Return the currently persisted same-session summary, if any."""
+        meta = session.metadata.get("_last_summary")
+        if not isinstance(meta, dict):
+            return None
+        text = meta.get("text")
+        last_active = meta.get("last_active")
+        if not isinstance(text, str) or not text.strip() or not isinstance(last_active, str):
+            return None
+        try:
+            timestamp = datetime.fromisoformat(last_active)
+        except ValueError:
+            return None
+        return cls._format_summary(text, timestamp)
+
     def prepare_session(self, session: Session, key: str) -> tuple[Session, str | None]:
         if self._is_internal_session(key):
             self._archiving.discard(key)
@@ -108,7 +124,4 @@ class AutoCompact:
         if entry:
             return session, self._format_summary(entry[0], entry[1])
         # Cold path: summary persisted in session metadata (process restarted).
-        meta = session.metadata.get("_last_summary")
-        if isinstance(meta, dict):
-            return session, self._format_summary(meta["text"], datetime.fromisoformat(meta["last_active"]))
-        return session, None
+        return session, self.summary_for_session(session)

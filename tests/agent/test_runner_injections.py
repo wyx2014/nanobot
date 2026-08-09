@@ -723,7 +723,7 @@ async def test_dispatch_preserves_running_expert_team_after_early_final_response
     ))
     loop.subagents.get_running_count_by_session.return_value = 3
     loop.sessions.get_or_create.return_value.metadata = {
-        "expert_team": {"id": "trading-analysis-team"},
+        "expert_team": {"id": "test-expert-team"},
     }
 
     msg = InboundMessage(
@@ -731,7 +731,7 @@ async def test_dispatch_preserves_running_expert_team_after_early_final_response
         sender_id="u",
         chat_id="c",
         content="分析股票",
-        metadata={"expert_team": {"id": "trading-analysis-team"}},
+        metadata={"expert_team": {"id": "test-expert-team"}},
     )
     await loop._dispatch(msg)
 

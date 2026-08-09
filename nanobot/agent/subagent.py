@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 _EXPERT_TEAM_MAX_ITERATIONS = 100
 _EXPERT_TEAM_MEMBER_TIMEOUT_S = 540
+_EXPERT_TEAM_MEMBER_ARTIFACT_DIR = Path("reports") / ".team-runs"
 
 
 @dataclass(slots=True)
@@ -109,6 +110,12 @@ def _friendly_tool_name(name: str) -> str:
         return "结构化数据查询"
     if compact.startswith("mcp_juyuan_"):
         return "聚源结构化数据查询"
+    if compact.startswith("mcp_caihui_mcp_"):
+        return "财汇结构化数据查询"
+    if compact.startswith("mcp_hexin-ifind-ds-"):
+        return "同花顺 iFinD 结构化数据查询"
+    if compact.startswith("mcp_anysearch_"):
+        return "AnySearch 公开资料查询"
     return "当前查询"
 
 
@@ -146,6 +153,24 @@ def _subagent_activity(name: str, arguments: Any) -> str:
             f"正在查询聚源金融数据：{query[:72]}"
             if query
             else "正在查询聚源结构化金融数据"
+        )
+    if compact.startswith("mcp_caihui_mcp_"):
+        return (
+            f"正在查询财汇金融数据：{query[:72]}"
+            if query
+            else "正在查询财汇结构化金融数据"
+        )
+    if compact.startswith("mcp_hexin-ifind-ds-"):
+        return (
+            f"正在查询同花顺 iFinD：{query[:72]}"
+            if query
+            else "正在查询同花顺 iFinD 结构化金融数据"
+        )
+    if compact.startswith("mcp_anysearch_"):
+        return (
+            f"正在通过 AnySearch 补充资料：{query[:72]}"
+            if query
+            else "正在通过 AnySearch 补充公开资料"
         )
     return f"正在执行：{name}"
 
@@ -524,9 +549,20 @@ class SubagentManager:
                     expert_team_run_id=expert_team_run_id,
                 ):
                     return
+                partial_result = self._format_partial_progress(result)
+                artifact = await self._persist_expert_team_member_artifact(
+                    content=partial_result,
+                    label=label,
+                    run_id=expert_team_run_id,
+                    origin=origin,
+                    workspace_scope=workspace_scope,
+                    delivery_status="degraded",
+                )
                 await self._announce_result(
                     task_id, label, task,
-                    self._format_partial_progress(result),
+                    partial_result + (
+                        f"\n\nRole artifact: `{artifact}`" if artifact else ""
+                    ),
                     origin, "error", origin_message_id,
                     expert_team=expert_team is not None,
                 )
@@ -534,6 +570,7 @@ class SubagentManager:
                     origin, expert_team, expert_team_run_id,
                     task_id=task_id, label=label, status="failed",
                     activity="该角色未形成有效报告，等待 Team Lead 重试或补齐",
+                    artifact=artifact,
                 )
             elif result.stop_reason == "error":
                 if await self._retry_expert_team_member(
@@ -551,9 +588,20 @@ class SubagentManager:
                     expert_team_run_id=expert_team_run_id,
                 ):
                     return
+                error_result = result.error or "Error: subagent execution failed."
+                artifact = await self._persist_expert_team_member_artifact(
+                    content=error_result,
+                    label=label,
+                    run_id=expert_team_run_id,
+                    origin=origin,
+                    workspace_scope=workspace_scope,
+                    delivery_status="degraded",
+                )
                 await self._announce_result(
                     task_id, label, task,
-                    result.error or "Error: subagent execution failed.",
+                    error_result + (
+                        f"\n\nRole artifact: `{artifact}`" if artifact else ""
+                    ),
                     origin, "error", origin_message_id,
                     expert_team=expert_team is not None,
                 )
@@ -561,6 +609,7 @@ class SubagentManager:
                     origin, expert_team, expert_team_run_id,
                     task_id=task_id, label=label, status="failed",
                     activity="该角色运行异常，等待 Team Lead 重试或补齐",
+                    artifact=artifact,
                 )
             elif quality_issue is not None:
                 if await self._retry_expert_team_member(
@@ -581,12 +630,25 @@ class SubagentManager:
                 status.phase = "error"
                 status.error = quality_issue
                 partial = (result.final_content or "").strip()
+                degraded_result = (
+                    f"Report quality check failed: {quality_issue}"
+                    + (f"\n\nPartial result:\n{partial}" if partial else "")
+                )
+                artifact = await self._persist_expert_team_member_artifact(
+                    content=degraded_result,
+                    label=label,
+                    run_id=expert_team_run_id,
+                    origin=origin,
+                    workspace_scope=workspace_scope,
+                    delivery_status="degraded",
+                )
                 await self._announce_result(
                     task_id,
                     label,
                     task,
-                    f"Report quality check failed: {quality_issue}"
-                    + (f"\n\nPartial result:\n{partial}" if partial else ""),
+                    degraded_result + (
+                        f"\n\nRole artifact: `{artifact}`" if artifact else ""
+                    ),
                     origin,
                     "error",
                     origin_message_id,
@@ -600,9 +662,20 @@ class SubagentManager:
                     label=label,
                     status="failed",
                     activity=f"未通过交付质量检查：{quality_issue}；等待 Team Lead 补齐",
+                    artifact=artifact,
                 )
             else:
                 final_result = result.final_content or "Task completed but no final response was generated."
+                artifact = await self._persist_expert_team_member_artifact(
+                    content=final_result,
+                    label=label,
+                    run_id=expert_team_run_id,
+                    origin=origin,
+                    workspace_scope=workspace_scope,
+                    delivery_status="completed",
+                )
+                if artifact:
+                    final_result = f"{final_result}\n\nRole artifact: `{artifact}`"
                 logger.info("Subagent [{}] completed successfully", task_id)
                 await self._announce_result(
                     task_id,
@@ -618,6 +691,7 @@ class SubagentManager:
                     origin, expert_team, expert_team_run_id,
                     task_id=task_id, label=label, status="completed",
                     activity="研究完成，完整结果已交付 Team Lead",
+                    artifact=artifact,
                 )
 
         except asyncio.TimeoutError:
@@ -626,15 +700,26 @@ class SubagentManager:
             status.error = (
                 f"expert-team member exceeded {_EXPERT_TEAM_MEMBER_TIMEOUT_S} seconds"
             )
+            timeout_result = (
+                "Error: this research member exceeded its runtime deadline and was stopped. "
+                "Treat the missing dimension as a degradable evidence gap. Use the Team Lead "
+                "data package, configured structured sources, and completed member reports to "
+                "fill it; do not restart the same failed lookup loop."
+            )
+            artifact = await self._persist_expert_team_member_artifact(
+                content=timeout_result,
+                label=label,
+                run_id=expert_team_run_id,
+                origin=origin,
+                workspace_scope=workspace_scope,
+                delivery_status="degraded",
+            )
             await self._announce_result(
                 task_id,
                 label,
                 task,
-                (
-                    "Error: this research member exceeded its runtime deadline and was stopped. "
-                    "Treat the missing dimension as a degradable evidence gap. Use the Team Lead "
-                    "data package, configured Juyuan MCP, and completed member reports to fill it; "
-                    "do not restart the same iFinD lookup loop."
+                timeout_result + (
+                    f"\n\nRole artifact: `{artifact}`" if artifact else ""
                 ),
                 origin,
                 "error",
@@ -648,7 +733,8 @@ class SubagentManager:
                 task_id=task_id,
                 label=label,
                 status="failed",
-                activity="运行超时，已停止重复取数；Team Lead 将使用聚源和现有证据降级补齐",
+                activity="运行超时，已停止重复取数；Team Lead 将使用结构化数据和现有证据降级补齐",
+                artifact=artifact,
             )
         except asyncio.CancelledError:
             if status.stop_reason != "cancelled":
@@ -684,11 +770,22 @@ class SubagentManager:
             status.phase = "error"
             status.error = str(e)
             logger.exception("Subagent [{}] failed", task_id)
+            exception_result = f"Error: {e}"
+            artifact = await self._persist_expert_team_member_artifact(
+                content=exception_result,
+                label=label,
+                run_id=expert_team_run_id,
+                origin=origin,
+                workspace_scope=workspace_scope,
+                delivery_status="degraded",
+            )
             await self._announce_result(
                 task_id,
                 label,
                 task,
-                f"Error: {e}",
+                exception_result + (
+                    f"\n\nRole artifact: `{artifact}`" if artifact else ""
+                ),
                 origin,
                 "error",
                 origin_message_id,
@@ -698,6 +795,7 @@ class SubagentManager:
                 origin, expert_team, expert_team_run_id,
                 task_id=task_id, label=label, status="failed",
                 activity="该角色运行异常，等待 Team Lead 重试或补齐",
+                artifact=artifact,
             )
 
     async def _retry_expert_team_member(
@@ -732,8 +830,10 @@ class SubagentManager:
         await self._run_subagent(
             task_id,
             task + (
-                "\n\nRuntime retry: the first attempt failed. Use the integrated structured data "
-                "source first, avoid the failed lookup/tool, and return a self-contained final report."
+                "\n\nRuntime retry: the first attempt failed. Avoid the failed source, use the "
+                "remaining configured iFinD/Juyuan/Caihui sources, then AnySearch and explicit "
+                "DuckDuckGo only if all three core sources miss the same field. Return a "
+                "self-contained report with gaps and confidence; do not block delivery."
             ),
             label,
             origin,
@@ -746,6 +846,86 @@ class SubagentManager:
             retry_count + 1,
         )
         return True
+
+    async def _persist_expert_team_member_artifact(
+        self,
+        *,
+        content: str,
+        label: str,
+        run_id: str | None,
+        origin: dict[str, str],
+        workspace_scope: WorkspaceScope | None,
+        delivery_status: str,
+    ) -> str | None:
+        """Persist every terminal role result as a parent-turn intermediate artifact."""
+
+        if not run_id or origin.get("channel") != "websocket":
+            return None
+        root = (
+            workspace_scope.project_path
+            if workspace_scope is not None
+            else self.workspace
+        ).expanduser().resolve(strict=False)
+        safe_run = re.sub(r"[^a-zA-Z0-9_-]+", "-", run_id).strip("-")[:80]
+        safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "-", label).strip("-")[:80]
+        if not safe_run or not safe_label:
+            return None
+        relative = (
+            _EXPERT_TEAM_MEMBER_ARTIFACT_DIR
+            / safe_run
+            / "members"
+            / f"{safe_label}.md"
+        )
+        path = (root / relative).resolve(strict=False)
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return None
+
+        body = (
+            f"# {label} 研究产物\n\n"
+            f"- 团队运行：`{run_id}`\n"
+            f"- 交付状态：`{delivery_status}`\n\n"
+            "---\n\n"
+            f"{content.strip() or '该角色未返回可用正文；Team Lead 必须按降级流程补齐。'}\n"
+        )
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(body, encoding="utf-8")
+            temporary.replace(path)
+
+        try:
+            await asyncio.to_thread(_write)
+            from nanobot.storage.state import StateStore
+
+            state = StateStore(
+                self.workspace / ".nanobot" / "state.sqlite",
+                default_workspace=self.workspace,
+            )
+            parent_session_key = str(
+                origin.get("session_key")
+                or f"{origin['channel']}:{origin['chat_id']}"
+            )
+            turn_id = state.active_turn_id(parent_session_key)
+            await asyncio.to_thread(
+                state.register_artifact,
+                parent_session_key,
+                path,
+                relation_type="intermediate",
+                artifact_kind="document",
+                mime_type="text/markdown",
+                turn_id=turn_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist expert-team member artifact run={} member={}",
+                run_id,
+                label,
+            )
+            return None
+        return relative.as_posix()
 
     @staticmethod
     def _expert_team_report_quality_issue(result: Any) -> str | None:
@@ -781,6 +961,7 @@ class SubagentManager:
         label: str,
         status: str,
         activity: str | None = None,
+        artifact: str | None = None,
     ) -> None:
         if origin.get("channel") != "websocket" or not isinstance(expert_team, dict) or not run_id:
             return
@@ -812,6 +993,7 @@ class SubagentManager:
                     "name": member_name,
                     "status": status,
                     "activity": visible_activity,
+                    **({"artifact": artifact} if artifact else {}),
                 },
             },
         ))
@@ -933,7 +1115,9 @@ class SubagentManager:
         sections: list[str] = [
             "# Required Integrated Financial Data Sources",
             "These data-source Skills are part of the expert team, not optional suggestions. "
-            "Use a primary structured source before broad web research whenever it covers the requested fact.",
+            "For A-share key numeric fields, query the configured iFinD, Juyuan, and Caihui "
+            "sources by field and cross-validate values, dates, units, and reporting scope "
+            "before broad web research.",
         ]
         for source in raw_sources:
             if not isinstance(source, dict):
@@ -994,14 +1178,14 @@ class SubagentManager:
                         "credentials or configuration files; use another bound structured source."
                     )
             sections.append(
-                "Enforce this source state machine: iFinD first when appropriate; on its first hard "
+                "Enforce this source state machine per field: use every configured core source among "
+                "iFinD, `mcp_juyuan_...`, and `mcp_caihui_mcp_...` for cross-validation. On a hard "
                 "failure, inner `call failed`/429/permission error, or repeated-query warning, stop "
-                "iFinD immediately and switch to an available `mcp_juyuan_...` tool. Never rotate "
-                "cosmetically different iFinD commands to evade a failure. If Juyuan is absent or "
-                "also lacks the field, use verified evidence already supplied and finish with an "
-                "explicit data gap. Cross-check important figures between working sources when "
-                "practical, and use exchange filings, company IR, regulatory disclosures, and "
-                "public web sources only for remaining gaps."
+                "that source and continue the other core sources; never issue cosmetic retries. "
+                "Only when all three core sources fail or omit that same field, use configured "
+                "`mcp_anysearch_...`, then `web_search` with `provider=duckduckgo`. Preserve source "
+                "conflicts, dates, units, gaps, and confidence. Missing data never blocks the role "
+                "artifact or final report."
             )
         return "\n\n".join(sections)
 
@@ -1025,11 +1209,14 @@ task text:
   recoverable evidence failure. Change the query/source or use reliable search
   snippets, and continue the remaining analysis. Never repeat an identical
   external lookup more than twice.
-- Financial data source order is strict: iFinD -> configured Juyuan MCP ->
-  verified evidence already present. On the first hard iFinD failure, inner
-  `call failed`/429/permission error, or repeated-query warning, stop iFinD and
-  use an available `mcp_juyuan_...` tool. If Juyuan also fails, label the gap
-  and finish. Never rotate issuer or peer queries indefinitely.
+- For A-share key fields, cross-validate every configured core source among
+  iFinD, Juyuan, and Caihui. Stop a source after its first hard failure and
+  continue the remaining core sources. Only if all three fail or omit the same
+  field, fall back to AnySearch and then explicit DuckDuckGo. Label conflicts,
+  dates, units, gaps, and confidence; never rotate cosmetic queries.
+- Your terminal response is automatically materialized by nanobot as this
+  role's durable artifact. Always return the fullest supported report even in
+  degraded mode; do not withhold it because a source failed.
 - Keep research bounded: prioritize a small set of authoritative sources and
   synthesize once the key claims are supported. Do not keep searching for a
   perfect source. Never fabricate unavailable data; label gaps and confidence.

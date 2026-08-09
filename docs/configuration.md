@@ -436,6 +436,12 @@ You can also reference `${APIFREE_API_KEY}` in `apiKey` if that is how your envi
 
 Bedrock uses the native `bedrock-runtime` Converse API, so it can call Bedrock model IDs such as Claude Opus 4.7, Claude Sonnet, Amazon Nova, Meta Llama, Mistral, Qwen, and other models that support Converse. It supports normal chat, streaming, tool calling, tool results, token usage, and Bedrock error metadata.
 
+Install the optional AWS SDK before selecting this provider:
+
+```bash
+python -m pip install "nanobot-ai[bedrock]"
+```
+
 This provider is for Bedrock's native Converse API, not Bedrock's OpenAI-compatible `/openai/v1` endpoint. For OpenAI-compatible Bedrock models, you can still use `custom` if you specifically want that API surface.
 
 **1. Configure credentials**

@@ -1975,7 +1975,7 @@ class AgentRunner:
                 )
                 payload = (
                     f"{payload}\n\n"
-                    f"{structured_finance_fallback_instruction(finance_source)}"
+                    f"{structured_finance_fallback_instruction(finance_source, external_lookup_counts)}"
                 )
             if spec.fail_on_tool_error:
                 return payload, event, exc
@@ -2011,7 +2011,7 @@ class AgentRunner:
                 )
                 result = (
                     f"{result}\n\n"
-                    f"{structured_finance_fallback_instruction(finance_source)}"
+                    f"{structured_finance_fallback_instruction(finance_source, external_lookup_counts)}"
                 )
             if spec.fail_on_tool_error:
                 return result + hint, event, RuntimeError(result)
@@ -2025,7 +2025,10 @@ class AgentRunner:
                 external_lookup_counts,
                 finance_source,
             )
-            instruction = structured_finance_fallback_instruction(finance_source)
+            instruction = structured_finance_fallback_instruction(
+                finance_source,
+                external_lookup_counts,
+            )
             payload = f"{result}\n\nError: {instruction}"
             event = {
                 "name": tool_call.name,

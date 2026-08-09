@@ -209,6 +209,10 @@ def _normalize_volcengine_auth_level(value: Any) -> int | None:
     tool_parameters_schema(
         query=StringSchema("Search query"),
         count=IntegerSchema(1, description="Results (1-10)", minimum=1, maximum=10),
+        provider=StringSchema(
+            "Optional one-call provider override. Only `duckduckgo` is accepted; "
+            "use it as the final public-web fallback after configured sources fail.",
+        ),
         timeRange=StringSchema(
             "Optional time filter for providers that support it: "
             "OneDay, OneWeek, OneMonth, OneYear, or YYYY-MM-DD..YYYY-MM-DD",
@@ -233,6 +237,7 @@ class WebSearchTool(Tool):
     description = (
         "Search the web. Returns titles, URLs, and snippets. "
         "count defaults to 5 (max 10). "
+        "Set provider=duckduckgo only when an explicit DuckDuckGo fallback is required. "
         "Some providers support timeRange, authLevel, and queryRewrite. "
         "Use web_fetch to read a specific page in full."
     )
@@ -335,18 +340,26 @@ class WebSearchTool(Tool):
         self,
         query: str,
         count: int | None = None,
+        provider: str | None = None,
         time_range: str | None = None,
         auth_level: int | None = None,
         query_rewrite: bool | None = None,
         **kwargs: Any,
     ) -> str:
         self._refresh_config()
-        provider = self.config.provider.strip().lower() or "brave"
+        requested_provider = str(provider or "").strip().lower()
+        if requested_provider and requested_provider != "duckduckgo":
+            return "Error: web_search provider override only supports 'duckduckgo'"
+        selected_provider = (
+            requested_provider
+            or self.config.provider.strip().lower()
+            or "brave"
+        )
         n = min(max(count or self.config.max_results, 1), 10)
 
-        if provider == "olostep":
+        if selected_provider == "olostep":
             return await self._search_olostep(query, n)
-        if provider == "volcengine":
+        if selected_provider == "volcengine":
             return await self._search_volcengine(
                 query,
                 n,
@@ -354,30 +367,30 @@ class WebSearchTool(Tool):
                 auth_level=kwargs.get("authLevel", kwargs.get("auth_level", auth_level)),
                 query_rewrite=kwargs.get("queryRewrite", kwargs.get("query_rewrite", query_rewrite)),
             )
-        if provider == "duckduckgo":
+        if selected_provider == "duckduckgo":
             return await self._search_duckduckgo(query, n)
-        elif provider == "tavily":
+        elif selected_provider == "tavily":
             return await self._search_tavily(query, n)
-        elif provider == "searxng":
+        elif selected_provider == "searxng":
             return await self._search_searxng(query, n)
-        elif provider == "jina":
+        elif selected_provider == "jina":
             return await self._search_jina(query, n)
-        elif provider == "brave":
+        elif selected_provider == "brave":
             return await self._search_brave(query, n)
-        elif provider == "kagi":
+        elif selected_provider == "kagi":
             return await self._search_kagi(query, n)
-        elif provider == "exa":
+        elif selected_provider == "exa":
             return await self._search_exa(query, n)
-        elif provider == "bocha":
+        elif selected_provider == "bocha":
             return await self._search_bocha(
                 query,
                 n,
                 freshness=kwargs.get("freshness", "noLimit"),
             )
-        elif provider == "keenable":
+        elif selected_provider == "keenable":
             return await self._search_keenable(query, n)
         else:
-            return f"Error: unknown search provider '{provider}'"
+            return f"Error: unknown search provider '{selected_provider}'"
 
     async def _search_olostep(self, query: str, n: int) -> str:
         try:

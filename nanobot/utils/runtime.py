@@ -13,8 +13,9 @@ from nanobot.utils.helpers import stringify_text_blocks
 
 _MAX_REPEAT_EXTERNAL_LOOKUPS = 2
 _MAX_IFIND_LOOKUPS_PER_TURN = 8
-_IFIND_DISABLED_KEY = "__structured_finance_source_disabled__:ifind"
-_IFIND_TOTAL_KEY = "__structured_finance_source_total__:ifind"
+_SOURCE_DISABLED_PREFIX = "__structured_finance_source_disabled__:"
+_SOURCE_TOTAL_PREFIX = "__structured_finance_source_total__:"
+_CORE_STRUCTURED_FINANCE_SOURCES = ("ifind", "juyuan", "caihui")
 
 # Third consecutive identical local lookup is almost always an agent loop.
 _MAX_REPEAT_LOCAL_LOOKUPS = 2
@@ -158,9 +159,16 @@ def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
 
 def structured_finance_source(tool_name: str, arguments: Any) -> str | None:
     """Identify team-bound structured-finance calls hidden behind generic tools."""
-    if tool_name.startswith("mcp_juyuan_"):
+    compact_name = tool_name.lower()
+    if compact_name.startswith("mcp_juyuan_"):
         return "juyuan"
-    if tool_name != "exec" or not isinstance(arguments, dict):
+    if compact_name.startswith(("mcp_caihui_mcp_", "mcp_caihui_")):
+        return "caihui"
+    if compact_name.startswith(("mcp_hexin-ifind-ds-", "mcp_ifind_")):
+        return "ifind"
+    if compact_name.startswith("mcp_anysearch_"):
+        return "anysearch"
+    if compact_name != "exec" or not isinstance(arguments, dict):
         return None
     command = str(arguments.get("command") or arguments.get("cmd") or "").lower()
     if "ifind-finance-data" in command or (
@@ -170,20 +178,63 @@ def structured_finance_source(tool_name: str, arguments: Any) -> str | None:
     return None
 
 
-def structured_finance_fallback_instruction(source: str) -> str:
+def _source_disabled_key(source: str) -> str:
+    return f"{_SOURCE_DISABLED_PREFIX}{source}"
+
+
+def _source_total_key(source: str) -> str:
+    return f"{_SOURCE_TOTAL_PREFIX}{source}"
+
+
+def structured_finance_fallback_instruction(
+    source: str,
+    seen_counts: dict[str, int] | None = None,
+) -> str:
     """Return a deterministic source-switch instruction for recoverable failures."""
-    if source == "ifind":
+    state = seen_counts or {}
+    failed = {
+        item
+        for item in (*_CORE_STRUCTURED_FINANCE_SOURCES, "anysearch")
+        if state.get(_source_disabled_key(item), 0)
+    }
+    remaining = [
+        item for item in _CORE_STRUCTURED_FINANCE_SOURCES if item not in failed
+    ]
+    labels = {
+        "ifind": "iFinD",
+        "juyuan": "Juyuan",
+        "caihui": "Caihui",
+        "anysearch": "AnySearch",
+    }
+    source_label = labels.get(source, source)
+    if remaining:
+        prefixes = {
+            "ifind": "iFinD Skill or an available `mcp_hexin-ifind-ds-...` tool",
+            "juyuan": "an available `mcp_juyuan_...` tool",
+            "caihui": "an available `mcp_caihui_mcp_...` tool",
+        }
+        remaining_text = ", ".join(prefixes[item] for item in remaining)
+        lead = (
+            "Stop calling iFinD immediately. "
+            if source == "ifind"
+            else f"Stop calling {source_label} for this field. "
+        )
         return (
-            "iFinD is unavailable or repeating for this run. Stop calling iFinD immediately. "
-            "Switch now to an available `mcp_juyuan_...` tool for the missing financial fields. "
-            "If no Juyuan tool is available or it also lacks the field, finish from the verified "
-            "evidence already collected and label the remaining gap. Do not scan Home, search for "
-            "another skill copy, or retry iFinD with a cosmetically different command."
+            f"{source_label} is unavailable or repeating for this run. {lead}"
+            f"Continue field-level cross-validation with the remaining configured core sources: "
+            f"{remaining_text}. Do not scan Home, discover credentials, or retry the failed source "
+            "with a cosmetically different query."
+        )
+    if "anysearch" not in failed and source != "anysearch":
+        return (
+            "iFinD, Juyuan, and Caihui are unavailable for this field. Stop retrying the core "
+            "sources and use an available `mcp_anysearch_...` tool once. Preserve the missing "
+            "field and source failures in the evidence matrix."
         )
     return (
-        "Juyuan did not provide this result. Do not repeat the same Juyuan lookup. Use verified "
-        "evidence already collected, exchange/company/regulatory disclosures, or explicitly label "
-        "the remaining data gap and finish the report."
+        "The configured structured sources and AnySearch did not provide this field. Use "
+        "`web_search` once with `provider=duckduckgo`, prefer exchange/company/regulatory "
+        "disclosures, then explicitly label any remaining data gap and finish the role/report."
     )
 
 
@@ -192,13 +243,13 @@ def mark_structured_finance_source_failed(
     source: str,
 ) -> None:
     """Disable a hard-failed source for the rest of the current agent run."""
-    if source == "ifind":
-        seen_counts[_IFIND_DISABLED_KEY] = 1
+    if source in {*_CORE_STRUCTURED_FINANCE_SOURCES, "anysearch"}:
+        seen_counts[_source_disabled_key(source)] = 1
 
 
 def structured_finance_result_failed(source: str, result: Any) -> bool:
     """Detect hard failures hidden inside a nominally successful tool payload."""
-    if source not in {"ifind", "juyuan"}:
+    if source not in {*_CORE_STRUCTURED_FINANCE_SOURCES, "anysearch"}:
         return False
     if isinstance(result, str):
         text = result
@@ -239,28 +290,32 @@ def repeated_external_lookup_error(
     if signature is None:
         return None
     source = structured_finance_source(tool_name, arguments)
+    if source is not None and seen_counts.get(_source_disabled_key(source), 0):
+        return f"Error: {structured_finance_fallback_instruction(source, seen_counts)}"
     if source == "ifind":
-        if seen_counts.get(_IFIND_DISABLED_KEY, 0):
-            return f"Error: {structured_finance_fallback_instruction(source)}"
-        total = seen_counts.get(_IFIND_TOTAL_KEY, 0) + 1
-        seen_counts[_IFIND_TOTAL_KEY] = total
+        total_key = _source_total_key(source)
+        total = seen_counts.get(total_key, 0) + 1
+        seen_counts[total_key] = total
         if total > _MAX_IFIND_LOOKUPS_PER_TURN:
-            seen_counts[_IFIND_DISABLED_KEY] = 1
+            mark_structured_finance_source_failed(seen_counts, source)
             logger.warning("Disabling iFinD after {} calls in one agent run", total)
-            return f"Error: {structured_finance_fallback_instruction(source)}"
+            return f"Error: {structured_finance_fallback_instruction(source, seen_counts)}"
     count = seen_counts.get(signature, 0) + 1
     seen_counts[signature] = count
     if count <= _MAX_REPEAT_EXTERNAL_LOOKUPS:
         return None
-    if source == "ifind":
-        seen_counts[_IFIND_DISABLED_KEY] = 1
+    if source is not None:
+        mark_structured_finance_source_failed(seen_counts, source)
     logger.warning(
         "Blocking repeated external lookup {} on attempt {}",
         signature[:160],
         count,
     )
     if source is not None:
-        return f"Error: repeated {source} lookup blocked. {structured_finance_fallback_instruction(source)}"
+        return (
+            f"Error: repeated {source} lookup blocked. "
+            f"{structured_finance_fallback_instruction(source, seen_counts)}"
+        )
     return (
         "Error: repeated external lookup blocked. "
         "Use the results you already have to answer, or try a meaningfully different source."

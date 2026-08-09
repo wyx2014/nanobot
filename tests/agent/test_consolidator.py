@@ -177,6 +177,37 @@ class TestConsolidatorPromptContract:
         assert "check context below" not in prompt.lower()
         assert "Do not mark something [skip] merely because it might already exist" in prompt
 
+    async def test_session_only_consolidation_preserves_tools_instead_of_snip_filtering(
+        self,
+        mock_provider,
+    ):
+        sessions = MagicMock()
+        session_consolidator = Consolidator(
+            store=None,
+            provider=mock_provider,
+            model="test-model",
+            sessions=sessions,
+            context_window_tokens=1000,
+            build_messages=MagicMock(return_value=[]),
+            get_tool_definitions=MagicMock(return_value=[]),
+            max_completion_tokens=100,
+        )
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="调用了 mcp_anysearch_batch_search 查询光伏行业。",
+            finish_reason="stop",
+        )
+
+        await session_consolidator.archive([
+            {"role": "user", "content": "分析光伏行业"},
+        ])
+
+        prompt = mock_provider.chat_with_retry.await_args.kwargs["messages"][0]["content"]
+        assert "conversation-continuity summary" in prompt
+        assert "every tool or MCP method used" in prompt
+        assert "do not emit `[skip]`" in prompt
+        assert "Only SNIP facts" not in prompt
+        assert "Expert-team memory boundary" not in prompt
+
     def test_dream_prompt_keeps_expert_team_methods_out_of_global_memory(self):
         prompt = render_template("agent/dream.md", strip=True, skill_creator_path="/tmp/skill")
 

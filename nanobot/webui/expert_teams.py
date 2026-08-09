@@ -11,8 +11,26 @@ from typing import Any, Mapping
 import yaml
 
 EXPERT_TEAM_SESSION_KEY = "expert_team"
+EXPERT_TEAM_RESUME_KEY = "expert_team_resume"
 _TEAM_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _MCP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_RESUME_MARKERS = (
+    "补充上次",
+    "补充之前",
+    "补充缺失",
+    "补充数据",
+    "补上缺失",
+    "补齐缺失",
+    "继续上次",
+    "继续之前",
+    "基于上次",
+    "基于之前",
+    "接着分析",
+    "重新汇总",
+    "重新审校",
+    "resume",
+    "supplement previous",
+)
 
 
 class ExpertTeamError(ValueError):
@@ -227,6 +245,42 @@ def expert_team_mcp_attachments(binding: Mapping[str, Any] | None) -> list[dict[
         if isinstance(item, Mapping)
         and item.get("configured") is True
         and isinstance(item.get("name"), str)
+    ]
+
+
+def expert_team_resume_requested(content: str, *, has_media: bool = False) -> bool:
+    """Conservatively recognize a user asking to supplement a prior team run."""
+
+    normalized = content.strip().lower()
+    if any(marker in normalized for marker in _RESUME_MARKERS):
+        return True
+    return has_media and any(
+        marker in normalized
+        for marker in ("这是", "数据", "资料", "附件", "缺失", "上次", "之前")
+    )
+
+
+def expert_team_resume_runtime_lines(metadata: Mapping[str, Any] | None) -> list[str]:
+    """Render a bounded, model-visible resume contract from trusted metadata."""
+
+    raw = metadata.get(EXPERT_TEAM_RESUME_KEY) if isinstance(metadata, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return []
+    previous_run_id = str(raw.get("run_id") or "").strip()
+    artifacts = [
+        str(item).strip()
+        for item in raw.get("artifacts", [])
+        if isinstance(item, str) and str(item).strip()
+    ][:12]
+    artifact_lines = "\n".join(f"  - {path}" for path in artifacts) or "  - (none recorded)"
+    return [
+        "Expert Team Resume: The user is supplementing a previous degraded asset-research "
+        "run. Resume at Team Lead cross-examination/synthesis; do not recreate the base data "
+        "package and do not spawn the four completed roles again. Treat current user text and "
+        "attachments as higher-priority evidence, read the previous member artifacts below, "
+        "then update the final report and run report audit/delivery.\n"
+        f"Previous run: {previous_run_id or 'unknown'}\n"
+        f"Previous artifacts:\n{artifact_lines}"
     ]
 
 

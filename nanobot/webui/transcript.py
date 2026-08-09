@@ -736,6 +736,7 @@ class WebUITranscriptRecorder:
         media_paths: list[str] | None = None,
         cli_apps: list[dict[str, Any]] | None = None,
         mcp_presets: list[dict[str, Any]] | None = None,
+        skill_scope: dict[str, Any] | None = None,
     ) -> None:
         if text.strip() == "/stop" and not media_paths:
             return
@@ -748,6 +749,7 @@ class WebUITranscriptRecorder:
             media_paths=media_paths,
             cli_apps=cli_apps,
             mcp_presets=mcp_presets,
+            skill_scope=skill_scope,
             interactive_prompt_answer=interactive_prompt_answer,
         )
         if payload is None:
@@ -900,6 +902,13 @@ def write_session_messages_as_transcript(
                 value = msg.get(key)
                 if isinstance(value, list) and value:
                     row[key] = json.loads(json.dumps(value, ensure_ascii=False))
+            scope = msg.get("skill_scope")
+            if isinstance(scope, dict):
+                explicit = scope.get("explicit_skills")
+                if isinstance(explicit, list):
+                    names = [str(name) for name in explicit if isinstance(name, str) and name]
+                    if names:
+                        row["skills"] = names
             interactive_prompt_answer = normalize_interactive_prompt_answer(
                 msg.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
             )
@@ -948,6 +957,7 @@ def build_user_transcript_event(
     media_paths: list[Any] | None = None,
     cli_apps: list[Any] | None = None,
     mcp_presets: list[Any] | None = None,
+    skill_scope: dict[str, Any] | None = None,
     interactive_prompt_answer: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     paths = [str(path) for path in (media_paths or []) if path]
@@ -966,6 +976,12 @@ def build_user_transcript_event(
     presets = [dict(preset) for preset in (mcp_presets or []) if isinstance(preset, Mapping)]
     if presets:
         event["mcp_presets"] = presets
+    if isinstance(skill_scope, Mapping):
+        explicit = skill_scope.get("explicit_skills")
+        if isinstance(explicit, list):
+            skills = [str(name) for name in explicit if isinstance(name, str) and name.strip()]
+            if skills:
+                event["skills"] = skills
     if interactive_prompt_answer:
         event[INBOUND_META_INTERACTIVE_PROMPT_ANSWER] = interactive_prompt_answer
     return event
@@ -2004,6 +2020,9 @@ def replay_transcript_to_ui_messages(
                 row["mcpPresets"] = [
                     dict(preset) for preset in mcp_presets if isinstance(preset, dict)
                 ]
+            skills = rec.get("skills")
+            if isinstance(skills, list) and skills:
+                row["skills"] = [str(name) for name in skills if isinstance(name, str)]
             interactive_prompt_answer = normalize_interactive_prompt_answer(
                 rec.get(INBOUND_META_INTERACTIVE_PROMPT_ANSWER)
             )

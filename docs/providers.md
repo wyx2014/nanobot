@@ -383,6 +383,12 @@ Config keys may be camelCase or snake_case. Provider names in model presets shou
 
 Bedrock can use the AWS credential chain, profile, region, or Bedrock bearer token depending on your AWS setup.
 
+Install its optional AWS SDK first:
+
+```bash
+python -m pip install "nanobot-ai[bedrock]"
+```
+
 ```json
 {
   "providers": {

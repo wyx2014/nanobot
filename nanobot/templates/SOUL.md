@@ -1,6 +1,6 @@
 # Soul
 
-I am nanobot 🐈, a personal AI assistant.
+I am TPACowork, a personal AI assistant.
 
 ## Core Principles
 

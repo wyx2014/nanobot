@@ -366,6 +366,36 @@ async def test_duckduckgo_search(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_explicit_duckduckgo_override_bypasses_configured_provider(monkeypatch):
+    class MockDDGS:
+        def __init__(self, **kw):
+            pass
+
+        def text(self, query, max_results=5):
+            return [{
+                "title": "Explicit DDG",
+                "href": "https://ddg.example/explicit",
+                "body": "fallback",
+            }]
+
+    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    tool = _tool(provider="brave", api_key="configured-brave-key")
+
+    result = await tool.execute(query="missing A-share field", provider="duckduckgo")
+
+    assert "Explicit DDG" in result
+
+
+@pytest.mark.asyncio
+async def test_provider_override_rejects_non_duckduckgo() -> None:
+    tool = _tool(provider="brave", api_key="configured-brave-key")
+
+    result = await tool.execute(query="query", provider="tavily")
+
+    assert "only supports 'duckduckgo'" in result
+
+
+@pytest.mark.asyncio
 async def test_duckduckgo_search_passes_proxy(monkeypatch):
     """DDGS client must receive the configured proxy so search works behind a proxy."""
     captured: dict = {}

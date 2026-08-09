@@ -59,6 +59,12 @@ If `nanobot channels status` does not show the channel as enabled, the config sn
 <details>
 <summary><b>Telegram</b></summary>
 
+Install the optional Telegram SDK before enabling this channel:
+
+```bash
+python -m pip install "nanobot-ai[telegram]"
+```
+
 **1. Create a bot**
 - Open Telegram, search `@BotFather`
 - Send `/newbot`, follow prompts
@@ -362,6 +368,12 @@ very first message:
 
 Uses **WebSocket** long connection — no public IP required.
 
+Install the optional Feishu SDK before enabling this channel:
+
+```bash
+python -m pip install "nanobot-ai[feishu]"
+```
+
 **Quick setup: QR login**
 
 ```bash
@@ -434,6 +446,12 @@ nanobot gateway
 <summary><b>QQ (QQ单聊)</b></summary>
 
 Uses **botpy SDK** with WebSocket — no public IP required. Currently supports **private messages only**.
+
+Install the optional QQ SDK before enabling this channel:
+
+```bash
+python -m pip install "nanobot-ai[qq]"
+```
 
 **1. Register & create bot**
 - Visit [QQ Open Platform](https://q.qq.com) → Register as a developer (personal or enterprise)
@@ -524,6 +542,12 @@ Connects to a [Napcat](https://github.com/NapNeko/NapCatQQ) instance over its **
 
 Uses **Stream Mode** — no public IP required.
 
+Install the optional DingTalk SDK before enabling this channel:
+
+```bash
+python -m pip install "nanobot-ai[dingtalk]"
+```
+
 **1. Create a DingTalk bot**
 - Visit [DingTalk Open Platform](https://open-dev.dingtalk.com/)
 - Create a new app -> Add **Robot** capability
@@ -565,6 +589,12 @@ nanobot gateway
 <summary><b>Slack</b></summary>
 
 Uses **Socket Mode** — no public URL required.
+
+Install the optional Slack SDK before enabling this channel:
+
+```bash
+python -m pip install "nanobot-ai[slack]"
+```
 
 **1. Create a Slack app**
 - Go to [Slack API](https://api.slack.com/apps) → **Create New App** → "From scratch"

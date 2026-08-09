@@ -30,6 +30,12 @@ from nanobot.webui.project_skills_api import (
     project_skills_payload,
     project_skills_save,
 )
+from nanobot.webui.personalization_api import (
+    PersonalizationError,
+    personalization_payload,
+    restore_personalization,
+    save_personalization,
+)
 from nanobot.webui.settings_api import (
     WebUISettingsError,
     create_model_configuration,
@@ -58,6 +64,8 @@ QueryParams = dict[str, list[str]]
 _MCP_VALUES_HEADER = "X-Nanobot-MCP-Values"
 _MCP_VALUES_HEADER_MAX_BYTES = 64 * 1024
 _SKILL_VALUES_HEADER = "X-Nanobot-Skill-Values"
+_PERSONALIZATION_VALUES_HEADER = "X-Nanobot-Personalization-Values"
+_PERSONALIZATION_VALUES_HEADER_MAX_BYTES = 512 * 1024
 _SKILL_VALUES_HEADER_MAX_BYTES = 512 * 1024
 _PROJECT_SKILL_VALUES_HEADER = "X-Nanobot-Project-Skill-Values"
 _PROJECT_SKILL_VALUES_HEADER_MAX_BYTES = 64 * 1024
@@ -162,6 +170,12 @@ class WebUISettingsRouter:
             return self._handle_settings_project_skills(request)
         if path == "/api/settings/project-skills/save":
             return self._handle_settings_project_skills_save(request)
+        if path == "/api/settings/personalization":
+            return self._handle_settings_personalization(request)
+        if path == "/api/settings/personalization/save":
+            return self._handle_settings_personalization_save(request)
+        if path == "/api/settings/personalization/restore":
+            return self._handle_settings_personalization_restore(request)
         if path == "/api/settings/mcp-presets":
             return await self._handle_settings_mcp_presets(request)
         if path == "/api/settings/version-check":
@@ -526,6 +540,69 @@ class WebUISettingsRouter:
         except Exception:
             self.logger.exception("failed to save project skills")
             return self._error_response(500, "failed to save project skills")
+        return self._json_response(payload)
+
+    def _handle_settings_personalization(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            return self._json_response(personalization_payload())
+        except Exception:
+            self.logger.exception("failed to load personalization")
+            return self._error_response(500, "failed to load personalization")
+
+    def _parse_personalization_query(self, request: WsRequest) -> QueryParams:
+        query = self._query(request)
+        raw = request.headers.get(_PERSONALIZATION_VALUES_HEADER)
+        if not raw:
+            return query
+        if len(raw.encode("utf-8")) > _PERSONALIZATION_VALUES_HEADER_MAX_BYTES:
+            raise PersonalizationError("personalization payload is too large")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise PersonalizationError("invalid personalization payload") from exc
+        if not isinstance(payload, dict):
+            raise PersonalizationError("personalization payload must be a JSON object")
+        merged = {key: list(values) for key, values in query.items()}
+        for key, value in payload.items():
+            if not isinstance(key, str) or not key:
+                raise PersonalizationError("personalization payload contains an invalid key")
+            if value is None:
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            if text:
+                merged[key] = [text]
+        return merged
+
+    def _handle_settings_personalization_save(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            query = self._parse_personalization_query(request)
+            soul = _query_first(query, "soul")
+            user = _query_first(query, "user")
+            if soul is None and user is None:
+                raise PersonalizationError("nothing to save")
+            payload = save_personalization(soul=soul, user=user)
+        except PersonalizationError as e:
+            return self._error_response(e.status, e.message)
+        except Exception:
+            self.logger.exception("failed to save personalization")
+            return self._error_response(500, "failed to save personalization")
+        return self._json_response(payload)
+
+    def _handle_settings_personalization_restore(self, request: WsRequest) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            kind = (_query_first(self._query(request), "kind") or "").strip()
+            payload = restore_personalization(kind)
+        except PersonalizationError as e:
+            return self._error_response(e.status, e.message)
+        except Exception:
+            self.logger.exception("failed to restore personalization")
+            return self._error_response(500, "failed to restore personalization")
         return self._json_response(payload)
 
     async def _handle_settings_mcp_presets(

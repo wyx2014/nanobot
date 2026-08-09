@@ -6,6 +6,7 @@ import nanobot.agent.memory as memory_module
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
+from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 
 
 def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -> AgentLoop:
@@ -28,6 +29,52 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.consolidator._SAFETY_BUFFER = 0
     return loop
+
+
+def test_project_session_uses_session_only_consolidator(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    project = tmp_path / "project"
+    project.mkdir()
+    session = loop.sessions.get_or_create("websocket:project")
+    session.metadata[WORKSPACE_SCOPE_METADATA_KEY] = {
+        "project_path": str(project),
+        "access_mode": "restricted",
+    }
+
+    assert loop._memory_store_for_session(session) is None
+    assert loop._consolidator_for_session(session) is loop.session_consolidator
+    assert loop.session_consolidator.store is None
+
+
+def test_root_project_session_also_uses_session_only_consolidator(tmp_path) -> None:
+    """Desktop projects commonly use the runtime workspace as their root."""
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    session = loop.sessions.get_or_create("websocket:root-project")
+    session.metadata["project_id"] = "prj_root"
+    session.metadata[WORKSPACE_SCOPE_METADATA_KEY] = {
+        "project_path": str(tmp_path),
+        "access_mode": "full",
+    }
+
+    assert loop._memory_store_for_session(session) is None
+    assert loop._consolidator_for_session(session) is loop.session_consolidator
+
+
+@pytest.mark.asyncio
+async def test_failed_session_only_compaction_keeps_live_messages(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    session = loop.sessions.get_or_create("websocket:project")
+    session.messages = [
+        {"role": role, "content": f"message {index}"}
+        for index, role in enumerate(["user", "assistant"] * 6)
+    ]
+    loop.sessions.save(session)
+    loop.session_consolidator.archive = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    result = await loop.session_consolidator.compact_idle_session(session.key)
+
+    assert result is None
+    assert len(loop.sessions.get_or_create(session.key).messages) == 12
 
 
 @pytest.mark.asyncio

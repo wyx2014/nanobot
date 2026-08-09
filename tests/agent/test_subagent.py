@@ -11,6 +11,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ToolsConfig
 from nanobot.providers.base import LLMProvider
+from nanobot.storage.state import StateStore
 
 
 @pytest.mark.asyncio
@@ -106,3 +107,93 @@ def test_expert_team_inherits_only_its_configured_mcp_tools(tmp_path):
 
     assert tools.get("mcp_juyuan_company_financials") is juyuan
     assert not tools.has("mcp_browser_snapshot")
+
+
+def test_asset_team_inherits_configured_three_source_and_fallback_mcp_tools(tmp_path):
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    parent_tools = ToolRegistry()
+    names = (
+        "mcp_hexin-ifind-ds-stock-mcp_quote",
+        "mcp_juyuan_company_financials",
+        "mcp_caihui_mcp_company_financials",
+        "mcp_anysearch_search",
+    )
+    tools_by_name = {}
+    for name in names:
+        tool = MagicMock()
+        tool.name = name
+        parent_tools.register(tool)
+        tools_by_name[name] = tool
+    unrelated = MagicMock()
+    unrelated.name = "mcp_playwright_browser_snapshot"
+    parent_tools.register(unrelated)
+    manager = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+        parent_tools=parent_tools,
+    )
+
+    tools = manager._build_tools(expert_team={
+        "mcp_presets": [
+            {"name": "hexin-ifind-ds-stock-mcp", "configured": True},
+            {"name": "juyuan", "configured": True},
+            {"name": "caihui_mcp", "configured": True},
+            {"name": "anysearch", "configured": True},
+        ],
+    })
+
+    for name, tool in tools_by_name.items():
+        assert tools.get(name) is tool
+    assert not tools.has("mcp_playwright_browser_snapshot")
+
+
+@pytest.mark.asyncio
+async def test_expert_team_member_terminal_result_is_registered_as_artifact(tmp_path):
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    state = StateStore(
+        tmp_path / ".nanobot" / "state.sqlite",
+        default_workspace=tmp_path,
+    )
+    project = state.ensure_project(tmp_path)
+    session = state.bind_session("websocket:artifact-chat", project.id)
+    state.project_event(session.session_key, {
+        "schema_version": 1,
+        "event": "user",
+        "event_id": "artifact-user",
+        "event_seq": 1,
+        "recorded_at": 1,
+        "project_id": project.id,
+        "session_id": session.id,
+        "turn_id": "turn-artifact",
+        "text": "research",
+    })
+    manager = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+
+    relative = await manager._persist_expert_team_member_artifact(
+        content="# 结论\n\n数据来源：交易所公告",
+        label="financial-analyst",
+        run_id="run-artifact",
+        origin={
+            "channel": "websocket",
+            "chat_id": "artifact-chat",
+            "session_key": session.session_key,
+        },
+        workspace_scope=None,
+        delivery_status="completed",
+    )
+
+    assert relative == (
+        "reports/.team-runs/run-artifact/members/financial-analyst.md"
+    )
+    assert (tmp_path / relative).is_file()
+    artifacts = state.list_session_artifacts(session.session_key)
+    assert any(item.relative_path == relative for item in artifacts)

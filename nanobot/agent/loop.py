@@ -10,7 +10,6 @@ import time
 from contextlib import AsyncExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -50,7 +49,6 @@ from nanobot.cron.session_turns import (
     cron_history_overrides,
     is_cron_turn,
 )
-from nanobot.memories.project import ProjectMemoryPipeline, ProjectMemoryPipelineConfig
 from nanobot.observability.trace_collector import TraceCollector
 from nanobot.observability.trace_store import TraceStore
 from nanobot.providers.base import LLMProvider
@@ -86,7 +84,6 @@ from nanobot.session.manager import (
     Session,
     SessionManager,
 )
-from nanobot.storage.state import StateStore
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -171,7 +168,7 @@ def _wrap_active_turn_correction(content: Any, *, objective: str) -> Any:
         "[Active-turn user correction]\n"
         "This is a correction to the task currently in progress, not a new task. "
         "Keep the active objective and the evidence gathered for it. Do not infer "
-        "a different topic from older conversation history, project memory, browser "
+        "a different topic from older conversation history, browser "
         "cache, or unrelated files.\n"
         f"Active objective:\n{objective or '[Use the immediately preceding active user request.]'}\n"
         f"User correction:\n{correction or '[See the attached content.]'}\n"
@@ -429,7 +426,6 @@ class AgentLoop:
         runtime_events: RuntimeEventBus | None = None,
         thread_runtime_registry: ThreadRuntimeRegistry | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
-        project_memory_config: Any | None = None,
         performance_log_store: StructuredLogStore | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
@@ -564,15 +560,19 @@ class AgentLoop:
             consolidation_ratio=consolidation_ratio,
             unified_session=unified_session,
         )
-        self._project_consolidators: dict[str, Consolidator] = {}
-        self.project_memory = ProjectMemoryPipeline(
-            state=StateStore(
-                workspace.expanduser().resolve(strict=False) / ".nanobot" / "state.sqlite",
-                default_workspace=workspace,
-            ),
+        # Project-bound sessions still need compaction, but their summaries
+        # must remain in session metadata instead of entering global memory.
+        self.session_consolidator = Consolidator(
+            store=None,
             provider=provider,
             model=self.model,
-            config=ProjectMemoryPipelineConfig.from_runtime(project_memory_config),
+            sessions=self.sessions,
+            context_window_tokens=self.context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
+            consolidation_ratio=consolidation_ratio,
+            unified_session=unified_session,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -643,7 +643,6 @@ class AgentLoop:
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
-            project_memory_config=config.agents.defaults.dream,
             **extra,
         )
 
@@ -669,9 +668,7 @@ class AgentLoop:
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
-        for project_consolidator in self._project_consolidators.values():
-            project_consolidator.set_provider(provider, model, context_window_tokens)
-        self.project_memory.set_provider(provider, model)
+        self.session_consolidator.set_provider(provider, model, context_window_tokens)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
             self._runtime_model_publisher(
@@ -1092,9 +1089,13 @@ class AgentLoop:
         session: Session,
         msg: InboundMessage | None = None,
     ) -> Any | None:
+        # Project-bound chats must never feed their turn summaries into the
+        # global history, even when the project's canonical root happens to be
+        # the runtime workspace itself (the desktop app's common case).
+        if isinstance(session.metadata.get("project_id"), str):
+            return None
         if msg is not None:
             scope = self.workspace_scopes.for_message(msg, session.metadata)
-            metadata = msg.metadata
         else:
             channel = session.key.split(":", 1)[0] if ":" in session.key else None
             scope = self.workspace_scopes.for_turn(
@@ -1102,15 +1103,9 @@ class AgentLoop:
                 message_metadata=None,
                 session_metadata=session.metadata,
             )
-            metadata = {}
-        project_id = session.metadata.get("project_id")
-        raw_context = metadata.get(PROJECT_CONTEXT_METADATA_KEY)
-        if isinstance(raw_context, dict) and isinstance(raw_context.get("project_id"), str):
-            project_id = raw_context["project_id"]
-        return self.context.memory_for_project(
-            project_id if isinstance(project_id, str) else None,
-            scope.project_path,
-        )
+        runtime_root = self.workspace.expanduser().resolve(strict=False)
+        active_root = scope.project_path.expanduser().resolve(strict=False)
+        return self.context.memory if active_root == runtime_root else None
 
     def _consolidator_for_session(
         self,
@@ -1118,28 +1113,9 @@ class AgentLoop:
         msg: InboundMessage | None = None,
     ) -> Consolidator | None:
         store = self._memory_store_for_session(session, msg)
-        if store is None:
-            return None
         if store is self.context.memory:
             return self.consolidator
-        key = str(store.workspace.expanduser().resolve(strict=False))
-        existing = self._project_consolidators.get(key)
-        if existing is not None:
-            return existing
-        consolidator = Consolidator(
-            store=store,
-            provider=self.provider,
-            model=self.model,
-            sessions=self.sessions,
-            context_window_tokens=self.context_window_tokens,
-            build_messages=self.context.build_messages,
-            get_tool_definitions=self.tools.get_definitions,
-            max_completion_tokens=self.provider.generation.max_tokens,
-            consolidation_ratio=self.consolidator.consolidation_ratio,
-            unified_session=self._unified_session,
-        )
-        self._project_consolidators[key] = consolidator
-        return consolidator
+        return self.session_consolidator
 
     async def _dispatch_command_inline(
         self,
@@ -2097,6 +2073,10 @@ class AgentLoop:
                 session,
                 replay_max_messages=self._max_messages,
             )
+            # Consolidation can advance last_consolidated during this very
+            # turn. Refresh the summary immediately so the archived prefix is
+            # never absent from the provider request that follows.
+            pending = self.auto_compact.summary_for_session(session) or pending
         is_subagent = msg.sender_id == "subagent"
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
@@ -2148,14 +2128,7 @@ class AgentLoop:
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
         self._save_turn(session, all_msgs, 1 + len(history), turn_latency_ms=latency_ms)
         self._runtime_events().record_turn_latency(key, latency_ms)
-        memory_store = self._memory_store_for_session(session, msg)
-        session.enforce_file_cap(
-            on_archive=(
-                partial(memory_store.raw_archive, session_key=key)
-                if memory_store is not None
-                else None
-            )
-        )
+        session.enforce_file_cap()
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
         if consolidator is not None:
@@ -2347,6 +2320,7 @@ class AgentLoop:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         self.workspace_scopes.persist_message_scope(ctx.session, msg)
         self._ensure_inherited_project_session(ctx)
+        self._repair_legacy_project_consolidation(ctx.session)
         await self._runtime_events().session_turn_started(msg, ctx.session_key)
 
         if self._restore_runtime_checkpoint(ctx.session):
@@ -2407,6 +2381,32 @@ class AgentLoop:
         ctx.msg.metadata[PROJECT_CONTEXT_METADATA_KEY] = context_metadata
         ctx.session.metadata["project_id"] = project.id
         ctx.session.metadata["session_id"] = state_session.id
+
+    def _repair_legacy_project_consolidation(self, session: Session) -> bool:
+        """Restore raw replay hidden by the removed project-memory pipeline.
+
+        Older project turns used the global SNIP memory summarizer.  It could
+        advance ``last_consolidated`` while replacing one-off research with a
+        list of ``[skip]`` items.  The raw JSONL messages still exist, so reset
+        only that legacy cursor.  Session-continuity summaries created by the
+        new consolidator carry ``kind=session`` and are left intact.
+        """
+        if not isinstance(session.metadata.get("project_id"), str):
+            return False
+        if session.last_consolidated <= 0:
+            return False
+        summary = session.metadata.get("_last_summary")
+        if isinstance(summary, dict) and summary.get("kind") == "session":
+            return False
+        logger.info(
+            "Restoring {} legacy project messages for same-session replay in {}",
+            session.last_consolidated,
+            session.key,
+        )
+        session.last_consolidated = 0
+        session.metadata.pop("_last_summary", None)
+        self.sessions.save(session)
+        return True
 
     def _consume_pending_interactive_prompt_answer(self, ctx: TurnContext) -> None:
         pending = normalize_interactive_prompt(
@@ -2596,6 +2596,13 @@ class AgentLoop:
                     ctx.session,
                     replay_max_messages=self._max_messages,
                 )
+                # maybe_consolidate_by_tokens may have hidden old raw messages
+                # after _state_compact captured its summary. Pull the newly
+                # persisted summary into this same provider request.
+                ctx.pending_summary = (
+                    self.auto_compact.summary_for_session(ctx.session)
+                    or ctx.pending_summary
+                )
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
@@ -2715,17 +2722,9 @@ class AgentLoop:
             ctx.session_key,
             ctx.turn_latency_ms,
         )
-        memory_store = None
         if not ctx.ephemeral:
-            memory_store = self._memory_store_for_session(ctx.session, ctx.msg)
             consolidator = self._consolidator_for_session(ctx.session, ctx.msg)
-            ctx.session.enforce_file_cap(
-                on_archive=(
-                    partial(memory_store.raw_archive, session_key=ctx.session_key)
-                    if memory_store is not None
-                    else None
-                )
-            )
+            ctx.session.enforce_file_cap()
             if consolidator is not None:
                 self._schedule_background(
                     consolidator.maybe_consolidate_by_tokens(
@@ -2736,9 +2735,6 @@ class AgentLoop:
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
-        memory_task = self.project_memory.build_session_task(ctx.session, memory_store)
-        if memory_task is not None:
-            self._schedule_background(memory_task)
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:

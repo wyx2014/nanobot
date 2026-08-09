@@ -5,6 +5,13 @@ from pathlib import Path
 from nanobot.webui import expert_teams
 
 
+def test_resume_detection_is_explicit_and_does_not_capture_new_research() -> None:
+    assert expert_teams.expert_team_resume_requested("补充上次缺失的现金流数据") is True
+    assert expert_teams.expert_team_resume_requested("这是补充数据", has_media=True) is True
+    assert expert_teams.expert_team_resume_requested("补充分析另一家公司") is False
+    assert expert_teams.expert_team_resume_requested("帮我分析工商银行") is False
+
+
 def _write_team(root: Path) -> None:
     team = root / "asset-research-team"
     source = team / "source/ai-berkshire"

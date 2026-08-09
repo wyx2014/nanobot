@@ -67,19 +67,6 @@ class DreamConfig(Base):
     max_batch_size: int = Field(default=20, ge=1)  # Deprecated: no longer used
     max_iterations: int = Field(default=15, ge=1)  # Deprecated: no longer used
     annotate_line_ages: bool = True  # Deprecated: no longer used
-    project_memory_enabled: bool = True
-    project_memory_idle_s: int = Field(default=20, ge=0, le=600)
-    project_memory_max_source_chars: int = Field(default=40_000, ge=2_000, le=200_000)
-    project_memory_max_stage1_per_project: int = Field(default=50, ge=1, le=200)
-    project_memory_max_raw_memory_chars: int = Field(default=24_000, ge=2_000, le=100_000)
-    project_memory_max_rollout_summary_chars: int = Field(
-        default=12_000,
-        ge=1_000,
-        le=50_000,
-    )
-    project_memory_max_summary_chars: int = Field(default=8_000, ge=500, le=30_000)
-    project_memory_lease_ms: int = Field(default=300_000, ge=10_000, le=3_600_000)
-
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
         if self.cron:

@@ -264,7 +264,7 @@ async def test_task_progress_tool_does_not_replace_expert_team_workflow():
             chat_id="chat-1",
             message_id="m1",
             session_key="websocket:chat-1",
-            metadata={"expert_team": {"id": "trading-analysis-team"}},
+            metadata={"expert_team": {"id": "test-expert-team"}},
         )
     )
     steps = [

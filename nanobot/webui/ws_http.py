@@ -26,7 +26,6 @@ from loguru import logger
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
-from nanobot.agent.memory import MemoryStore
 from nanobot.command.builtin import builtin_command_palette
 from nanobot.cron.session_turns import is_bound_cron_job
 from nanobot.cron.types import CronJob, CronSchedule
@@ -201,7 +200,6 @@ class GatewayHTTPHandler:
         disabled_skills: set[str] | None = None,
         cron_service: CronService | None = None,
         cron_pending_job_ids: Callable[[str], set[str]] | None = None,
-        project_memory_pipeline: Any | None = None,
         thread_runtime_registry: Any | None = None,
         log: Any = logger,
     ) -> None:
@@ -223,7 +221,6 @@ class GatewayHTTPHandler:
         self.disabled_skills = disabled_skills or set()
         self.cron_service = cron_service
         self.cron_pending_job_ids = cron_pending_job_ids
-        self.project_memory_pipeline = project_memory_pipeline
         self.thread_runtime_registry = thread_runtime_registry
         self._log = log
         self._runtime_surface = runtime_surface
@@ -582,6 +579,17 @@ class GatewayHTTPHandler:
             if event_rows
             else None
         )
+        if has_more_messages and event_rows and event_rows[0].get("event") != "user":
+            oldest_turn_id = str(event_rows[0].get("turn_id") or "").strip()
+            if oldest_turn_id:
+                user_anchor = await asyncio.to_thread(
+                    self.state.session_turn_user_event_envelope,
+                    session_key,
+                    turn_id=oldest_turn_id,
+                    before_event_seq=message_before_cursor,
+                )
+                if user_anchor is not None:
+                    event_rows = [user_anchor, *event_rows]
         thread = build_webui_thread_response(
             session_key,
             event_rows=event_rows,
@@ -1665,42 +1673,6 @@ class GatewayHTTPHandler:
         m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/sessions$", got)
         if m:
             return await self._handle_project_sessions(request, m.group(1))
-        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/status$", got)
-        if m:
-            return await self._handle_project_memory_status(request, m.group(1))
-        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/consolidate$", got)
-        if m:
-            return await self._handle_project_memory_consolidate(request, m.group(1))
-        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/clear$", got)
-        if m:
-            return await self._handle_project_memory_clear(request, m.group(1))
-        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories/reindex$", got)
-        if m:
-            return await self._handle_project_memory_reindex(request, m.group(1))
-        m = re.match(
-            r"^/api/projects/([A-Za-z0-9_-]+)/memories/([A-Za-z0-9_-]+)/forget$",
-            got,
-        )
-        if m:
-            return await self._handle_project_memory_item(
-                request,
-                m.group(1),
-                m.group(2),
-                allow_get=True,
-            )
-        m = re.match(
-            r"^/api/projects/([A-Za-z0-9_-]+)/memories/([A-Za-z0-9_-]+)$",
-            got,
-        )
-        if m:
-            return await self._handle_project_memory_item(
-                request,
-                m.group(1),
-                m.group(2),
-            )
-        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/memories$", got)
-        if m:
-            return await self._handle_project_memories(request, m.group(1))
         if got == "/api/diagnostics/logs":
             return await self._handle_diagnostic_logs(request)
         if got == "/api/traces":
@@ -1880,261 +1852,6 @@ class GatewayHTTPHandler:
             return _http_error(405, "unsupported method")
         return None
 
-    def _project_memory_store(self, project_id: str) -> MemoryStore:
-        if self.state.get_project(project_id) is None:
-            raise StateStoreError("project not found")
-        return MemoryStore(
-            self.skills_workspace_path
-            / ".nanobot"
-            / "project-memory"
-            / project_id
-        )
-
-    async def _refresh_project_memory_files_from_rows(
-        self,
-        project_id: str,
-        store: MemoryStore,
-    ) -> None:
-        rows = await asyncio.to_thread(self.state.list_project_memories, project_id)
-        structured = [row for row in rows if row.get("kind") != "long_term"]
-        if not structured:
-            await asyncio.to_thread(store.write_memory, "")
-            await asyncio.to_thread(store.write_memory_summary, "")
-            await asyncio.to_thread(store.write_raw_memories, "")
-            await asyncio.to_thread(store.sync_rollout_summaries, {})
-            await asyncio.to_thread(store.sync_memory_skills, {})
-            return
-        markdown = "# Project memory\n\n" + "\n\n".join(
-            (
-                f"## {str(row.get('title') or row.get('kind') or 'Memory')}\n\n"
-                f"{row['content']}"
-            )
-            for row in structured
-        )
-        summary = "\n".join(
-            f"- {str(row['content'])[:500]}"
-            for row in structured[:12]
-        )
-        await asyncio.to_thread(store.write_memory, markdown)
-        await asyncio.to_thread(store.write_memory_summary, summary)
-        skills = {
-            f"{row['kind']}-{row['id']}": (
-                f"# {str(row.get('title') or row.get('kind') or 'Memory')}\n\n"
-                f"- kind: `{row['kind']}`\n\n{row['content']}\n"
-            )
-            for row in structured
-            if row.get("kind") in {
-                "project_preference",
-                "workflow",
-                "failure_shield",
-                "decision_rule",
-            }
-        }
-        await asyncio.to_thread(store.sync_memory_skills, skills)
-
-    async def _handle_project_memories(
-        self,
-        request: WsRequest,
-        project_id: str,
-    ) -> Response:
-        if not self.check_api_token(request):
-            return _http_error(401, "Unauthorized")
-        method = str(getattr(request, "method", "GET")).upper()
-        if method == "GET":
-            try:
-                rows = await asyncio.to_thread(
-                    self.state.list_project_memories,
-                    project_id,
-                )
-                for row in rows:
-                    row["sources"] = await asyncio.to_thread(
-                        self.state.list_project_memory_sources,
-                        project_id,
-                        str(row["id"]),
-                    )
-                status = await asyncio.to_thread(
-                    self.state.project_memory_job_status,
-                    project_id,
-                )
-            except StateStoreError as exc:
-                return _http_error(404, str(exc))
-            return _http_json_response(
-                {
-                    "project_id": project_id,
-                    "memories": rows,
-                    "status": status,
-                    "retrieval": {
-                        "mode": "bounded_lexical",
-                        "deep_rag_enabled": False,
-                    },
-                }
-            )
-        if method != "DELETE":
-            return _http_error(405, "unsupported method")
-        return await self._clear_project_memories(project_id)
-
-    async def _handle_project_memory_clear(
-        self,
-        request: WsRequest,
-        project_id: str,
-    ) -> Response:
-        if not self.check_api_token(request):
-            return _http_error(401, "Unauthorized")
-        if str(getattr(request, "method", "GET")).upper() not in {"GET", "DELETE"}:
-            return _http_error(405, "unsupported method")
-        return await self._clear_project_memories(project_id)
-
-    async def _clear_project_memories(self, project_id: str) -> Response:
-        try:
-            store = self._project_memory_store(project_id)
-            removed = await asyncio.to_thread(
-                self.state.clear_project_memories,
-                project_id,
-            )
-            await asyncio.to_thread(store.write_memory, "")
-            await asyncio.to_thread(store.write_memory_summary, "")
-            await asyncio.to_thread(store.write_raw_memories, "")
-            await asyncio.to_thread(store.sync_rollout_summaries, {})
-            await asyncio.to_thread(store.sync_memory_skills, {})
-        except StateStoreError as exc:
-            return _http_error(404, str(exc))
-        await asyncio.to_thread(
-            self.logs.write,
-            level="warning",
-            component="project_memory",
-            event_name="project_memory_cleared",
-            message="project-derived memory was cleared; source sessions were preserved",
-            project_id=project_id,
-            details={"removed": removed},
-        )
-        return _http_json_response({"ok": True, "removed": removed})
-
-    async def _handle_project_memory_status(
-        self,
-        request: WsRequest,
-        project_id: str,
-    ) -> Response:
-        if not self.check_api_token(request):
-            return _http_error(401, "Unauthorized")
-        if str(getattr(request, "method", "GET")).upper() != "GET":
-            return _http_error(405, "unsupported method")
-        try:
-            payload = await asyncio.to_thread(
-                self.state.project_memory_job_status,
-                project_id,
-            )
-        except StateStoreError as exc:
-            return _http_error(404, str(exc))
-        return _http_json_response(payload)
-
-    async def _handle_project_memory_consolidate(
-        self,
-        request: WsRequest,
-        project_id: str,
-    ) -> Response:
-        if not self.check_api_token(request):
-            return _http_error(401, "Unauthorized")
-        if str(getattr(request, "method", "GET")).upper() not in {"GET", "POST"}:
-            return _http_error(405, "unsupported method")
-        if self.project_memory_pipeline is None:
-            return _http_error(503, "project memory pipeline is unavailable")
-        try:
-            store = self._project_memory_store(project_id)
-            refreshed = await self.project_memory_pipeline.consolidate_project(
-                project_id,
-                store,
-                force=True,
-            )
-            status = await asyncio.to_thread(
-                self.state.project_memory_job_status,
-                project_id,
-            )
-        except StateStoreError as exc:
-            return _http_error(404, str(exc))
-        return _http_json_response(
-            {"ok": True, "refreshed": refreshed, "status": status}
-        )
-
-    async def _handle_project_memory_reindex(
-        self,
-        request: WsRequest,
-        project_id: str,
-    ) -> Response:
-        if not self.check_api_token(request):
-            return _http_error(401, "Unauthorized")
-        if str(getattr(request, "method", "GET")).upper() != "GET":
-            return _http_error(405, "unsupported method")
-        try:
-            result = await asyncio.to_thread(
-                self.state.reindex_project_text_artifacts,
-                project_id,
-            )
-        except StateStoreError as exc:
-            return _http_error(404, str(exc))
-        await asyncio.to_thread(
-            self.logs.write,
-            level="info",
-            component="project_memory",
-            event_name="project_lexical_index_rebuilt",
-            message="project-scoped text artifact index was rebuilt",
-            project_id=project_id,
-            details=result,
-        )
-        return _http_json_response(
-            {
-                "ok": True,
-                "retrieval": {
-                    "mode": "bounded_lexical",
-                    "deep_rag_enabled": False,
-                },
-                **result,
-            }
-        )
-
-    async def _handle_project_memory_item(
-        self,
-        request: WsRequest,
-        project_id: str,
-        memory_id: str,
-        *,
-        allow_get: bool = False,
-    ) -> Response:
-        if not self.check_api_token(request):
-            return _http_error(401, "Unauthorized")
-        allowed_methods = {"GET", "DELETE"} if allow_get else {"DELETE"}
-        if str(getattr(request, "method", "GET")).upper() not in allowed_methods:
-            return _http_error(405, "unsupported method")
-        removed = await asyncio.to_thread(
-            self.state.delete_project_memory,
-            project_id,
-            memory_id,
-        )
-        if not removed:
-            return _http_error(404, "project memory not found")
-        refreshed = False
-        if self.project_memory_pipeline is not None:
-            store = self._project_memory_store(project_id)
-            refreshed = await self.project_memory_pipeline.consolidate_project(
-                project_id,
-                store,
-                force=True,
-            )
-        if not refreshed:
-            store = self._project_memory_store(project_id)
-            await self._refresh_project_memory_files_from_rows(project_id, store)
-        await asyncio.to_thread(
-            self.logs.write,
-            level="warning",
-            component="project_memory",
-            event_name="project_memory_forgotten",
-            message="one project memory and its exclusive evidence were forgotten",
-            project_id=project_id,
-            details={"memory_id": memory_id, "projection_refreshed": refreshed},
-        )
-        return _http_json_response(
-            {"ok": True, "memory_id": memory_id, "refreshed": refreshed}
-        )
-
     async def _handle_project_archive(
         self,
         request: WsRequest,
@@ -2257,19 +1974,6 @@ class GatewayHTTPHandler:
                     source = Path(event_log).expanduser().resolve(strict=False)
                     if source.is_file():
                         archive.write(source, f"sessions/{session['id']}.jsonl")
-                memory_root = (
-                    self.skills_workspace_path
-                    / ".nanobot"
-                    / "project-memory"
-                    / project_id
-                )
-                if memory_root.is_dir():
-                    for source in memory_root.rglob("*"):
-                        if source.is_file():
-                            archive.write(
-                                source,
-                                f"memory/{source.relative_to(memory_root).as_posix()}",
-                            )
                 if include_files:
                     seen: set[str] = set()
                     for artifact in manifest["artifacts"]:

@@ -417,7 +417,7 @@ async def test_projects_api_exposes_stable_project_and_session_ids(
 
 
 @pytest.mark.asyncio
-async def test_project_memory_routes_are_authenticated_and_project_scoped(
+async def test_project_memory_routes_are_removed(
     bus: MagicMock,
     tmp_path: Path,
 ) -> None:
@@ -430,44 +430,20 @@ async def test_project_memory_routes_are_authenticated_and_project_scoped(
         port=29948,
     )
     project = channel.gateway.state.ensure_project(project_path, kind="workspace")
-    session = channel.gateway.state.bind_session("websocket:memory-chat", project.id)
-    memory_id = channel.gateway.state.upsert_project_memory(
+    channel.gateway.state.upsert_project_memory(
         project.id,
         kind="workflow",
         title="Package manager",
         content="Use pnpm.",
-        source_session_id=session.id,
     )
     server_task = asyncio.create_task(channel.start())
     await asyncio.sleep(0.3)
     try:
         url = f"http://127.0.0.1:29948/api/projects/{project.id}/memories"
-        denied = await _http_get(url)
-        assert denied.status_code == 401
-
-        boot = await _http_get("http://127.0.0.1:29948/webui/bootstrap")
-        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
-        listing = await _http_get(url, headers=auth)
-        assert listing.status_code == 200
-        body = listing.json()
-        assert body["project_id"] == project.id
-        assert body["retrieval"]["deep_rag_enabled"] is False
-        assert body["memories"][0]["id"] == memory_id
-        assert body["memories"][0]["content"] == "Use pnpm."
-
-        reindexed = await _http_get(f"{url}/reindex", headers=auth)
-        assert reindexed.status_code == 200
-        assert reindexed.json()["retrieval"]["deep_rag_enabled"] is False
-
-        forgotten = await _http_get(f"{url}/{memory_id}/forget", headers=auth)
-        assert forgotten.status_code == 200
-        assert forgotten.json()["ok"] is True
-        after = await _http_get(url, headers=auth)
-        assert after.json()["memories"] == []
-
-        cleared = await _http_get(f"{url}/clear", headers=auth)
-        assert cleared.status_code == 200
-        assert cleared.json()["removed"] == 0
+        listing = await _http_get(url)
+        assert listing.status_code == 404
+        # Removing the feature does not destructively erase legacy rows.
+        assert channel.gateway.state.list_project_memories(project.id)[0]["content"] == "Use pnpm."
     finally:
         await channel.stop()
         await server_task
@@ -638,6 +614,65 @@ async def test_thread_resource_pages_messages_by_canonical_event_sequence(
         ]
         assert older_payload["message_page"]["before_event_seq"] == 2
         assert older_payload["message_page"]["has_more_before"] is True
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_thread_resource_anchors_user_before_long_turn_tail(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    session_key = "websocket:thread-long-turn"
+    sm = _seed_session(tmp_path, key=session_key)
+    port = _free_port()
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+        port=port,
+    )
+    project = channel.gateway.state.ensure_project(tmp_path)
+    channel.gateway.state.bind_session(session_key, project.id)
+    channel.gateway.journal.commit(
+        session_key,
+        {
+            "event": "user",
+            "turn_id": "turn-long",
+            "text": "帮我分析下 长江电力",
+        },
+    )
+    for index in range(205):
+        channel.gateway.journal.commit(
+            session_key,
+            {
+                "event": "message",
+                "turn_id": "turn-long",
+                "kind": "progress",
+                "text": f"progress-{index}",
+            },
+        )
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get(f"http://127.0.0.1:{port}/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/sessions/"
+            "websocket%3Athread-long-turn/thread?message_limit=200",
+            headers=auth,
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["messages"][0]["role"] == "user"
+        assert payload["messages"][0]["content"] == "帮我分析下 长江电力"
+        assert sum(row["role"] == "user" for row in payload["messages"]) == 1
+        assert payload["message_page"]["has_more_before"] is True
+        assert payload["message_page"]["before_event_seq"] == 7
+        assert payload["message_page"]["loaded_message_count"] == 2
     finally:
         await channel.stop()
         await server_task

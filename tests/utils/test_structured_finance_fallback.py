@@ -30,6 +30,21 @@ def test_structured_finance_source_detects_ifind_exec_and_juyuan_mcp() -> None:
     assert structured_finance_source("exec", {"command": "npm test"}) is None
 
 
+def test_structured_finance_source_detects_all_team_bound_mcp_sources() -> None:
+    assert structured_finance_source(
+        "mcp_hexin-ifind-ds-stock-mcp_quote",
+        {"query": "工商银行"},
+    ) == "ifind"
+    assert structured_finance_source(
+        "mcp_caihui_mcp_company_financials",
+        {"query": "工商银行"},
+    ) == "caihui"
+    assert structured_finance_source(
+        "mcp_anysearch_search",
+        {"query": "工商银行 年报"},
+    ) == "anysearch"
+
+
 def test_repeated_ifind_lookup_disables_ifind_for_different_queries() -> None:
     counts: dict[str, int] = {}
     first = _ifind_call("新易盛 300502.SZ PE PB")
@@ -61,6 +76,31 @@ def test_hard_ifind_failure_disables_follow_up_ifind_calls() -> None:
 
     assert blocked is not None
     assert "mcp_juyuan_" in blocked
+
+
+def test_three_core_failures_route_to_anysearch_then_duckduckgo() -> None:
+    counts: dict[str, int] = {}
+    for source in ("ifind", "juyuan", "caihui"):
+        mark_structured_finance_source_failed(counts, source)
+
+    anysearch_instruction = repeated_external_lookup_error(
+        "mcp_juyuan_company_financials",
+        {"query": "missing field"},
+        counts,
+    )
+
+    assert anysearch_instruction is not None
+    assert "mcp_anysearch_" in anysearch_instruction
+
+    mark_structured_finance_source_failed(counts, "anysearch")
+    duckduckgo_instruction = repeated_external_lookup_error(
+        "mcp_anysearch_search",
+        {"query": "missing field"},
+        counts,
+    )
+
+    assert duckduckgo_instruction is not None
+    assert "provider=duckduckgo" in duckduckgo_instruction
 
 
 def test_rotating_ifind_queries_hit_a_total_run_budget() -> None:

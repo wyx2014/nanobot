@@ -23,6 +23,15 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.graph.workflows.asset_research import (
+    AUDIT,
+    DELIVERED,
+    MEMBERS,
+    PREPARATION,
+    SYNTHESIS,
+    advance_asset_research_graph,
+    new_asset_research_state,
+)
 from nanobot.security.project_context import PROJECT_CONTEXT_METADATA_KEY
 from nanobot.security.workspace_access import (
     WORKSPACE_SCOPE_METADATA_KEY,
@@ -36,9 +45,11 @@ from nanobot.utils.media_decode import (
 )
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
 from nanobot.webui.expert_teams import (
+    EXPERT_TEAM_RESUME_KEY,
     EXPERT_TEAM_SESSION_KEY,
     ExpertTeamError,
     expert_team_mcp_attachments,
+    expert_team_resume_requested,
     normalize_expert_team_binding,
     public_expert_team_binding,
 )
@@ -533,6 +544,8 @@ class WebSocketChannel(BaseChannel):
         team_id: str,
         team_name: str,
         members: list[dict[str, Any]],
+        resume_state: dict[str, Any] | None = None,
+        supplemental_artifacts: list[str] | None = None,
     ) -> None:
         staged_members = [member for member in members if member.get("phase")]
         first_phase = staged_members[0].get("phase") if staged_members else None
@@ -548,7 +561,8 @@ class WebSocketChannel(BaseChannel):
             if not member_id:
                 continue
             running = (
-                not has_data_package
+                resume_state is None
+                and not has_data_package
                 and (first_phase is None or member.get("phase") == first_phase)
             )
             normalized_members.append({
@@ -564,17 +578,52 @@ class WebSocketChannel(BaseChannel):
                     or "团队已启动，正在分配研究任务"
                 ),
             })
+        graph_state = (
+            new_asset_research_state(
+                run_id=run_id,
+                member_ids=[
+                    str(member.get("id") or "")
+                    for member in normalized_members
+                    if str(member.get("id") or "").strip()
+                ],
+                resume_from=resume_state,
+                supplemental_artifacts=supplemental_artifacts or [],
+            )
+            if has_data_package
+            else None
+        )
+        if graph_state is not None and resume_state is not None:
+            prior_members = graph_state.get("members")
+            if isinstance(prior_members, dict):
+                for member in normalized_members:
+                    prior = prior_members.get(member["id"])
+                    member["status"] = "completed"
+                    member["member_status"] = str(
+                        prior.get("status") if isinstance(prior, dict) else "completed"
+                    )
+                    member["activity"] = "复用上次角色产物，等待 Team Lead 重新交叉质证"
+                    if isinstance(prior, dict) and prior.get("artifact"):
+                        member["artifact"] = str(prior["artifact"])
+        initial_stage = (
+            str(graph_state.get("node"))
+            if isinstance(graph_state, dict)
+            else "members"
+        )
         self._team_runs[(chat_id, run_id)] = {
             "team_id": team_id,
             "team_name": team_name,
             "members": normalized_members,
             "has_data_package": has_data_package,
+            "graph_state": graph_state,
+            "graph_event": "resume_started" if resume_state is not None else "run_started",
             "revision": 0,
             "turn_id": self.gateway.state.active_turn_id(f"websocket:{chat_id}"),
-            "stage": "preparation" if has_data_package else "members",
+            "stage": initial_stage,
             "status": "running",
             "note": (
-                "Team Lead 正在建立公司基础数据包，完成后启动四位专家"
+                "已读取上次角色产物和本轮补充资料，主笔正在重新交叉质证与汇总"
+                if resume_state is not None
+                else "Team Lead 正在建立公司基础数据包，完成后启动四位专家"
                 if has_data_package
                 else (
                     f"{len(normalized_members)} 位专家将分阶段协作，"
@@ -726,6 +775,14 @@ class WebSocketChannel(BaseChannel):
                 "team_name": str(run.get("team_name") or "专家团队"),
                 "team_id": str(run.get("team_id") or ""),
                 "team_run_id": run_id,
+                **(
+                    {
+                        "graph_state": run["graph_state"],
+                        "graph_event": str(run.get("graph_event") or "progress"),
+                    }
+                    if isinstance(run.get("graph_state"), dict)
+                    else {}
+                ),
             },
         }
         if turn_id:
@@ -813,7 +870,17 @@ class WebSocketChannel(BaseChannel):
             for name in successful_names
         )
         if stage == "synthesis" and delivery_activity:
-            run["stage"] = "audit"
+            graph_state = run.get("graph_state")
+            if isinstance(graph_state, dict):
+                graph_state = advance_asset_research_graph(
+                    graph_state,
+                    "report_written",
+                )
+                run["graph_state"] = graph_state
+                run["graph_event"] = "report_written"
+                run["stage"] = str(graph_state.get("node") or AUDIT)
+            else:
+                run["stage"] = "audit"
             run["note"] = "主笔汇总已完成，正在进行报告审校与交付"
             self._persist_team_run_projection(
                 chat_id,
@@ -1381,6 +1448,33 @@ class WebSocketChannel(BaseChannel):
             is_team_run = expert_team is not None and not content.strip().startswith("/")
             if expert_team is not None:
                 metadata[EXPERT_TEAM_SESSION_KEY] = expert_team
+            resume_state: dict[str, Any] | None = None
+            resume_artifacts: list[str] = []
+            if (
+                is_team_run
+                and expert_team.get("id") == "asset-research-team"
+                and expert_team_resume_requested(
+                    content,
+                    has_media=bool(media_paths),
+                )
+            ):
+                prior_run = self.gateway.state.latest_expert_team_resume(
+                    session_key=f"websocket:{cid}",
+                    team_id="asset-research-team",
+                )
+                if prior_run is not None:
+                    candidate_state = prior_run.get("graph_state")
+                    if isinstance(candidate_state, dict):
+                        resume_state = candidate_state
+                    resume_artifacts = [
+                        str(item)
+                        for item in prior_run.get("artifacts", [])
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    metadata[EXPERT_TEAM_RESUME_KEY] = {
+                        "run_id": str(prior_run.get("run_id") or ""),
+                        "artifacts": resume_artifacts,
+                    }
             if is_team_run:
                 metadata["expert_team_run_id"] = uuid.uuid4().hex[:12]
             if interactive_prompt_answer:
@@ -1425,6 +1519,7 @@ class WebSocketChannel(BaseChannel):
                     media_paths=media_paths or None,
                     cli_apps=cli_apps or None,
                     mcp_presets=mcp_presets or None,
+                    skill_scope=skill_scope or None,
                 )
             if is_team_run:
                 run_id = metadata["expert_team_run_id"]
@@ -1437,6 +1532,11 @@ class WebSocketChannel(BaseChannel):
                     team_id=team_id,
                     team_name=team_name,
                     members=members,
+                    resume_state=resume_state,
+                    supplemental_artifacts=[
+                        *resume_artifacts,
+                        *(media_paths or []),
+                    ] if resume_state is not None else None,
                 )
                 await self._send_event(
                     connection,
@@ -2674,7 +2774,45 @@ class WebSocketChannel(BaseChannel):
             if status in {"completed", "completed_with_warnings", "failed", "cancelled"}
             else "failed"
         )
+        graph_state = run.get("graph_state")
         run["completed"] = public_status in {"completed", "completed_with_warnings"}
+        if run["completed"] and isinstance(graph_state, dict):
+            # A durable terminal turn must settle every graph node. Usually the
+            # write_file event already moved synthesis -> audit; these guarded
+            # transitions also cover renderer/tool payloads that didn't expose
+            # a detailed activity event.
+            if graph_state.get("node") == PREPARATION:
+                graph_state = advance_asset_research_graph(
+                    graph_state,
+                    "data_package_ready",
+                )
+            if graph_state.get("node") == MEMBERS:
+                for member_id, member_state in list(
+                    dict(graph_state.get("members") or {}).items()
+                ):
+                    if str(member_state.get("status") or "") not in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                    }:
+                        graph_state = advance_asset_research_graph(
+                            graph_state,
+                            "member_updated",
+                            {"id": member_id, "status": "failed"},
+                        )
+            if graph_state.get("node") == SYNTHESIS:
+                graph_state = advance_asset_research_graph(
+                    graph_state,
+                    "report_written",
+                )
+            if graph_state.get("node") == AUDIT:
+                graph_state = advance_asset_research_graph(
+                    graph_state,
+                    "audit_completed",
+                )
+            run["graph_state"] = graph_state
+            run["graph_event"] = "audit_completed"
+            public_status = str(graph_state.get("status") or public_status)
         run["status"] = (
             "completed"
             if run["completed"]
@@ -2682,8 +2820,11 @@ class WebSocketChannel(BaseChannel):
             if public_status == "cancelled"
             else "failed"
         )
-        run["stage"] = "delivered" if run["completed"] else str(
-            run.get("stage") or "members"
+        run["stage"] = (
+            str(graph_state.get("node") or DELIVERED)
+            if run["completed"] and isinstance(graph_state, dict)
+            else "delivered" if run["completed"]
+            else str(run.get("stage") or "members")
         )
         run["note"] = (
             "研究与报告已完成"
@@ -2773,6 +2914,9 @@ class WebSocketChannel(BaseChannel):
                 activity = str(member.get("activity") or "").strip()
                 if activity:
                     projected_member["activity"] = activity
+                artifact = str(member.get("artifact") or "").strip()
+                if artifact:
+                    projected_member["artifact"] = artifact
                 # Running members can spend minutes in the same lifecycle
                 # state while moving through several visible research actions.
                 # Persist a distinct activity as a new workflow revision so
@@ -2782,8 +2926,10 @@ class WebSocketChannel(BaseChannel):
                     incoming_status != previous_status
                     or bool(activity and activity != previous_activity)
                 )
+            graph_state = run.get("graph_state")
             if (
-                str(run.get("stage") or "members") == "preparation"
+                isinstance(graph_state, dict)
+                and graph_state.get("node") == PREPARATION
                 and str(member.get("status") or "") in {
                     "running",
                     "completed",
@@ -2791,9 +2937,26 @@ class WebSocketChannel(BaseChannel):
                     "cancelled",
                 }
             ):
-                run["stage"] = "members"
+                graph_state = advance_asset_research_graph(
+                    graph_state,
+                    "data_package_ready",
+                )
                 run["note"] = "基础数据包已建立，四位专家正在并行研究"
                 persist_projection = True
+            if isinstance(graph_state, dict) and graph_state.get("node") == MEMBERS:
+                graph_state = advance_asset_research_graph(
+                    graph_state,
+                    "member_updated",
+                    {
+                        "id": str(member.get("id") or ""),
+                        "status": str(member.get("status") or "running"),
+                        "activity": str(member.get("activity") or ""),
+                        "artifact": str(member.get("artifact") or ""),
+                    },
+                )
+                run["graph_state"] = graph_state
+                run["graph_event"] = "member_updated"
+                run["stage"] = str(graph_state.get("node") or MEMBERS)
             all_members_terminal = bool(run.get("members")) and all(
                 isinstance(item, dict)
                 and str(item.get("member_status") or "")
@@ -2805,6 +2968,12 @@ class WebSocketChannel(BaseChannel):
                 and str(run.get("stage") or "members") == "members"
             ):
                 run["stage"] = "synthesis"
+                run["note"] = "专家研究已全部交付，主笔正在交叉质证与汇总"
+                persist_projection = True
+            elif (
+                isinstance(graph_state, dict)
+                and graph_state.get("node") == SYNTHESIS
+            ):
                 run["note"] = "专家研究已全部交付，主笔正在交叉质证与汇总"
                 persist_projection = True
         if persist_projection:
@@ -2835,6 +3004,7 @@ class WebSocketChannel(BaseChannel):
                 "status": member.get("status"),
                 "task_id": member.get("task_id"),
                 "activity": member.get("activity"),
+                "artifact": member.get("artifact"),
             },
         }, ensure_ascii=False)
         for connection in conns:

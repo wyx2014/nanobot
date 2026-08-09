@@ -65,7 +65,6 @@ class ChannelManager:
         webui_static_dist: bool = True,
         webui_runtime_surface: str = "browser",
         webui_runtime_capabilities: dict[str, Any] | None = None,
-        webui_project_memory_pipeline: Any | None = None,
         webui_thread_runtime_registry: Any | None = None,
     ):
         self.config = config
@@ -79,7 +78,6 @@ class ChannelManager:
         self._webui_static_dist = webui_static_dist
         self._webui_runtime_surface = webui_runtime_surface
         self._webui_runtime_capabilities = dict(webui_runtime_capabilities or {})
-        self._webui_project_memory_pipeline = webui_project_memory_pipeline
         self._webui_thread_runtime_registry = webui_thread_runtime_registry
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
@@ -140,7 +138,6 @@ class ChannelManager:
                         runtime_capabilities_overrides=self._webui_runtime_capabilities,
                         cron_service=self._cron_service,
                         cron_pending_job_ids=self._webui_cron_pending_job_ids,
-                        project_memory_pipeline=self._webui_project_memory_pipeline,
                         thread_runtime_registry=self._webui_thread_runtime_registry,
                         logger=logger,
                     )

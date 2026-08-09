@@ -56,7 +56,6 @@ def build_gateway_services(
     disabled_skills: set[str] | None = None,
     cron_service: Any | None = None,
     cron_pending_job_ids: Callable[[str], set[str]] | None = None,
-    project_memory_pipeline: Any | None = None,
     thread_runtime_registry: Any | None = None,
     logger: Any = default_logger,
 ) -> GatewayServices:
@@ -137,7 +136,6 @@ def build_gateway_services(
         disabled_skills=disabled_skills,
         cron_service=cron_service,
         cron_pending_job_ids=cron_pending_job_ids,
-        project_memory_pipeline=project_memory_pipeline,
         thread_runtime_registry=thread_runtime_registry,
         log=logger,
     )

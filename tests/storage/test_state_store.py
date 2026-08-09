@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.graph.workflows.asset_research import (
+    advance_asset_research_graph,
+    new_asset_research_state,
+)
 from nanobot.storage.state import (
     EventProjectionError,
     SessionProjectMismatch,
@@ -44,6 +48,7 @@ def test_schema_initializes_with_wal_and_core_relations(tmp_path: Path) -> None:
             "turn_progress",
             "turn_steps",
             "expert_team_runs",
+            "expert_team_checkpoints",
             "artifacts",
             "artifact_links",
             "project_memories",
@@ -58,7 +63,7 @@ def test_schema_initializes_with_wal_and_core_relations(tmp_path: Path) -> None:
             "projected_events",
         } <= tables
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
 
 
 def test_project_and_session_ids_are_stable_and_session_project_is_immutable(
@@ -562,6 +567,119 @@ def test_workflow_plan_allows_parallel_members_and_terminal_revision(tmp_path: P
     assert second["active_step_ids"] == ["team-lead"]
 
 
+def test_expert_team_graph_checkpoint_can_resume_from_same_session_artifacts(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    project_path = tmp_path / "project-resume"
+    project_path.mkdir()
+    project = store.ensure_project(project_path)
+    session = store.bind_session("websocket:resume", project.id)
+    common = {
+        "schema_version": 3,
+        "project_id": project.id,
+        "session_id": session.id,
+        "recorded_at": 1_000,
+        "chat_id": "resume",
+        "turn_id": "turn-resume",
+    }
+    assert store.project_event(session.session_key, {
+        **common,
+        "event": "user",
+        "event_id": "resume-user",
+        "event_seq": 1,
+        "text": "research",
+    })
+
+    member_ids = (
+        "business-analyst",
+        "financial-analyst",
+        "industry-researcher",
+        "risk-assessor",
+    )
+    graph = new_asset_research_state(run_id="run-resume", member_ids=member_ids)
+    graph = advance_asset_research_graph(graph, "data_package_ready")
+    for member_id in member_ids:
+        relative = f"reports/.team-runs/run-resume/members/{member_id}.md"
+        path = project_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {member_id}\n", encoding="utf-8")
+        store.register_artifact(
+            session.session_key,
+            path,
+            relation_type="intermediate",
+            artifact_kind="document",
+            mime_type="text/markdown",
+            turn_id="turn-resume",
+        )
+        graph = advance_asset_research_graph(
+            graph,
+            "member_updated",
+            {
+                "id": member_id,
+                "status": "failed" if member_id == "risk-assessor" else "completed",
+                "artifact": relative,
+            },
+        )
+    graph = advance_asset_research_graph(
+        graph,
+        "report_written",
+        {"artifact": "reports/resume-report.html"},
+    )
+    graph = advance_asset_research_graph(graph, "audit_completed")
+
+    assert store.project_event(session.session_key, {
+        **common,
+        "event": "message",
+        "event_id": "resume-workflow",
+        "event_seq": 2,
+        "kind": "progress",
+        "agent_ui": {
+            "kind": "task_progress",
+            "plan_kind": "workflow",
+            "execution": "staged",
+            "revision": graph["checkpoint_revision"],
+            "team_id": "asset-research-team",
+            "team_run_id": "run-resume",
+            "stage_key": graph["node"],
+            "graph_event": "audit_completed",
+            "graph_state": graph,
+            "steps": [
+                {"id": "data-package", "title": "Data", "status": "completed"},
+                *[
+                    {"id": item, "title": item, "status": "completed"}
+                    for item in member_ids
+                ],
+                {"id": "team-lead", "title": "Lead", "status": "completed"},
+                {"id": "report-audit", "title": "Audit", "status": "completed"},
+            ],
+        },
+    })
+
+    resume = store.latest_expert_team_resume(
+        session_key=session.session_key,
+        team_id="asset-research-team",
+    )
+    assert resume is not None
+    assert resume["run_id"] == "run-resume"
+    assert resume["graph_state"]["degraded"] is True
+    assert any(path.endswith("risk-assessor.md") for path in resume["artifacts"])
+    other_session = store.bind_session("websocket:other", project.id)
+    assert store.latest_expert_team_resume(
+        session_key=other_session.session_key,
+        team_id="asset-research-team",
+    ) is None
+    with sqlite3.connect(store.path) as connection:
+        checkpoint = connection.execute(
+            "SELECT node_key, event_type, revision FROM expert_team_checkpoints"
+        ).fetchone()
+    assert checkpoint == (
+        "delivered",
+        "audit_completed",
+        graph["checkpoint_revision"],
+    )
+
+
 def test_v2_lifecycle_projection_has_one_stable_terminal(tmp_path: Path) -> None:
     store = _store(tmp_path)
     project_path = tmp_path / "project-v2"
@@ -742,7 +860,7 @@ def test_artifact_staging_reaches_ready_or_failed_terminal_state(
     }
 
 
-def test_project_archive_restore_relocate_export_and_memory(
+def test_project_archive_restore_relocate_export_excludes_legacy_memory(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -765,7 +883,7 @@ def test_project_archive_restore_relocate_export_and_memory(
     manifest = store.project_export_manifest(project.id)
     assert manifest["project"]["id"] == project.id
     assert manifest["sessions"][0]["id"] == session.id
-    assert manifest["memories"][0]["content"] == "Only visible in Example"
+    assert "memories" not in manifest
 
     archived = store.archive_project(project.id)
     assert archived.status == "archived"

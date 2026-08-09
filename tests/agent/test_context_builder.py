@@ -358,48 +358,6 @@ class TestBuildSystemPrompt:
         assert "Inbox-only customer secret" not in result
         assert "Prior Inbox-only discussion" not in result
 
-    def test_project_memory_is_managed_and_isolated_by_project_id(self, tmp_path):
-        builder = _builder(tmp_path)
-        from nanobot.storage.state import StateStore
-
-        state = StateStore(
-            tmp_path / ".nanobot" / "state.sqlite",
-            default_workspace=tmp_path,
-        )
-        project_a = tmp_path / "customer-a"
-        project_b = tmp_path / "customer-b"
-        project_a.mkdir()
-        project_b.mkdir()
-        project_a_id = state.ensure_project(project_a).id
-        project_b_id = state.ensure_project(project_b).id
-        memory_a = builder.memory_for_project(project_a_id, project_a)
-        memory_b = builder.memory_for_project(project_b_id, project_b)
-        assert memory_a is not None
-        assert memory_b is not None
-        memory_a.write_memory("Customer A private decision")
-        memory_b.write_memory("Customer B private decision")
-
-        prompt_a = builder.build_system_prompt(
-            workspace=project_a,
-            project_id=project_a_id,
-        )
-        prompt_b = builder.build_system_prompt(
-            workspace=project_b,
-            project_id=project_b_id,
-        )
-
-        assert "Customer A private decision" in prompt_a
-        assert "Customer B private decision" not in prompt_a
-        assert "Customer B private decision" in prompt_b
-        assert "Customer A private decision" not in prompt_b
-        assert str(memory_a.workspace).startswith(
-            str(tmp_path / ".nanobot" / "project-memory" / project_a_id)
-        )
-        assert state.list_project_memories(project_a_id)[0]["content"] == (
-            "Customer A private decision"
-        )
-
-
 # ---------------------------------------------------------------------------
 # build_messages
 # ---------------------------------------------------------------------------
@@ -421,7 +379,7 @@ class TestBuildMessages:
         assert "[Runtime Context" in user_msg
         assert "hello" in user_msg
 
-    def test_relevant_project_memory_is_progressively_loaded_with_provenance(self, tmp_path):
+    def test_project_memory_is_not_loaded_but_project_documents_still_are(self, tmp_path):
         from nanobot.storage.state import StateStore
 
         builder = _builder(tmp_path)
@@ -449,6 +407,11 @@ class TestBuildMessages:
             content="Customer B private release process.",
             memory_key="release",
         )
+        state.replace_project_document(
+            project_id,
+            relative_path="docs/release.txt",
+            chunks=["release verification uses the current project document"],
+        )
 
         messages = builder.build_messages(
             [],
@@ -458,10 +421,12 @@ class TestBuildMessages:
         )
         system = str(messages[0]["content"])
 
-        assert "# Relevant Project Memory" in system
-        assert "[memory:mem_" in system
-        assert "Run the release smoke test before packaging." in system
+        assert "# Relevant Project Memory" not in system
+        assert "[memory:mem_" not in system
+        assert "Run the release smoke test before packaging." not in system
         assert "Customer B private release process." not in system
+        assert "# Project Documents" in system
+        assert "release verification uses the current project document" in system
 
     def test_skill_scope_filters_workspace_skills_in_system_prompt(self, tmp_path):
         ws_skills = tmp_path / "skills"
@@ -679,6 +644,26 @@ class TestBuildMessages:
         history = [{"role": "assistant", "content": "previous response"}]
         messages = builder.build_messages(history, "new message")
         assert len(messages) == 3  # system + assistant + user
+        assert "Same-session Conversation Continuity" in messages[0]["content"]
+        assert "preceded by 1 replayed message" in messages[0]["content"]
+        assert "Never claim that the current request is the first message" in messages[0]["content"]
+
+    def test_empty_history_does_not_add_continuity_contract(self, tmp_path):
+        builder = _builder(tmp_path)
+        messages = builder.build_messages([], "first message")
+
+        assert "Same-session Conversation Continuity" not in messages[0]["content"]
+
+    def test_project_session_does_not_inject_global_memory(self, tmp_path):
+        builder = _builder(tmp_path)
+        builder.memory.write_memory("unrelated global stock memory")
+
+        prompt = builder.build_system_prompt(
+            workspace=tmp_path,
+            project_id="prj_current",
+        )
+
+        assert "unrelated global stock memory" not in prompt
 
     def test_media_with_history(self, tmp_path):
         png = tmp_path / "img.png"

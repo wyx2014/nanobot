@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
-STATE_SCHEMA_VERSION = 7
+STATE_SCHEMA_VERSION = 8
 _ID_NAMESPACE = uuid.UUID("8b77d594-7dc0-4f27-b76c-7b96e80743c9")
 _ARTIFACT_RELATIONS = {
     "generated",
@@ -312,12 +312,36 @@ CREATE TABLE IF NOT EXISTS expert_team_runs (
     updated_at            INTEGER NOT NULL,
     terminalized_at       INTEGER,
     terminalization_reason TEXT,
+    graph_state_json      TEXT NOT NULL DEFAULT '{}',
+    checkpoint_revision   INTEGER NOT NULL DEFAULT 0,
     UNIQUE(turn_id, team_id),
     FOREIGN KEY(session_id, project_id)
         REFERENCES sessions(id, project_id),
     FOREIGN KEY(turn_id, project_id)
         REFERENCES turns(id, project_id)
 );
+
+CREATE TABLE IF NOT EXISTS expert_team_checkpoints (
+    id                    TEXT PRIMARY KEY,
+    project_id            TEXT NOT NULL,
+    session_id            TEXT NOT NULL,
+    turn_id               TEXT NOT NULL,
+    run_id                TEXT NOT NULL,
+    revision              INTEGER NOT NULL,
+    node_key              TEXT NOT NULL,
+    event_type            TEXT NOT NULL,
+    state_json            TEXT NOT NULL,
+    created_at            INTEGER NOT NULL,
+    UNIQUE(run_id, revision),
+    FOREIGN KEY(session_id, project_id)
+        REFERENCES sessions(id, project_id),
+    FOREIGN KEY(turn_id, project_id)
+        REFERENCES turns(id, project_id),
+    FOREIGN KEY(run_id) REFERENCES expert_team_runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS expert_team_checkpoints_run
+ON expert_team_checkpoints(run_id, revision DESC);
 
 CREATE TABLE IF NOT EXISTS artifacts (
     id                      TEXT PRIMARY KEY,
@@ -818,6 +842,18 @@ class StateStore:
             self._ensure_column(connection, "turn_steps", "step_kind", "TEXT")
             self._ensure_column(connection, "turn_steps", "stage_key", "TEXT")
             self._ensure_column(connection, "turn_steps", "warning", "TEXT")
+            self._ensure_column(
+                connection,
+                "expert_team_runs",
+                "graph_state_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            self._ensure_column(
+                connection,
+                "expert_team_runs",
+                "checkpoint_revision",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             self._ensure_column(
                 connection,
                 "sessions",
@@ -1325,16 +1361,6 @@ class StateStore:
                 """,
                 (project_id,),
             ).fetchall()
-            memories = connection.execute(
-                """
-                SELECT id, kind, content, source_session_id, source_turn_id,
-                       confidence, created_at, updated_at
-                FROM project_memories
-                WHERE project_id = ?
-                ORDER BY created_at, id
-                """,
-                (project_id,),
-            ).fetchall()
         return {
             "schema_version": STATE_SCHEMA_VERSION,
             "exported_at": _now_ms(),
@@ -1378,7 +1404,6 @@ class StateStore:
                 }
                 for row in artifacts
             ],
-            "memories": [dict(row) for row in memories],
         }
 
     def upsert_project_memory(
@@ -3347,21 +3372,42 @@ class StateStore:
         team_id = _optional_text(agent_ui.get("team_id"))
         if plan_kind == "workflow" and team_run_id and team_id:
             stage_key = _optional_text(agent_ui.get("stage_key"))
+            graph_state = (
+                agent_ui.get("graph_state")
+                if isinstance(agent_ui.get("graph_state"), dict)
+                else None
+            )
+            graph_revision = (
+                _coerce_nonnegative_int(graph_state.get("checkpoint_revision"))
+                if graph_state is not None
+                else 0
+            )
+            graph_state_json = _safe_json(graph_state) if graph_state is not None else "{}"
             connection.execute(
                 """
                 INSERT INTO expert_team_runs(
                     id, project_id, session_id, turn_id, team_id, plan_id,
                     status, current_stage_key, warning_count,
                     created_at, updated_at, terminalized_at,
-                    terminalization_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    terminalization_reason, graph_state_json,
+                    checkpoint_revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     status = excluded.status,
                     current_stage_key = excluded.current_stage_key,
                     warning_count = excluded.warning_count,
                     updated_at = excluded.updated_at,
                     terminalized_at = excluded.terminalized_at,
-                    terminalization_reason = excluded.terminalization_reason
+                    terminalization_reason = excluded.terminalization_reason,
+                    graph_state_json = CASE
+                        WHEN excluded.graph_state_json = '{}'
+                        THEN expert_team_runs.graph_state_json
+                        ELSE excluded.graph_state_json
+                    END,
+                    checkpoint_revision = MAX(
+                        expert_team_runs.checkpoint_revision,
+                        excluded.checkpoint_revision
+                    )
                 """,
                 (
                     team_run_id,
@@ -3381,8 +3427,36 @@ class StateStore:
                         if overall in {"completed", "failed", "cancelled"}
                         else None
                     ),
+                    graph_state_json,
+                    graph_revision,
                 ),
             )
+            if graph_state is not None:
+                checkpoint_revision = max(graph_revision, revision)
+                checkpoint_id = _stable_id(
+                    "teamcp",
+                    f"{team_run_id}:{checkpoint_revision}",
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO expert_team_checkpoints(
+                        id, project_id, session_id, turn_id, run_id,
+                        revision, node_key, event_type, state_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checkpoint_id,
+                        session.project_id,
+                        session.id,
+                        turn_id,
+                        team_run_id,
+                        checkpoint_revision,
+                        str(graph_state.get("node") or stage_key or "unknown")[:128],
+                        str(agent_ui.get("graph_event") or "progress")[:128],
+                        graph_state_json,
+                        recorded_at,
+                    ),
+                )
 
     def reconcile_incomplete_runs(self, *, error_code: str = "GATEWAY_RESTARTED") -> int:
         """Close stale running projections during startup so clients never spin forever."""
@@ -3658,18 +3732,50 @@ class StateStore:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
                 f"""
+                WITH ranked_messages AS (
+                    SELECT
+                        source.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY CASE
+                                WHEN json_extract(
+                                    source.content_json,
+                                    '$.agent_ui.kind'
+                                ) = 'task_progress'
+                                THEN 'task-progress:' || COALESCE(
+                                    NULLIF(json_extract(
+                                        source.content_json,
+                                        '$.agent_ui.plan_id'
+                                    ), ''),
+                                    NULLIF(json_extract(
+                                        source.content_json,
+                                        '$.agent_ui.team_run_id'
+                                    ), ''),
+                                    NULLIF(json_extract(
+                                        source.content_json,
+                                        '$.agent_ui.turn_id'
+                                    ), ''),
+                                    NULLIF(source.turn_id, ''),
+                                    'message:' || source.id
+                                )
+                                ELSE 'message:' || source.id
+                            END
+                            ORDER BY source.sequence_no DESC
+                        ) AS display_rank
+                    FROM messages AS source
+                    WHERE source.project_id = ? AND source.session_id = ?
+                )
                 SELECT
                     pe.event_id,
                     pe.event_seq,
                     pe.event_type,
                     pe.recorded_at,
                     pe.payload_json
-                FROM messages AS m
+                FROM ranked_messages AS m
                 JOIN projected_events AS pe
                   ON pe.project_id = m.project_id
                  AND pe.session_id = m.session_id
                  AND pe.event_seq = m.sequence_no
-                WHERE m.project_id = ? AND m.session_id = ?
+                WHERE m.display_rank = 1
                 {before_clause}
                 ORDER BY m.sequence_no DESC
                 LIMIT ?
@@ -3767,6 +3873,75 @@ class StateStore:
                             merged.append(terminal_by_seq[seq])
                 events = merged
         return events
+
+    def session_turn_user_event_envelope(
+        self,
+        session_key: str,
+        *,
+        turn_id: str,
+        before_event_seq: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the durable user event that anchors one projected turn."""
+
+        session = self.get_session(session_key)
+        normalized_turn_id = str(turn_id or "").strip()
+        if session is None or not normalized_turn_id:
+            return None
+        before_clause = ""
+        params: list[Any] = [
+            session.project_id,
+            session.id,
+            normalized_turn_id,
+        ]
+        if before_event_seq is not None:
+            before_clause = "AND m.sequence_no < ?"
+            params.append(max(0, int(before_event_seq)))
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT
+                    pe.event_id,
+                    pe.event_seq,
+                    pe.event_type,
+                    pe.recorded_at,
+                    pe.payload_json
+                FROM messages AS m
+                JOIN projected_events AS pe
+                  ON pe.project_id = m.project_id
+                 AND pe.session_id = m.session_id
+                 AND pe.event_seq = m.sequence_no
+                WHERE m.project_id = ? AND m.session_id = ?
+                  AND m.turn_id = ? AND m.role = 'user'
+                {before_clause}
+                ORDER BY m.sequence_no ASC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        if row is None:
+            return None
+        payload: dict[str, Any] = {}
+        raw = row["payload_json"]
+        if raw:
+            try:
+                decoded = json.loads(str(raw))
+                if isinstance(decoded, dict):
+                    payload = decoded
+            except json.JSONDecodeError:
+                payload = {}
+        payload.update(
+            {
+                "schema_version": int(payload.get("schema_version") or 3),
+                "event_id": str(row["event_id"]),
+                "event_seq": int(row["event_seq"]),
+                "event": str(payload.get("event") or row["event_type"]),
+                "recorded_at": int(row["recorded_at"]),
+                "project_id": session.project_id,
+                "session_id": session.id,
+                "session_key": session.session_key,
+            }
+        )
+        return payload
 
     def session_artifact_revision(self, session_key: str) -> int:
         with self._lock, self._connection() as connection:
@@ -4454,6 +4629,102 @@ class StateStore:
             "runtime_epoch": (
                 str(row["runtime_epoch"]) if row["runtime_epoch"] else None
             ),
+        }
+
+    def latest_expert_team_resume(
+        self,
+        *,
+        session_key: str,
+        team_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the latest degraded graph checkpoint and its session artifacts.
+
+        Resume is deliberately session-scoped. A run from another project or
+        conversation can never become evidence for the current Team Lead.
+        """
+
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT r.id, r.turn_id, r.status, r.graph_state_json,
+                       r.updated_at, s.id AS session_id
+                FROM expert_team_runs AS r
+                JOIN sessions AS s
+                  ON s.id = r.session_id AND s.project_id = r.project_id
+                WHERE s.session_key = ?
+                  AND r.team_id = ?
+                  AND r.graph_state_json != '{}'
+                ORDER BY r.updated_at DESC
+                LIMIT 10
+                """,
+                (session_key, team_id),
+            ).fetchall()
+            selected = None
+            graph_state: dict[str, Any] | None = None
+            for row in rows:
+                try:
+                    parsed = json.loads(str(row["graph_state_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                members = parsed.get("members")
+                if (
+                    not isinstance(members, dict)
+                    or not members
+                    or any(
+                        not isinstance(member, dict) or not member.get("artifact")
+                        for member in members.values()
+                    )
+                ):
+                    # Resuming at synthesis is safe only after every parallel
+                    # branch has a durable result (successful or degraded).
+                    continue
+                if parsed.get("degraded") is True or str(row["status"]) in {
+                    "failed",
+                    "cancelled",
+                }:
+                    selected = row
+                    graph_state = parsed
+                    break
+            if selected is None or graph_state is None:
+                return None
+            artifact_rows = connection.execute(
+                """
+                SELECT DISTINCT a.relative_path
+                FROM artifacts AS a
+                JOIN artifact_links AS l
+                  ON l.artifact_id = a.id AND l.project_id = a.project_id
+                WHERE l.session_id = ?
+                  AND a.status = 'ready'
+                  AND (l.turn_id = ? OR a.created_by_turn_id = ?)
+                ORDER BY a.created_at
+                """,
+                (selected["session_id"], selected["turn_id"], selected["turn_id"]),
+            ).fetchall()
+
+        artifacts: list[str] = []
+        graph_members = graph_state.get("members")
+        for member in graph_members.values() if isinstance(graph_members, dict) else ():
+            if isinstance(member, dict) and member.get("artifact"):
+                artifacts.append(str(member["artifact"]))
+        graph_artifacts = graph_state.get("artifacts")
+        if isinstance(graph_artifacts, dict):
+            artifacts.extend(
+                str(value)
+                for value in graph_artifacts.values()
+                if str(value).strip()
+            )
+        artifacts.extend(str(row["relative_path"]) for row in artifact_rows)
+        graph_state = dict(graph_state)
+        graph_state["run_id"] = str(selected["id"])
+        return {
+            "run_id": str(selected["id"]),
+            "turn_id": str(selected["turn_id"]),
+            "status": str(selected["status"]),
+            "graph_state": graph_state,
+            "artifacts": list(dict.fromkeys(artifacts)),
+            "updated_at": int(selected["updated_at"]),
         }
 
     def latest_turn_snapshot(self, session_key: str) -> dict[str, Any] | None:

@@ -64,17 +64,11 @@ class MemoryStore:
         self,
         workspace: Path,
         max_history_entries: int = _DEFAULT_MAX_HISTORY,
-        *,
-        on_memory_write: Callable[[str], None] | None = None,
     ):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
-        self.memory_summary_file = self.memory_dir / "memory_summary.md"
-        self.raw_memories_file = self.memory_dir / "raw_memories.md"
-        self.rollout_summaries_dir = self.memory_dir / "rollout_summaries"
-        self.memory_skills_dir = self.memory_dir / "skills"
         self.history_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
@@ -85,7 +79,6 @@ class MemoryStore:
         self._malformed_entry_logged = False  # rate-limit bad history shape warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
-        self._on_memory_write = on_memory_write
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
         ])
@@ -230,56 +223,8 @@ class MemoryStore:
     def read_memory(self) -> str:
         return self.read_file(self.memory_file)
 
-    def write_memory(self, content: str, *, notify: bool = True) -> None:
+    def write_memory(self, content: str) -> None:
         self._write_text_atomic(self.memory_file, content)
-        if notify and self._on_memory_write is not None:
-            try:
-                self._on_memory_write(content)
-            except Exception:
-                logger.exception("Failed to update project memory projection")
-
-    def read_memory_summary(self) -> str:
-        return self.read_file(self.memory_summary_file)
-
-    def write_memory_summary(self, content: str) -> None:
-        self._write_text_atomic(self.memory_summary_file, content)
-
-    def write_raw_memories(self, content: str) -> None:
-        self._write_text_atomic(self.raw_memories_file, content)
-
-    def write_rollout_summary(self, slug: str, content: str) -> Path:
-        safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", slug).strip("-._")[:120]
-        if not safe_slug:
-            raise ValueError("rollout summary slug is empty")
-        self.rollout_summaries_dir.mkdir(parents=True, exist_ok=True)
-        path = self.rollout_summaries_dir / f"{safe_slug}.md"
-        self._write_text_atomic(path, content)
-        return path
-
-    def sync_rollout_summaries(self, summaries: dict[str, str]) -> None:
-        """Atomically refresh the selected project rollout summary projection."""
-        self.rollout_summaries_dir.mkdir(parents=True, exist_ok=True)
-        expected: set[Path] = set()
-        for slug, content in summaries.items():
-            expected.add(self.write_rollout_summary(slug, content))
-        for path in self.rollout_summaries_dir.glob("*.md"):
-            if path not in expected:
-                path.unlink(missing_ok=True)
-
-    def sync_memory_skills(self, skills: dict[str, str]) -> None:
-        """Refresh reusable, memory-derived project skill snippets."""
-        self.memory_skills_dir.mkdir(parents=True, exist_ok=True)
-        expected: set[Path] = set()
-        for slug, content in skills.items():
-            safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", slug).strip("-._")[:120]
-            if not safe_slug:
-                continue
-            path = self.memory_skills_dir / f"{safe_slug}.md"
-            self._write_text_atomic(path, content)
-            expected.add(path)
-        for path in self.memory_skills_dir.glob("*.md"):
-            if path not in expected:
-                path.unlink(missing_ok=True)
 
     @staticmethod
     def _write_text_atomic(path: Path, content: str) -> None:
@@ -318,7 +263,7 @@ class MemoryStore:
     # -- context injection (used by context.py) ------------------------------
 
     def get_memory_context(self) -> str:
-        long_term = self.read_memory_summary() or self.read_memory()
+        long_term = self.read_memory()
         long_term = truncate_text_to_tokens(long_term, 3_000)
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
@@ -742,7 +687,7 @@ class Consolidator:
 
     def __init__(
         self,
-        store: MemoryStore,
+        store: MemoryStore | None,
         provider: LLMProvider,
         model: str,
         sessions: SessionManager,
@@ -875,6 +820,8 @@ class Consolidator:
             replay_max_messages,
         )
         summary = await self.archive(chunk, session_key=session.key)
+        if summary is None and self.store is None:
+            return None
         session.last_consolidated = end_idx
         self.sessions.save(session)
         return summary
@@ -884,6 +831,7 @@ class Consolidator:
             session.metadata["_last_summary"] = {
                 "text": summary,
                 "last_active": session.updated_at.isoformat(),
+                "kind": "session" if self.store is None else "memory",
             }
             self.sessions.save(session)
 
@@ -954,10 +902,14 @@ class Consolidator:
             formatted = MemoryStore._format_messages(messages_to_summarize)
             formatted = self._truncate_to_token_budget(formatted)
             archive_contract = render_template(
-                "agent/consolidator_archive.md",
+                (
+                    "agent/session_consolidator_archive.md"
+                    if self.store is None
+                    else "agent/consolidator_archive.md"
+                ),
                 strip=True,
             )
-            if expert_team_derived:
+            if expert_team_derived and self.store is not None:
                 archive_contract += (
                     "\n\n## Expert-team memory boundary\n"
                     "This chunk was produced with an explicitly selected expert team. "
@@ -987,15 +939,19 @@ class Consolidator:
                 if expert_team_derived
                 else summary
             )
-            self.store.append_history(
-                history_summary,
-                max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
-                session_key=session_key,
-            )
+            if self.store is not None:
+                self.store.append_history(
+                    history_summary,
+                    max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
+                    session_key=session_key,
+                )
             return summary
         except Exception:
-            logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages, session_key=session_key)
+            if self.store is not None:
+                logger.warning("Consolidation LLM call failed, raw-dumping to history")
+                self.store.raw_archive(messages, session_key=session_key)
+            else:
+                logger.warning("Session-only consolidation LLM call failed")
             return None
 
     async def maybe_consolidate_by_tokens(
@@ -1079,10 +1035,13 @@ class Consolidator:
                     len(chunk),
                 )
                 summary = await self.archive(chunk, session_key=session.key)
-                # Advance the cursor either way: on success the chunk was
-                # summarized; on failure archive() already raw-archived it as
-                # a breadcrumb. Re-archiving the same chunk on the next call
-                # would just emit duplicate [RAW] entries.
+                if not summary and self.store is None:
+                    # A session-only compact has no durable archive fallback.
+                    # Keep the live messages intact if summarization failed.
+                    break
+                # Global-memory consolidation advances on a raw-archive
+                # fallback; session-only consolidation only advances after a
+                # durable summary has been stored in session metadata.
                 if summary:
                     last_summary = summary
                 session.last_consolidated = end_idx
@@ -1116,8 +1075,9 @@ class Consolidator:
 
         Used by AutoCompact so all session mutation goes through a single
         lock-protected path.  Returns the summary text on success, ``None``
-        if the LLM failed (raw_archive fallback), or ``""`` if there was
-        nothing to archive.
+        if the LLM failed, or ``""`` if there was nothing to archive. Global
+        memory uses a raw-archive fallback; session-only compaction leaves the
+        live session unchanged when summarization fails.
         """
         lock = self.get_lock(session_key)
         async with lock:
@@ -1158,10 +1118,16 @@ class Consolidator:
                     summary_messages=messages_to_summarize,
                 )
 
+            if messages_to_remove and summary is None and self.store is None:
+                session.updated_at = datetime.now()
+                self.sessions.save(session)
+                return None
+
             if summary and summary != "(nothing)":
                 session.metadata["_last_summary"] = {
                     "text": summary,
                     "last_active": last_active.isoformat(),
+                    "kind": "session" if self.store is None else "memory",
                 }
 
             session.messages = messages_to_keep

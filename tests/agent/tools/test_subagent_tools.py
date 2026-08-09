@@ -768,7 +768,7 @@ async def test_expert_team_run_enables_injection_overflow_while_members_are_acti
     pending_queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
     session = Session(
         key="websocket:expert-overflow",
-        metadata={"expert_team": {"id": "trading-analysis-team"}},
+        metadata={"expert_team": {"id": "test-expert-team"}},
     )
     captured_spec = None
 
@@ -863,7 +863,7 @@ async def test_expert_team_run_configures_final_delivery_guard(tmp_path):
         key="websocket:expert-completion",
         metadata={
             "expert_team": {
-                "id": "trading-analysis-team",
+                "id": "test-expert-team",
                 "completion": {
                     "required_tools": ["write_file", "create_docx", "create_pdf"],
                     "required_artifacts": ["html", "docx", "pdf"],

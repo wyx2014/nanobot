@@ -1264,7 +1264,6 @@ def _run_gateway(
         webui_static_dist=webui_static_dist,
         webui_runtime_surface=webui_runtime_surface,
         webui_runtime_capabilities=webui_runtime_capabilities,
-        webui_project_memory_pipeline=agent.project_memory,
         webui_thread_runtime_registry=getattr(agent, "thread_runtime_registry", None),
     )
     channel_map = getattr(channels, "channels", {})
