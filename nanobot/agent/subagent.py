@@ -55,6 +55,16 @@ class SubagentStatus:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class WorkflowSubagentResult:
+    """Terminal result returned directly to a runtime-owned graph."""
+
+    task_id: str
+    label: str
+    status: str
+    content: str
+
+
 class _SubagentHook(AgentHook):
     """Hook for subagent execution — logs tool calls and updates status."""
 
@@ -71,6 +81,8 @@ class _SubagentHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         for tool_call in context.tool_calls:
+            if tool_call.id in context.hidden_tool_call_ids:
+                continue
             args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
             logger.debug(
                 "Subagent [{}] executing: {} with arguments: {}",
@@ -97,7 +109,12 @@ class _SubagentHook(AgentHook):
             )
             if failure is not None:
                 name = str(failure.get("name") or "数据源")
-                await self._on_activity(f"{_friendly_tool_name(name)}未返回有效结果，正在换源重试")
+                if failure.get("detail") == "asset-research source priority blocked":
+                    await self._on_activity("已阻止低优先级公开检索，正在先查询结构化金融数据源")
+                else:
+                    await self._on_activity(
+                        f"{_friendly_tool_name(name)}未返回有效结果，正在换源重试"
+                    )
 
 
 def _friendly_tool_name(name: str) -> str:
@@ -220,6 +237,10 @@ class SubagentManager:
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+        self._workflow_task_ids: set[str] = set()
+        self._workflow_completion_futures: dict[
+            str, asyncio.Future[WorkflowSubagentResult]
+        ] = {}
 
     def _subagent_tools_config(self) -> ToolsConfig:
         """Build a ToolsConfig scoped for subagent use."""
@@ -266,6 +287,34 @@ class SubagentManager:
                         registry.register(tool)
         return registry
 
+    @staticmethod
+    def _workflow_member_tools(
+        registry: ToolRegistry,
+        expert_team: dict[str, Any] | None,
+    ) -> ToolRegistry:
+        """Limit fixed asset-workflow branches to bound MCP and web fallback tools."""
+
+        raw_presets = (
+            expert_team.get("mcp_presets")
+            if isinstance(expert_team, dict)
+            else None
+        )
+        prefixes = tuple(
+            f"mcp_{str(item.get('name') or '').strip().lower()}_"
+            for item in raw_presets or []
+            if isinstance(item, dict)
+            and item.get("configured") is True
+            and str(item.get("name") or "").strip()
+        )
+        scoped = ToolRegistry()
+        for name in registry.tool_names:
+            if name not in {"web_search", "web_fetch"} and not name.startswith(prefixes):
+                continue
+            tool = registry.get(name)
+            if tool is not None:
+                scoped.register(tool)
+        return scoped
+
     def set_provider(self, provider: LLMProvider, model: str) -> None:
         self.provider = provider
         self.model = model
@@ -283,6 +332,7 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
         expert_team: dict[str, Any] | None = None,
         expert_team_run_id: str | None = None,
+        _workflow_owned: bool = False,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         project_context = current_project_context()
@@ -346,6 +396,11 @@ class SubagentManager:
             started_at=time.monotonic(),
         )
         self._task_statuses[task_id] = status
+        if _workflow_owned:
+            self._workflow_task_ids.add(task_id)
+            self._workflow_completion_futures[task_id] = (
+                asyncio.get_running_loop().create_future()
+            )
 
         bg_task = asyncio.create_task(
             self._run_subagent(
@@ -366,6 +421,27 @@ class SubagentManager:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
         def _cleanup(_: asyncio.Task) -> None:
+            workflow_future = self._workflow_completion_futures.get(task_id)
+            if workflow_future is not None and not workflow_future.done():
+                if bg_task.cancelled():
+                    workflow_future.set_result(WorkflowSubagentResult(
+                        task_id=task_id,
+                        label=display_label,
+                        status="cancelled",
+                        content="The workflow member was cancelled before delivery.",
+                    ))
+                else:
+                    task_error = bg_task.exception()
+                    workflow_future.set_result(WorkflowSubagentResult(
+                        task_id=task_id,
+                        label=display_label,
+                        status="error",
+                        content=(
+                            f"Error: {task_error}"
+                            if task_error is not None
+                            else "The workflow member ended without a terminal result."
+                        ),
+                    ))
             if state_store is not None and child_session_key is not None:
                 child_status = (
                     "cancelled"
@@ -387,10 +463,13 @@ class SubagentManager:
                 ids.discard(task_id)
                 if not ids:
                     del self._session_tasks[session_key]
+            self._workflow_task_ids.discard(task_id)
 
         bg_task.add_done_callback(_cleanup)
 
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
+        if _workflow_owned:
+            return task_id
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
 
     async def _run_subagent(
@@ -445,7 +524,13 @@ class SubagentManager:
                 tools_config=cfg,
                 expert_team=expert_team,
             )
-            system_prompt = self._build_subagent_prompt(workspace=root)
+            workflow_owned = task_id in self._workflow_task_ids
+            if workflow_owned:
+                tools = self._workflow_member_tools(tools, expert_team)
+            system_prompt = self._build_subagent_prompt(
+                workspace=root,
+                include_skills=not workflow_owned,
+            )
             if expert_team is not None:
                 members = expert_team.get("members")
                 member = next(
@@ -456,10 +541,15 @@ class SubagentManager:
                     None,
                 ) if isinstance(members, list) else None
                 instructions = str(member.get("instructions") or "").strip() if isinstance(member, dict) else ""
+                source_prompt = self._build_expert_team_data_source_prompt(
+                    expert_team,
+                    label,
+                    include_skills=not workflow_owned,
+                )
                 system_prompt = (
                     f"{system_prompt}\n\n---\n\n"
                     f"{self._build_expert_team_member_contract(label, instructions)}\n\n"
-                    f"{self._build_expert_team_data_source_prompt(expert_team, label)}"
+                    f"{source_prompt}"
                 )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -512,6 +602,10 @@ class SubagentManager:
                     llm_timeout_s=llm_timeout,
                     agent_kind="subagent",
                     agent_label=label,
+                    enforce_finance_source_priority=(
+                        isinstance(expert_team, dict)
+                        and expert_team.get("id") == "asset-research-team"
+                    ),
                 )
                 result = (
                     await asyncio.wait_for(
@@ -703,8 +797,9 @@ class SubagentManager:
             timeout_result = (
                 "Error: this research member exceeded its runtime deadline and was stopped. "
                 "Treat the missing dimension as a degradable evidence gap. Use the Team Lead "
-                "data package, configured structured sources, and completed member reports to "
-                "fill it; do not restart the same failed lookup loop."
+                "data package, configured iFinD MCP, Juyuan MCP, and Caihui MCP sources, and "
+                "completed member reports to fill it; do not restart the same failed lookup "
+                "loop."
             )
             artifact = await self._persist_expert_team_member_artifact(
                 content=timeout_result,
@@ -797,6 +892,34 @@ class SubagentManager:
                 activity="该角色运行异常，等待 Team Lead 重试或补齐",
                 artifact=artifact,
             )
+
+    async def spawn_for_workflow(
+        self,
+        *,
+        task: str,
+        label: str,
+        origin_channel: str,
+        origin_chat_id: str,
+        session_key: str,
+        origin_message_id: str | None,
+        workspace_scope: WorkspaceScope,
+        expert_team: dict[str, Any],
+        expert_team_run_id: str,
+    ) -> str:
+        """Start one graph-owned member and return its opaque runtime id."""
+
+        return await self.spawn(
+            task=task,
+            label=label,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
+            session_key=session_key,
+            origin_message_id=origin_message_id,
+            workspace_scope=workspace_scope,
+            expert_team=expert_team,
+            expert_team_run_id=expert_team_run_id,
+            _workflow_owned=True,
+        )
 
     async def _retry_expert_team_member(
         self,
@@ -1011,6 +1134,21 @@ class SubagentManager:
         expert_team: bool = False,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
+        if task_id in self._workflow_task_ids:
+            future = self._workflow_completion_futures.get(task_id)
+            if future is not None and not future.done():
+                future.set_result(WorkflowSubagentResult(
+                    task_id=task_id,
+                    label=label,
+                    status=status,
+                    content=result,
+                ))
+            logger.debug(
+                "Subagent [{}] returned directly to its runtime-owned workflow",
+                task_id,
+            )
+            return
+
         status_text = "completed successfully" if status == "ok" else "failed"
 
         announce_content = render_template(
@@ -1049,6 +1187,38 @@ class SubagentManager:
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
+    async def wait_for_workflow_tasks(
+        self,
+        task_ids: list[str],
+    ) -> list[WorkflowSubagentResult]:
+        """Wait for graph-owned tasks without routing their results as new turns."""
+
+        futures = [
+            self._workflow_completion_futures[task_id]
+            for task_id in task_ids
+            if task_id in self._workflow_completion_futures
+        ]
+        tasks = [
+            self._running_tasks[task_id]
+            for task_id in task_ids
+            if task_id in self._running_tasks
+        ]
+        if len(futures) != len(task_ids):
+            missing = [
+                task_id for task_id in task_ids
+                if task_id not in self._workflow_completion_futures
+            ]
+            raise RuntimeError(
+                "workflow subagent completion handle missing: " + ", ".join(missing)
+            )
+        try:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            return list(await asyncio.gather(*futures))
+        finally:
+            for task_id in task_ids:
+                self._workflow_completion_futures.pop(task_id, None)
+
     def get_running_task_ids_by_session(self, session_key: str) -> set[str]:
         """Return unfinished task IDs so team result batching can ignore announcers winding down."""
         return {
@@ -1078,17 +1248,25 @@ class SubagentManager:
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
-    def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
+    def _build_subagent_prompt(
+        self,
+        workspace: Path | None = None,
+        *,
+        include_skills: bool = True,
+    ) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
-        from nanobot.agent.skills import SkillsLoader
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         root = workspace or self.workspace
-        skills_summary = SkillsLoader(
-            root,
-            disabled_skills=self.disabled_skills,
-        ).build_skills_summary()
+        skills_summary = ""
+        if include_skills:
+            from nanobot.agent.skills import SkillsLoader
+
+            skills_summary = SkillsLoader(
+                root,
+                disabled_skills=self.disabled_skills,
+            ).build_skills_summary()
         return render_template(
             "agent/subagent_system.md",
             time_ctx=time_ctx,
@@ -1100,56 +1278,68 @@ class SubagentManager:
         self,
         expert_team: dict[str, Any],
         label: str,
+        *,
+        include_skills: bool = True,
     ) -> str:
-        """Load required team data-source Skills from the canonical workspace."""
-        from nanobot.agent.skills import SkillsLoader
+        """Describe the exact sources bound to an expert-team member."""
 
         raw_sources = expert_team.get("data_sources")
-        if not isinstance(raw_sources, list) or not raw_sources:
-            return ""
-        loader = SkillsLoader(self.workspace, disabled_skills=self.disabled_skills)
-        entries = {
-            entry["name"]: entry
-            for entry in loader.list_skills(filter_unavailable=False)
-        }
-        sections: list[str] = [
-            "# Required Integrated Financial Data Sources",
-            "These data-source Skills are part of the expert team, not optional suggestions. "
-            "For A-share key numeric fields, query the configured iFinD, Juyuan, and Caihui "
-            "sources by field and cross-validate values, dates, units, and reporting scope "
-            "before broad web research.",
-        ]
-        for source in raw_sources:
-            if not isinstance(source, dict):
-                continue
-            skill_name = str(source.get("skill") or "").strip()
-            if not skill_name:
-                continue
-            source_name = str(source.get("name") or skill_name).strip()
-            assignments = source.get("assignments")
-            assignment = str(assignments.get(label) or "").strip() if isinstance(assignments, dict) else ""
-            entry = entries.get(skill_name)
-            available, reason = loader.get_skill_availability(skill_name)
-            if skill_name in self.disabled_skills:
-                available, reason = False, "Skill is disabled"
-            content = loader.load_skills_for_context([skill_name]) if available and entry else ""
-            if not content:
-                required = "required" if source.get("required") is True else "optional"
-                sections.append(
-                    f"## {source_name} ({required}, unavailable)\n\n"
-                    f"Reason: {reason or 'Skill is not installed in the nanobot workspace'}. "
-                    "Report this concrete data-source gap to the Team Lead and use authoritative filings as fallback."
+        sections: list[str] = []
+        if include_skills and isinstance(raw_sources, list) and raw_sources:
+            from nanobot.agent.skills import SkillsLoader
+
+            loader = SkillsLoader(self.workspace, disabled_skills=self.disabled_skills)
+            entries = {
+                entry["name"]: entry
+                for entry in loader.list_skills(filter_unavailable=False)
+            }
+            sections.extend([
+                "# Required Integrated Financial Data Sources",
+                "These data-source Skills are part of the expert team, not optional suggestions. "
+                "For A-share key numeric fields, query the configured iFinD, Juyuan, and Caihui "
+                "sources by field and cross-validate values, dates, units, and reporting scope "
+                "before broad web research.",
+            ])
+            for source in raw_sources:
+                if not isinstance(source, dict):
+                    continue
+                skill_name = str(source.get("skill") or "").strip()
+                if not skill_name:
+                    continue
+                source_name = str(source.get("name") or skill_name).strip()
+                assignments = source.get("assignments")
+                assignment = (
+                    str(assignments.get(label) or "").strip()
+                    if isinstance(assignments, dict)
+                    else ""
                 )
-                continue
-            skill_path = entry["path"]
-            sections.append(
-                f"## {source_name} (primary, active)\n\n"
-                f"Skill path: `{skill_path}`\n\n"
-                f"Your assigned use: {assignment or 'query the structured financial data needed by your role'}.\n\n"
-                "Run its commands from the Skill directory so its local configuration is resolved. "
-                "Do not print, copy, or expose credential/configuration contents.\n\n"
-                f"{content}"
-            )
+                entry = entries.get(skill_name)
+                available, reason = loader.get_skill_availability(skill_name)
+                if skill_name in self.disabled_skills:
+                    available, reason = False, "Skill is disabled"
+                content = (
+                    loader.load_skills_for_context([skill_name])
+                    if available and entry
+                    else ""
+                )
+                if not content:
+                    required = "required" if source.get("required") is True else "optional"
+                    sections.append(
+                        f"## {source_name} ({required}, unavailable)\n\n"
+                        f"Reason: {reason or 'Skill is not installed in the nanobot workspace'}. "
+                        "Report this concrete data-source gap to the Team Lead and use "
+                        "authoritative filings as fallback."
+                    )
+                    continue
+                skill_path = entry["path"]
+                sections.append(
+                    f"## {source_name} (primary, active)\n\n"
+                    f"Skill path: `{skill_path}`\n\n"
+                    f"Your assigned use: {assignment or 'query the structured financial data needed by your role'}.\n\n"
+                    "Run its commands from the Skill directory so its local configuration is "
+                    "resolved. Do not print, copy, or expose credential/configuration contents.\n\n"
+                    f"{content}"
+                )
         raw_presets = expert_team.get("mcp_presets")
         if isinstance(raw_presets, list):
             sections.append(

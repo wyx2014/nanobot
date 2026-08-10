@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from nanobot.providers.base import LLMResponse
 from nanobot.webui import expert_teams
 
 
@@ -10,6 +14,77 @@ def test_resume_detection_is_explicit_and_does_not_capture_new_research() -> Non
     assert expert_teams.expert_team_resume_requested("这是补充数据", has_media=True) is True
     assert expert_teams.expert_team_resume_requested("补充分析另一家公司") is False
     assert expert_teams.expert_team_resume_requested("帮我分析工商银行") is False
+
+
+@pytest.mark.asyncio
+async def test_model_router_treats_bare_stock_name_as_asset_research() -> None:
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content='{"action":"run","target":"比亚迪","reason":"specific listed company"}',
+        usage={"prompt_tokens": 120, "completion_tokens": 20},
+    ))
+    usage: list[dict[str, int]] = []
+
+    decision = await expert_teams.classify_expert_team_turn_with_model(
+        provider=provider,
+        model="test-model",
+        history=[],
+        user_message="比亚迪",
+        usage_callback=usage.append,
+    )
+
+    assert decision == {
+        "action": "run",
+        "reason": "specific listed company",
+        "target": "比亚迪",
+    }
+    assert usage == [{"prompt_tokens": 120, "completion_tokens": 20}]
+    request = provider.chat_with_retry.await_args.kwargs
+    assert request["model"] == "test-model"
+    assert request["max_tokens"] == 220
+    assert request["temperature"] == 0
+    assert request["reasoning_effort"] == "none"
+    assert "比亚迪" in request["messages"][0]["content"]
+    assert '"current_user_message": "比亚迪"' in request["messages"][1]["content"]
+
+
+def test_model_router_output_is_validated_before_team_start() -> None:
+    assert expert_teams.normalize_expert_team_model_decision({
+        "route": "normal_agent",
+        "reason": "weather question",
+        "target": "old stock from history",
+    }) == {
+        "action": "bypass",
+        "reason": "weather question",
+    }
+    assert expert_teams.normalize_expert_team_model_decision({
+        "action": "run",
+        "target": None,
+    }) == {
+        "action": "clarify",
+        "reason": "model_missing_single_stock_target",
+    }
+    assert expert_teams.normalize_expert_team_model_decision({
+        "action": "delete_files",
+        "target": "比亚迪",
+    }) is None
+
+
+def test_asset_team_fallback_never_guesses_semantic_intent() -> None:
+    assert expert_teams.fallback_expert_team_turn_decision(
+        {"id": "asset-research-team"},
+        "比亚迪",
+    ) == {
+        "action": "bypass",
+        "reason": "model_route_unavailable",
+    }
+    assert expert_teams.fallback_expert_team_turn_decision(
+        {"id": "legal-review-team"},
+        "review this contract",
+    ) == {
+        "action": "run",
+        "reason": "team_selected",
+    }
 
 
 def _write_team(root: Path) -> None:
@@ -117,6 +192,10 @@ def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> 
     assert "lead playbook instructions" in prompt
     assert prompt.rfind("never inspect .claude permissions") > prompt.rfind("inspect .claude/settings.local.json")
     assert "Do not perform Claude Code permission checks" in prompt
+    assert expert_teams.expert_team_system_prompt(
+        {"expert_team": binding},
+        turn_metadata={expert_teams.EXPERT_TEAM_TURN_SUPPRESSED_KEY: True},
+    ) == ""
 
     assert expert_teams.public_expert_team_binding(binding) == {
         "id": "asset-research-team",

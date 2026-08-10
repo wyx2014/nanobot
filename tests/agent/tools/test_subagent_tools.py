@@ -311,6 +311,94 @@ async def test_expert_team_member_uses_recoverable_tool_errors_and_runtime_contr
     mgr.runner.run.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_runtime_owned_asset_member_is_mcp_only_and_hides_legacy_skills(tmp_path):
+    from nanobot.agent.subagent import SubagentManager, SubagentStatus
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.bus.queue import MessageBus
+
+    skill_dir = tmp_path / "skills" / "ifind-finance-data"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: ifind-finance-data\ndescription: legacy finance skill\n---\n",
+        encoding="utf-8",
+    )
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    registry = ToolRegistry()
+    for name in (
+        "exec",
+        "read_file",
+        "list_dir",
+        "web_search",
+        "web_fetch",
+        "mcp_hexin-ifind-ds-stock-mcp_company",
+        "mcp_juyuan_financials",
+        "mcp_unbound_private_source",
+    ):
+        tool = MagicMock()
+        tool.name = name
+        registry.register(tool)
+    mgr._build_tools = MagicMock(return_value=registry)
+    mgr._announce_result = AsyncMock()
+    mgr._workflow_task_ids.add("workflow-member")
+
+    async def fake_run(spec):
+        assert set(spec.tools.tool_names) == {
+            "web_search",
+            "web_fetch",
+            "mcp_hexin-ifind-ds-stock-mcp_company",
+            "mcp_juyuan_financials",
+        }
+        system_prompt = spec.initial_messages[0]["content"]
+        assert "Team-bound MCP Financial Data Sources" in system_prompt
+        assert "mcp_hexin-ifind-ds-stock-mcp_" in system_prompt
+        assert "ifind-finance-data" not in system_prompt
+        assert "Required Integrated Financial Data Sources" not in system_prompt
+        return SimpleNamespace(
+            stop_reason="done",
+            final_content=_valid_team_report(),
+            error=None,
+            tool_events=[],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fake_run)
+    await mgr._run_subagent(
+        "workflow-member",
+        "research",
+        "business-analyst",
+        {"channel": "test", "chat_id": "c1", "session_key": "test:c1"},
+        SubagentStatus(
+            task_id="workflow-member",
+            label="business-analyst",
+            task_description="research",
+            started_at=time.monotonic(),
+        ),
+        expert_team={
+            "id": "asset-research-team",
+            "members": [],
+            "data_sources": [{
+                "id": "ifind-finance-data",
+                "skill": "ifind-finance-data",
+            }],
+            "mcp_presets": [
+                {"name": "hexin-ifind-ds-stock-mcp", "configured": True},
+                {"name": "juyuan", "configured": True},
+                {"name": "unbound", "configured": False},
+            ],
+        },
+        expert_team_run_id="run-1",
+    )
+
+    mgr.runner.run.assert_awaited_once()
+
+
 def test_expert_team_data_source_is_added_to_project_skill_scope(tmp_path):
     from nanobot.agent.loop import _project_skill_scope
 
@@ -798,7 +886,9 @@ async def test_expert_team_run_enables_injection_overflow_while_members_are_acti
 
     assert captured_spec is not None
     assert captured_spec.injection_overflow_predicate is not None
-    assert captured_spec.final_response_guard is None
+    # The generic runner retains its final-response guard for active-turn
+    # corrections. The fixed asset workflow bypasses this model-owned path.
+    assert captured_spec.final_response_guard is not None
     loop.subagents.get_running_count_by_session = MagicMock(return_value=1)
     assert captured_spec.injection_overflow_predicate() is True
     loop.subagents.get_running_count_by_session.return_value = 0

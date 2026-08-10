@@ -222,6 +222,91 @@ async def test_runner_plan_barrier_requires_retry_after_plan_in_same_response() 
 
 
 @pytest.mark.asyncio
+async def test_asset_research_runner_enforces_core_then_anysearch_then_web() -> None:
+    tools = ToolRegistry()
+    shared_events: list[str] = []
+    names = (
+        "mcp_hexin-ifind-ds-stock-mcp_quote",
+        "mcp_juyuan_AShareLiveQuote",
+        "mcp_caihui_mcp_company_financials",
+        "mcp_anysearch_search",
+        "web_search",
+    )
+    for name in names:
+        tools.register(_DelayTool(
+            name,
+            delay=0,
+            read_only=True,
+            shared_events=shared_events,
+        ))
+    spec = AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        enforce_finance_source_priority=True,
+    )
+    counts: dict[str, int] = {}
+    runner = AgentRunner(MagicMock())
+
+    results, events, fatal, _interactive = await runner._execute_tools(
+        spec,
+        [ToolCallRequest(id="web-first", name="web_search", arguments={})],
+        counts,
+        {},
+    )
+    assert shared_events == []
+    assert "source priority blocked" in results[0]
+    assert events[0]["detail"] == "asset-research source priority blocked"
+    assert fatal is None
+
+    await runner._execute_tools(
+        spec,
+        [
+            ToolCallRequest(id="ifind", name=names[0], arguments={}),
+            ToolCallRequest(id="juyuan", name=names[1], arguments={}),
+            ToolCallRequest(id="caihui", name=names[2], arguments={}),
+        ],
+        counts,
+        {},
+    )
+    assert shared_events == [
+        f"start:{names[0]}",
+        f"end:{names[0]}",
+        f"start:{names[1]}",
+        f"end:{names[1]}",
+        f"start:{names[2]}",
+        f"end:{names[2]}",
+    ]
+
+    results, events, _, _ = await runner._execute_tools(
+        spec,
+        [ToolCallRequest(id="web-before-anysearch", name="web_search", arguments={})],
+        counts,
+        {},
+    )
+    assert "mcp_anysearch_" in results[0]
+    assert events[0]["detail"] == "asset-research source priority blocked"
+
+    await runner._execute_tools(
+        spec,
+        [ToolCallRequest(id="anysearch", name=names[3], arguments={})],
+        counts,
+        {},
+    )
+    results, events, fatal, _ = await runner._execute_tools(
+        spec,
+        [ToolCallRequest(id="web-last", name="web_search", arguments={})],
+        counts,
+        {},
+    )
+    assert results == ["web_search"]
+    assert events[0]["status"] == "ok"
+    assert fatal is None
+
+
+@pytest.mark.asyncio
 async def test_runner_does_not_batch_exclusive_read_only_tools():
     tools = ToolRegistry()
     shared_events: list[str] = []

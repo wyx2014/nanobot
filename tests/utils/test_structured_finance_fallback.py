@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from nanobot.utils.runtime import (
+    available_structured_finance_sources,
     external_lookup_signature,
+    mark_structured_finance_source_attempted,
     mark_structured_finance_source_failed,
     repeated_external_lookup_error,
     structured_finance_result_failed,
     structured_finance_source,
+    structured_finance_source_priority_error,
 )
 
 
@@ -43,6 +46,65 @@ def test_structured_finance_source_detects_all_team_bound_mcp_sources() -> None:
         "mcp_anysearch_search",
         {"query": "工商银行 年报"},
     ) == "anysearch"
+
+
+def test_available_structured_finance_sources_uses_actual_toolset() -> None:
+    assert available_structured_finance_sources([
+        "web_search",
+        "mcp_anysearch_search",
+        "mcp_caihui_mcp_company_financials",
+        "mcp_juyuan_AShareLiveQuote",
+        "mcp_hexin-ifind-ds-stock-mcp_quote",
+    ]) == ("ifind", "juyuan", "caihui", "anysearch")
+
+
+def test_public_fallback_is_blocked_until_each_higher_priority_layer_ran() -> None:
+    counts: dict[str, int] = {}
+    available = ("ifind", "juyuan", "caihui", "anysearch")
+
+    blocked_anysearch = structured_finance_source_priority_error(
+        "mcp_anysearch_search",
+        {"query": "工商银行 年报"},
+        counts,
+        available,
+    )
+    blocked_web = structured_finance_source_priority_error(
+        "web_search",
+        {"query": "工商银行 年报", "provider": "duckduckgo"},
+        counts,
+        available,
+    )
+
+    assert blocked_anysearch is not None
+    assert "iFinD, Juyuan, Caihui" in blocked_anysearch
+    assert blocked_web is not None
+    assert "iFinD, Juyuan, Caihui" in blocked_web
+
+    for source in ("ifind", "juyuan", "caihui"):
+        mark_structured_finance_source_attempted(counts, source)
+
+    assert structured_finance_source_priority_error(
+        "mcp_anysearch_search",
+        {"query": "工商银行 年报"},
+        counts,
+        available,
+    ) is None
+    blocked_web = structured_finance_source_priority_error(
+        "web_search",
+        {"query": "工商银行 年报"},
+        counts,
+        available,
+    )
+    assert blocked_web is not None
+    assert "mcp_anysearch_" in blocked_web
+
+    mark_structured_finance_source_attempted(counts, "anysearch")
+    assert structured_finance_source_priority_error(
+        "web_search",
+        {"query": "工商银行 年报", "provider": "duckduckgo"},
+        counts,
+        available,
+    ) is None
 
 
 def test_repeated_ifind_lookup_disables_ifind_for_different_queries() -> None:

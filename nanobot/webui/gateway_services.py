@@ -2,22 +2,22 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-import time
-from typing import Any, Callable
+from typing import Any
 
 from loguru import logger as default_logger
 
-from nanobot.storage.logs import StructuredLogStore
 from nanobot.observability.trace_store import TraceStore
 from nanobot.storage.journal import SessionEventJournal
+from nanobot.storage.logs import StructuredLogStore
 from nanobot.storage.session_events import SessionEventFileStore, SessionEventService
 from nanobot.storage.state import StateStore, open_state_store_with_recovery
 from nanobot.webui.gateway_tokens import GatewayTokenStore
 from nanobot.webui.media_gateway import WebUIMediaGateway
-from nanobot.webui.transcript import WebUITranscriptRecorder
-from nanobot.webui.transcript import read_transcript_lines
+from nanobot.webui.transcript import WebUITranscriptRecorder, read_transcript_lines
 from nanobot.webui.workspaces import WebUIWorkspaceController
 from nanobot.webui.ws_http import GatewayHTTPHandler
 
@@ -38,6 +38,7 @@ class GatewayServices:
     session_manager: Any | None
     cron_service: Any | None
     cron_pending_job_ids: Callable[[str], set[str]] | None
+    expert_team_turn_router: Callable[..., Awaitable[dict[str, Any] | None]] | None
 
 
 def build_gateway_services(
@@ -57,11 +58,18 @@ def build_gateway_services(
     cron_service: Any | None = None,
     cron_pending_job_ids: Callable[[str], set[str]] | None = None,
     thread_runtime_registry: Any | None = None,
+    expert_team_turn_router: Callable[..., Awaitable[dict[str, Any] | None]] | None = None,
     logger: Any = default_logger,
 ) -> GatewayServices:
     state_recovery = open_state_store_with_recovery(
         workspace_path / ".nanobot" / "state.sqlite",
         default_workspace=workspace_path,
+        # Native desktop startup is user-facing and state.sqlite is a
+        # rebuildable projection. StateStore initialization still validates
+        # the header/schema/migrations and triggers the same recovery path for
+        # databases that cannot be opened; avoid scanning every page of a
+        # potentially very large projection before the local socket can bind.
+        verify_integrity=runtime_surface != "native",
     )
     state = state_recovery.store
     logs = StructuredLogStore(workspace_path / ".nanobot" / "logs.sqlite")
@@ -86,6 +94,7 @@ def build_gateway_services(
         details={
             "state_database": str(state.path),
             "logs_database": str(logs.path),
+            "startup_full_integrity_check": runtime_surface != "native",
         },
     )
     tokens = GatewayTokenStore()
@@ -230,4 +239,5 @@ def build_gateway_services(
         session_manager=session_manager,
         cron_service=cron_service,
         cron_pending_job_ids=cron_pending_job_ids,
+        expert_team_turn_router=expert_team_turn_router,
     )

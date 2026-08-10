@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from loguru import logger
 
@@ -15,6 +15,7 @@ _MAX_REPEAT_EXTERNAL_LOOKUPS = 2
 _MAX_IFIND_LOOKUPS_PER_TURN = 8
 _SOURCE_DISABLED_PREFIX = "__structured_finance_source_disabled__:"
 _SOURCE_TOTAL_PREFIX = "__structured_finance_source_total__:"
+_SOURCE_ATTEMPTED_PREFIX = "__structured_finance_source_attempted__:"
 _CORE_STRUCTURED_FINANCE_SOURCES = ("ifind", "juyuan", "caihui")
 
 # Third consecutive identical local lookup is almost always an agent loop.
@@ -175,6 +176,87 @@ def structured_finance_source(tool_name: str, arguments: Any) -> str | None:
         "call-node.js" in command and ("51ifind" in command or "ifind" in command)
     ):
         return "ifind"
+    return None
+
+
+def available_structured_finance_sources(tool_names: Iterable[str]) -> tuple[str, ...]:
+    """Return the finance-source layers actually exposed to an agent run."""
+    available: set[str] = set()
+    for tool_name in tool_names:
+        source = structured_finance_source(str(tool_name), {})
+        if source is not None:
+            available.add(source)
+    return tuple(
+        source
+        for source in (*_CORE_STRUCTURED_FINANCE_SOURCES, "anysearch")
+        if source in available
+    )
+
+
+def _source_attempted_key(source: str) -> str:
+    return f"{_SOURCE_ATTEMPTED_PREFIX}{source}"
+
+
+def mark_structured_finance_source_attempted(
+    seen_counts: dict[str, int],
+    source: str,
+) -> None:
+    """Record that a source call reached a terminal result for this agent run."""
+    if source in {*_CORE_STRUCTURED_FINANCE_SOURCES, "anysearch"}:
+        seen_counts[_source_attempted_key(source)] = 1
+
+
+def structured_finance_source_priority_error(
+    tool_name: str,
+    arguments: Any,
+    seen_counts: dict[str, int],
+    available_sources: Iterable[str],
+) -> str | None:
+    """Block public fallbacks until the configured higher-priority layers ran.
+
+    This is deliberately a tool-boundary policy rather than a prompt hint.  A
+    successful prior call counts as an attempt because only the model can tell
+    whether a valid result still omitted the field needed for its current
+    analysis; the runtime's job is to prevent skipping an entire source layer.
+    """
+    source = structured_finance_source(tool_name, arguments)
+    normalized_name = tool_name.strip().lower()
+    is_public_web_search = normalized_name in {"web_search", "search_web"}
+    if source != "anysearch" and not is_public_web_search:
+        return None
+
+    available = set(available_sources)
+    missing_core = [
+        item
+        for item in _CORE_STRUCTURED_FINANCE_SOURCES
+        if item in available and not seen_counts.get(_source_attempted_key(item), 0)
+    ]
+    if missing_core:
+        labels = {
+            "ifind": "iFinD",
+            "juyuan": "Juyuan",
+            "caihui": "Caihui",
+        }
+        missing_text = ", ".join(labels[item] for item in missing_core)
+        return (
+            "Error: asset-research source priority blocked this public fallback. "
+            "First query every configured core source that has not yet been tried: "
+            f"{missing_text}. "
+            "Use the available `mcp_hexin-ifind-ds-...`, `mcp_juyuan_...`, and "
+            "`mcp_caihui_mcp_...` tools as applicable. Only retry the fallback after those "
+            "source calls have returned, and only for evidence they did not cover."
+        )
+
+    if (
+        is_public_web_search
+        and "anysearch" in available
+        and not seen_counts.get(_source_attempted_key("anysearch"), 0)
+    ):
+        return (
+            "Error: asset-research source priority blocked DuckDuckGo/web_search. "
+            "Query an available `mcp_anysearch_...` tool first. Use DuckDuckGo only after "
+            "AnySearch has returned and still does not cover the required evidence."
+        )
     return None
 
 

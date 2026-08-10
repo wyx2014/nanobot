@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
@@ -49,6 +50,18 @@ from nanobot.cron.session_turns import (
     cron_history_overrides,
     is_cron_turn,
 )
+from nanobot.graph.workflows.asset_research import (
+    MEMBER_NODES,
+    REPORT_AUDIT,
+    public_asset_research_state,
+)
+from nanobot.graph.workflows.asset_research_runtime import (
+    AUDIT_MAX_TOOL_ITERATIONS,
+    AgentNodeOutcome,
+    AssetResearchWorkflowRuntime,
+    MemberBatchOutcome,
+    MemberNodeOutcome,
+)
 from nanobot.observability.trace_collector import TraceCollector
 from nanobot.observability.trace_store import TraceStore
 from nanobot.providers.base import LLMProvider
@@ -91,6 +104,13 @@ from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
+)
+from nanobot.webui.expert_teams import (
+    ASSET_RESEARCH_TEAM_ID,
+    EXPERT_TEAM_RESUME_KEY,
+    EXPERT_TEAM_TURN_ROUTE_KEY,
+    EXPERT_TEAM_TURN_SUPPRESSED_KEY,
+    classify_expert_team_turn_with_model,
 )
 from nanobot.webui.interactive_prompt import (
     INBOUND_META_INTERACTIVE_PROMPT_ANSWER,
@@ -198,6 +218,11 @@ def _expert_team_binding(
     session_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return the active expert-team binding from the message or session."""
+    if (
+        isinstance(message_metadata, dict)
+        and message_metadata.get(EXPERT_TEAM_TURN_SUPPRESSED_KEY) is True
+    ):
+        return None
     for metadata in (message_metadata, session_metadata):
         if not isinstance(metadata, dict):
             continue
@@ -205,6 +230,31 @@ def _expert_team_binding(
         if isinstance(team, dict):
             return team
     return None
+
+
+class _SingleRewriteAuditToolRegistry(ToolRegistry):
+    """Expose audit tools while permitting at most one complete report rewrite."""
+
+    def __init__(self, source: ToolRegistry) -> None:
+        super().__init__()
+        self._rewrite_attempted = False
+        for name in source.tool_names:
+            if name == "edit_file":
+                continue
+            tool = source.get(name)
+            if tool is not None:
+                self.register(tool)
+
+    async def execute(self, name: str, params: Any) -> Any:
+        if name == "write_file":
+            if self._rewrite_attempted:
+                return (
+                    "Audit policy: the single allowed complete report rewrite has "
+                    "already been used. Do not modify files again; finish the audit "
+                    "with the current report."
+                )
+            self._rewrite_attempted = True
+        return await super().execute(name, params)
 
 
 def _tool_call_names(messages: list[dict[str, Any]]) -> set[str]:
@@ -298,6 +348,7 @@ class TurnContext:
     all_messages: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = ""
     had_injections: bool = False
+    artifact_paths: list[str] = field(default_factory=list)
 
     user_persisted_early: bool = False
     save_skip: int = 0
@@ -706,6 +757,48 @@ class AgentLoop:
         self._default_selection_signature = preset_helpers.default_selection_signature(snapshot.signature)
         self._apply_provider_snapshot(snapshot)
 
+    async def route_expert_team_turn(
+        self,
+        *,
+        history: list[dict[str, Any]],
+        user_message: str,
+        awaiting_target: bool = False,
+        has_media: bool = False,
+    ) -> dict[str, Any] | None:
+        """Classify one selected asset-team turn with the active runtime model."""
+
+        self._refresh_provider_snapshot()
+
+        def _record_usage(usage: dict[str, int]) -> None:
+            from nanobot.webui.token_usage import record_token_usage
+
+            record_token_usage(
+                usage,
+                source="user",
+                timezone_name=self.context.timezone,
+            )
+
+        try:
+            gate = self._concurrency_gate or nullcontext()
+            async with gate:
+                return await asyncio.wait_for(
+                    classify_expert_team_turn_with_model(
+                        provider=self.provider,
+                        model=self.model,
+                        history=history,
+                        user_message=user_message,
+                        awaiting_target=awaiting_target,
+                        has_media=has_media,
+                        usage_callback=_record_usage,
+                    ),
+                    timeout=20,
+                )
+        except TimeoutError:
+            logger.warning("Asset-research model routing timed out; using safe fallback")
+        except Exception:
+            logger.exception("Asset-research model routing failed; using safe fallback")
+        return None
+
     @property
     def model_preset(self) -> str | None:
         return self._active_preset
@@ -888,10 +981,10 @@ class AgentLoop:
             "_stop_reason",
             "",
         ))
-        if stop_reason in {"error", "tool_error"}:
+        if stop_reason in {"error", "tool_error", "workflow_error"}:
             reason = (
                 FinishReason.TOOL_ERROR
-                if stop_reason == "tool_error"
+                if stop_reason in {"tool_error", "workflow_error"}
                 else FinishReason.MODEL_ERROR
             )
             return TurnStatus.FAILED, reason, stop_reason
@@ -971,7 +1064,7 @@ class AgentLoop:
                 session_key,
                 error_code=exc.code,
             )
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "Runtime terminal persistence failed session={} turn={}",
                 session_key,
@@ -1192,6 +1285,7 @@ class AgentLoop:
         run_extra_hooks_for_ephemeral: bool = False,
         hooks: list[AgentHook] | None = None,
         tools: ToolRegistry | None = None,
+        max_iterations: int | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -1451,6 +1545,11 @@ class AgentLoop:
             else None
         )
         initial_message_count = len(initial_messages)
+        run_max_iterations = (
+            self.max_iterations
+            if max_iterations is None
+            else max(1, int(max_iterations))
+        )
 
         async def _provider_timing(payload: dict[str, Any]) -> None:
             logs = self._performance_logs
@@ -1554,7 +1653,7 @@ class AgentLoop:
                 initial_messages=initial_messages,
                 tools=tools or self.tools,
                 model=self.model,
-                max_iterations=self.max_iterations,
+                max_iterations=run_max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 hook=hook,
                 error_message="Sorry, I encountered an error calling the AI model.",
@@ -1583,8 +1682,17 @@ class AgentLoop:
                 ),
                 goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
                 goal_continue_message=_goal_continue,
+                enforce_finance_source_priority=(
+                    (
+                        isinstance(expert_team, dict)
+                        and expert_team.get("id") == "asset-research-team"
+                    )
+                    or bool((metadata or {}).get("_enforce_finance_source_priority"))
+                ),
                 finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
-                    pending_queue_available=pending_queue is not None and session is not None,
+                    pending_queue_available=(
+                        pending_queue is not None and session is not None
+                    ),
                     session_metadata=session_metadata,
                     message_metadata=metadata,
                 ),
@@ -1600,7 +1708,7 @@ class AgentLoop:
             reset_file_states(file_state_token)
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
+            logger.warning("Max iterations ({}) reached", run_max_iterations)
             should_stream = turn_continuation.should_stream_budget_response(
                 stop_reason=result.stop_reason,
                 pending_queue_available=pending_queue is not None and session is not None,
@@ -1615,6 +1723,335 @@ class AgentLoop:
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
         return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
+
+    @staticmethod
+    def _workflow_tool_subset(
+        registry: ToolRegistry,
+        *,
+        allowed_names: set[str],
+        allowed_prefixes: tuple[str, ...],
+    ) -> ToolRegistry:
+        """Build a capability-scoped registry for one fixed graph node."""
+
+        scoped = ToolRegistry()
+        for name in registry.tool_names:
+            if name not in allowed_names and not name.startswith(allowed_prefixes):
+                continue
+            tool = registry.get(name)
+            if tool is not None:
+                scoped.register(tool)
+        return scoped
+
+    async def _run_asset_research_workflow(
+        self,
+        ctx: TurnContext,
+    ) -> tuple[str, list[str], list[dict[str, Any]], str, bool]:
+        """Execute the runtime-owned asset-research DAG for one user turn."""
+
+        team = _expert_team_binding(ctx.msg.metadata, ctx.session.metadata)
+        if not isinstance(team, dict) or team.get("id") != ASSET_RESEARCH_TEAM_ID:
+            raise RuntimeError("asset-research workflow invoked without its team binding")
+        run_id = str(ctx.msg.metadata.get("expert_team_run_id") or "").strip()
+        if not run_id:
+            raise RuntimeError("asset-research workflow requires a run id")
+        raw_route = ctx.msg.metadata.get(EXPERT_TEAM_TURN_ROUTE_KEY)
+        target = (
+            str(raw_route.get("target") or "").strip()
+            if isinstance(raw_route, dict)
+            else ""
+        )
+        if not target:
+            raise RuntimeError("asset-research workflow requires a validated target")
+
+        source_registry = ctx.tools or self.tools
+        configured_prefixes = tuple(
+            f"mcp_{str(item.get('name') or '').strip().lower()}_"
+            for item in team.get("mcp_presets", [])
+            if isinstance(item, dict)
+            and item.get("configured") is True
+            and str(item.get("name") or "").strip()
+        )
+        data_tools = self._workflow_tool_subset(
+            source_registry,
+            allowed_names={"web_search", "web_fetch"},
+            allowed_prefixes=configured_prefixes,
+        )
+        report_tools = self._workflow_tool_subset(
+            source_registry,
+            allowed_names={
+                "web_search",
+                "web_fetch",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "create_research_chart",
+            },
+            allowed_prefixes=configured_prefixes,
+        )
+        audit_tools = _SingleRewriteAuditToolRegistry(
+            self._workflow_tool_subset(
+                source_registry,
+                allowed_names={
+                    "read_file",
+                    "write_file",
+                    "web_search",
+                    "web_fetch",
+                },
+                allowed_prefixes=configured_prefixes,
+            )
+        )
+
+        system_content = next(
+            (
+                message.get("content")
+                for message in ctx.initial_messages
+                if message.get("role") == "system"
+            ),
+            "",
+        )
+        system_text = _message_content_text(system_content)
+        node_system = (
+            "# Runtime-owned Asset Research Graph\n\n"
+            "The graph runtime is the sole control-flow authority. Execute only the "
+            "node named in the user message. Never select, skip, or simulate another "
+            "node and never publish model-authored workflow progress.\n\n"
+            f"{system_text}"
+        )
+        node_metadata = {
+            **dict(ctx.msg.metadata or {}),
+            EXPERT_TEAM_TURN_SUPPRESSED_KEY: True,
+            "webui": False,
+            "_enforce_finance_source_priority": True,
+        }
+        node_tool_map = {
+            "data-package": data_tools,
+            "team-lead": report_tools,
+            "report-audit": audit_tools,
+        }
+
+        async def _run_node(
+            node_id: str,
+            prompt: str,
+            final_stream: bool,
+        ) -> AgentNodeOutcome:
+            node_messages = [
+                {"role": "system", "content": node_system},
+                {"role": "user", "content": prompt},
+            ]
+            final_content, tools_used, messages, stop_reason, _had_injections = (
+                await self._run_agent_loop(
+                    node_messages,
+                    on_progress=ctx.on_progress,
+                    on_stream=ctx.on_stream if final_stream else None,
+                    on_stream_end=ctx.on_stream_end if final_stream else None,
+                    on_retry_wait=ctx.on_retry_wait,
+                    session=None,
+                    channel=ctx.msg.channel,
+                    chat_id=ctx.msg.chat_id,
+                    message_id=f"{ctx.msg.metadata.get('message_id') or ctx.turn_id}:{node_id}",
+                    metadata={**node_metadata, "_asset_research_graph_node": node_id},
+                    session_key=ctx.session_key,
+                    pending_queue=None,
+                    ephemeral=True,
+                    tools=node_tool_map[node_id],
+                    max_iterations=(
+                        AUDIT_MAX_TOOL_ITERATIONS
+                        if node_id == REPORT_AUDIT
+                        else None
+                    ),
+                )
+            )
+            return AgentNodeOutcome(
+                content=final_content or "",
+                stop_reason=stop_reason,
+                tools_used=list(tools_used or []),
+                messages=messages,
+                usage=dict(self._last_usage),
+                artifacts=_generated_artifact_paths(messages),
+            )
+
+        effective_scope = self.workspace_scopes.for_turn(
+            channel=ctx.msg.channel,
+            message_metadata=ctx.msg.metadata,
+            session_metadata=ctx.session.metadata,
+        )
+        workflow_corrections: list[str] = []
+
+        async def _run_members(tasks: dict[str, str]) -> MemberBatchOutcome:
+            task_ids: list[str] = []
+            member_by_task: dict[str, str] = {}
+            immediate: dict[str, MemberNodeOutcome] = {}
+            for member_id in MEMBER_NODES:
+                task_id = await self.subagents.spawn_for_workflow(
+                    task=tasks[member_id],
+                    label=member_id,
+                    origin_channel=ctx.msg.channel,
+                    origin_chat_id=ctx.msg.chat_id,
+                    session_key=ctx.session_key,
+                    origin_message_id=str(ctx.msg.metadata.get("message_id") or "") or None,
+                    workspace_scope=effective_scope,
+                    expert_team=team,
+                    expert_team_run_id=run_id,
+                )
+                if re.fullmatch(r"[0-9a-f]{8}", task_id):
+                    task_ids.append(task_id)
+                    member_by_task[task_id] = member_id
+                else:
+                    immediate[member_id] = MemberNodeOutcome(
+                        member_id=member_id,
+                        status="failed",
+                        content=task_id,
+                        activity="该角色未能启动，主笔将按降级流程补齐",
+                    )
+
+            completed = (
+                await self.subagents.wait_for_workflow_tasks(task_ids)
+                if task_ids
+                else []
+            )
+            members = dict(immediate)
+            for result in completed:
+                member_id = member_by_task[result.task_id]
+                artifact_match = re.search(r"Role artifact: `([^`]+)`", result.content)
+                status = (
+                    "completed" if result.status == "ok"
+                    else "cancelled" if result.status == "cancelled"
+                    else "failed"
+                )
+                members[member_id] = MemberNodeOutcome(
+                    member_id=member_id,
+                    status=status,
+                    content=result.content,
+                    artifact=artifact_match.group(1) if artifact_match else None,
+                    activity=(
+                        "研究完成，完整结果已交付 Team Lead"
+                        if status == "completed"
+                        else "该角色结果已降级，Team Lead 将补齐缺失维度"
+                    ),
+                )
+
+            supplements: list[str] = []
+            if ctx.pending_queue is not None:
+                while True:
+                    try:
+                        pending = ctx.pending_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if not isinstance(pending, InboundMessage):
+                        continue
+                    content = pending.content.strip()
+                    if content:
+                        supplements.append(content)
+                    supplements.extend(
+                        str(path) for path in (pending.media or []) if str(path).strip()
+                    )
+            workflow_corrections.extend(supplements)
+            return MemberBatchOutcome(members=members, supplements=supplements)
+
+        async def _publish_state(
+            state: dict[str, Any],
+            event: str,
+            activity: str,
+        ) -> None:
+            public_state = public_asset_research_state(state)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content="",
+                metadata={
+                    **dict(ctx.msg.metadata or {}),
+                    "_team_graph_updated": True,
+                    "team_graph": {
+                        "run_id": run_id,
+                        "team_id": ASSET_RESEARCH_TEAM_ID,
+                        "event": event,
+                        "activity": activity,
+                        "state": public_state,
+                    },
+                },
+            ))
+
+        resume_metadata = ctx.msg.metadata.get(EXPERT_TEAM_RESUME_KEY)
+        resume_state = (
+            resume_metadata.get("graph_state")
+            if isinstance(resume_metadata, dict)
+            and isinstance(resume_metadata.get("graph_state"), dict)
+            else None
+        )
+        resume_artifacts = (
+            [
+                str(item) for item in resume_metadata.get("artifacts", [])
+                if str(item).strip()
+            ]
+            if isinstance(resume_metadata, dict)
+            else []
+        )
+        request = ctx.msg.content.strip()
+        safe_target = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "-", target).strip("-")
+        report_path = f"reports/{(safe_target or 'stock')[:48]}-{run_id}-投资研究报告.md"
+
+        file_state_token = bind_file_states(
+            self._file_state_store.for_session(ctx.session_key)
+        )
+        request_token = bind_request_context(RequestContext(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            message_id=str(ctx.msg.metadata.get("message_id") or "") or None,
+            session_key=ctx.session_key,
+            metadata=dict(ctx.msg.metadata or {}),
+        ))
+        workspace_token = bind_workspace_scope(effective_scope)
+        bound_project_context = project_context_from_metadata(
+            ctx.msg.metadata.get(PROJECT_CONTEXT_METADATA_KEY),
+            session_key=ctx.session_key,
+            root_path=effective_scope.project_path,
+        )
+        project_context_token = bind_project_context(bound_project_context)
+        try:
+            runtime = AssetResearchWorkflowRuntime(
+                run_agent_node=_run_node,
+                run_member_wave=_run_members,
+                publish_state=_publish_state,
+            )
+            outcome = await runtime.run(
+                run_id=run_id,
+                target=target,
+                request=request,
+                team=team,
+                report_path=report_path,
+                resume_from=resume_state,
+                supplemental_artifacts=[*resume_artifacts, *(ctx.msg.media or [])],
+            )
+        finally:
+            reset_project_context(project_context_token)
+            reset_workspace_scope(workspace_token)
+            reset_request_context(request_token)
+            reset_file_states(file_state_token)
+
+        self._last_usage = dict(outcome.usage)
+        ctx.artifact_paths = list(outcome.artifacts)
+        messages = [
+            *ctx.initial_messages,
+            *(
+                [{
+                    "role": "user",
+                    "content": (
+                        "[Active-turn user correction]\n"
+                        + "\n".join(workflow_corrections)
+                    ),
+                }]
+                if workflow_corrections
+                else []
+            ),
+            {"role": "assistant", "content": outcome.final_content},
+        ]
+        return (
+            outcome.final_content,
+            outcome.tools_used,
+            messages,
+            outcome.stop_reason,
+            bool(workflow_corrections),
+        )
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -1746,7 +2183,6 @@ class AgentLoop:
         gate = self._concurrency_gate or nullcontext()
 
         pending: asyncio.Queue | None = None
-        dispatch_failed = False
         try:
             async with lock, gate:
                 # Only the task that owns the session lock may publish the
@@ -1860,7 +2296,6 @@ class AgentLoop:
                         )
                     self._cron_turns.complete(msg, response=response)
                 except asyncio.CancelledError:
-                    dispatch_failed = True
                     self._cron_turns.complete(
                         msg,
                         error=asyncio.CancelledError(),
@@ -1908,7 +2343,6 @@ class AgentLoop:
                         )
                     raise
                 except Exception as exc:
-                    dispatch_failed = True
                     logger.exception("Error processing message for session {}", session_key)
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -2271,6 +2705,7 @@ class AgentLoop:
         *,
         turn_latency_ms: int | None = None,
         turn_usage: dict[str, int] | None = None,
+        artifact_paths: list[str] | None = None,
     ) -> OutboundMessage | None:
         """Assemble the final outbound message from turn results."""
         # MessageTool suppression
@@ -2282,7 +2717,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None and stop_reason not in {"error", "tool_error"}:
+        if on_stream is not None and stop_reason not in {"error", "tool_error", "workflow_error"}:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
@@ -2298,7 +2733,10 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            media=_generated_artifact_paths(all_msgs),
+            media=list(dict.fromkeys([
+                *_generated_artifact_paths(all_msgs),
+                *(artifact_paths or []),
+            ])),
             metadata=meta,
         )
 
@@ -2658,24 +3096,32 @@ class AgentLoop:
                 "running",
                 started_at=ctx.visible_run_started_at,
             )
-            result = await self._run_agent_loop(
-                ctx.initial_messages,
-                on_progress=ctx.on_progress,
-                on_stream=ctx.on_stream,
-                on_stream_end=ctx.on_stream_end,
-                on_retry_wait=ctx.on_retry_wait,
-                session=ctx.session,
-                channel=ctx.msg.channel,
-                chat_id=ctx.msg.chat_id,
-                message_id=ctx.msg.metadata.get("message_id"),
-                metadata=ctx.msg.metadata,
-                session_key=ctx.session_key,
-                pending_queue=ctx.pending_queue,
-                ephemeral=ctx.ephemeral,
-                run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
-                hooks=ctx.hooks,
-                tools=ctx.tools,
-            )
+            expert_team = _expert_team_binding(ctx.msg.metadata, ctx.session.metadata)
+            if (
+                isinstance(expert_team, dict)
+                and expert_team.get("id") == ASSET_RESEARCH_TEAM_ID
+                and isinstance(ctx.msg.metadata.get("expert_team_run_id"), str)
+            ):
+                result = await self._run_asset_research_workflow(ctx)
+            else:
+                result = await self._run_agent_loop(
+                    ctx.initial_messages,
+                    on_progress=ctx.on_progress,
+                    on_stream=ctx.on_stream,
+                    on_stream_end=ctx.on_stream_end,
+                    on_retry_wait=ctx.on_retry_wait,
+                    session=ctx.session,
+                    channel=ctx.msg.channel,
+                    chat_id=ctx.msg.chat_id,
+                    message_id=ctx.msg.metadata.get("message_id"),
+                    metadata=ctx.msg.metadata,
+                    session_key=ctx.session_key,
+                    pending_queue=ctx.pending_queue,
+                    ephemeral=ctx.ephemeral,
+                    run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
+                    hooks=ctx.hooks,
+                    tools=ctx.tools,
+                )
         finally:
             prompt_requested = interactive_prompt_requested_in_turn()
             reset_interactive_prompt_requested(prompt_token)
@@ -2750,6 +3196,7 @@ class AgentLoop:
             ctx.on_stream,
             turn_latency_ms=ctx.turn_latency_ms,
             turn_usage=ctx.turn_usage,
+            artifact_paths=ctx.artifact_paths,
         )
         return "ok"
 

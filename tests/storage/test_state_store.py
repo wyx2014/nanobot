@@ -63,7 +63,7 @@ def test_schema_initializes_with_wal_and_core_relations(tmp_path: Path) -> None:
             "projected_events",
         } <= tables
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
 
 
 def test_project_and_session_ids_are_stable_and_session_project_is_immutable(
@@ -928,6 +928,49 @@ def test_corrupt_state_database_is_backed_up_and_rebuilt(tmp_path: Path) -> None
     assert recovery.store.quick_check() is True
     assert recovery.backup_dir is not None
     assert (recovery.backup_dir / "state.sqlite").read_bytes() == b"not-a-sqlite-database"
+
+
+def test_latency_sensitive_open_can_skip_full_integrity_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime" / "state.sqlite"
+    original_quick_check = StateStore.quick_check
+    calls = 0
+
+    def counted_quick_check(store: StateStore) -> bool:
+        nonlocal calls
+        calls += 1
+        return original_quick_check(store)
+
+    monkeypatch.setattr(StateStore, "quick_check", counted_quick_check)
+
+    recovery = open_state_store_with_recovery(
+        path,
+        default_workspace=tmp_path / "inbox",
+        verify_integrity=False,
+    )
+
+    assert recovery.backup_dir is None
+    assert calls == 0
+    assert recovery.store.list_projects() == []
+
+
+def test_skipping_full_scan_still_recovers_database_that_cannot_open(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runtime" / "state.sqlite"
+    path.parent.mkdir()
+    path.write_bytes(b"not-a-sqlite-database")
+
+    recovery = open_state_store_with_recovery(
+        path,
+        default_workspace=tmp_path / "inbox",
+        verify_integrity=False,
+    )
+
+    assert recovery.backup_dir is not None
+    assert recovery.store.quick_check() is True
 
 
 def test_event_projection_rejects_sequence_gaps(tmp_path: Path) -> None:

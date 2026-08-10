@@ -8,7 +8,7 @@ import json
 import re
 import ssl
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Self
@@ -25,10 +25,14 @@ from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.graph.workflows.asset_research import (
     AUDIT,
+    DATA_PACKAGE,
     DELIVERED,
+    MEMBER_NODES,
     MEMBERS,
     PREPARATION,
+    REPORT_AUDIT,
     SYNTHESIS,
+    TEAM_LEAD,
     advance_asset_research_graph,
     new_asset_research_state,
 )
@@ -45,12 +49,18 @@ from nanobot.utils.media_decode import (
 )
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
 from nanobot.webui.expert_teams import (
+    ASSET_RESEARCH_TEAM_ID,
+    EXPERT_TEAM_PENDING_TARGET_KEY,
     EXPERT_TEAM_RESUME_KEY,
     EXPERT_TEAM_SESSION_KEY,
+    EXPERT_TEAM_TURN_ROUTE_KEY,
+    EXPERT_TEAM_TURN_ROUTE_SOURCE_KEY,
+    EXPERT_TEAM_TURN_SUPPRESSED_KEY,
     ExpertTeamError,
     expert_team_mcp_attachments,
-    expert_team_resume_requested,
+    fallback_expert_team_turn_decision,
     normalize_expert_team_binding,
+    normalize_expert_team_model_decision,
     public_expert_team_binding,
 )
 from nanobot.webui.forking import handle_webui_fork_chat
@@ -70,13 +80,13 @@ from nanobot.webui.interactive_prompt import (
     normalize_interactive_prompt,
     normalize_interactive_prompt_answer,
 )
+from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
 from nanobot.webui.media_cache import (
     DEFAULT_MEDIA_CACHE_CLEANUP_INTERVAL_S,
     DEFAULT_MEDIA_CACHE_MAX_BYTES,
     DEFAULT_MEDIA_CACHE_STARTUP_DELAY_S,
     DEFAULT_MEDIA_CACHE_TTL_S,
 )
-from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
 from nanobot.webui.metadata import (
     ACTIVE_TURN_CLIENT_TURN_METADATA_KEY,
     ACTIVE_TURN_CORRECTION_METADATA_KEY,
@@ -527,14 +537,108 @@ class WebSocketChannel(BaseChannel):
         session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
         existing = session.metadata.get(EXPERT_TEAM_SESSION_KEY)
         if binding is None:
-            if EXPERT_TEAM_SESSION_KEY in session.metadata:
+            if (
+                EXPERT_TEAM_SESSION_KEY in session.metadata
+                or EXPERT_TEAM_PENDING_TARGET_KEY in session.metadata
+            ):
                 session.metadata.pop(EXPERT_TEAM_SESSION_KEY, None)
+                session.metadata.pop(EXPERT_TEAM_PENDING_TARGET_KEY, None)
                 self.gateway.session_manager.save(session)
             return None
         if existing != binding:
             session.metadata[EXPERT_TEAM_SESSION_KEY] = binding
+            session.metadata.pop(EXPERT_TEAM_PENDING_TARGET_KEY, None)
             self.gateway.session_manager.save(session)
         return binding
+
+    def _expert_team_awaiting_target(
+        self,
+        chat_id: str,
+        binding: Mapping[str, Any] | None,
+    ) -> bool:
+        if self.gateway.session_manager is None or not isinstance(binding, Mapping):
+            return False
+        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        return session.metadata.get(EXPERT_TEAM_PENDING_TARGET_KEY) == binding.get("id")
+
+    def _set_expert_team_awaiting_target(
+        self,
+        chat_id: str,
+        binding: Mapping[str, Any] | None,
+        *,
+        awaiting: bool,
+    ) -> None:
+        if self.gateway.session_manager is None:
+            return
+        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        value = str(binding.get("id") or "") if awaiting and isinstance(binding, Mapping) else ""
+        existing = session.metadata.get(EXPERT_TEAM_PENDING_TARGET_KEY)
+        if value:
+            if existing == value:
+                return
+            session.metadata[EXPERT_TEAM_PENDING_TARGET_KEY] = value
+        else:
+            if EXPERT_TEAM_PENDING_TARGET_KEY not in session.metadata:
+                return
+            session.metadata.pop(EXPERT_TEAM_PENDING_TARGET_KEY, None)
+        self.gateway.session_manager.save(session)
+
+    def _expert_team_route_history(self, chat_id: str) -> list[dict[str, Any]]:
+        if self.gateway.session_manager is None:
+            return []
+        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        return session.get_history(max_messages=8, max_tokens=3_000)
+
+    async def _route_expert_team_turn(
+        self,
+        chat_id: str,
+        binding: Mapping[str, Any] | None,
+        content: str,
+        *,
+        has_media: bool,
+    ) -> tuple[dict[str, Any], str]:
+        awaiting_target = self._expert_team_awaiting_target(chat_id, binding)
+        fallback = fallback_expert_team_turn_decision(
+            binding,
+            content,
+            has_media=has_media,
+            awaiting_target=awaiting_target,
+        )
+        team_id = str(binding.get("id") or "") if isinstance(binding, Mapping) else ""
+        router = self.gateway.expert_team_turn_router
+        if (
+            team_id != ASSET_RESEARCH_TEAM_ID
+            or content.strip().startswith("/")
+            or router is None
+        ):
+            return fallback, "fallback"
+        try:
+            raw = await router(
+                history=self._expert_team_route_history(chat_id),
+                user_message=content,
+                awaiting_target=awaiting_target,
+                has_media=has_media,
+            )
+        except Exception:
+            self.logger.exception(
+                "asset-research model route failed for chat {}; using safe fallback",
+                chat_id,
+            )
+            return fallback, "fallback"
+        decision = normalize_expert_team_model_decision(raw)
+        if decision is None:
+            self.logger.warning(
+                "asset-research model returned an invalid route for chat {}; using safe fallback",
+                chat_id,
+            )
+            return fallback, "fallback"
+        self.logger.info(
+            "asset-research model route chat={} action={} target={}",
+            chat_id,
+            decision.get("action"),
+            decision.get("target") or "-",
+        )
+        return decision, "model"
 
     def _start_team_run_projection(
         self,
@@ -578,18 +682,19 @@ class WebSocketChannel(BaseChannel):
                     or "团队已启动，正在分配研究任务"
                 ),
             })
+        graph_member_ids = [
+            str(member.get("id") or "")
+            for member in normalized_members
+            if str(member.get("id") or "").strip()
+        ]
         graph_state = (
             new_asset_research_state(
                 run_id=run_id,
-                member_ids=[
-                    str(member.get("id") or "")
-                    for member in normalized_members
-                    if str(member.get("id") or "").strip()
-                ],
+                member_ids=graph_member_ids,
                 resume_from=resume_state,
                 supplemental_artifacts=supplemental_artifacts or [],
             )
-            if has_data_package
+            if has_data_package and set(graph_member_ids) == set(MEMBER_NODES)
             else None
         )
         if graph_state is not None and resume_state is not None:
@@ -607,7 +712,7 @@ class WebSocketChannel(BaseChannel):
         initial_stage = (
             str(graph_state.get("node"))
             if isinstance(graph_state, dict)
-            else "members"
+            else PREPARATION if has_data_package else MEMBERS
         )
         self._team_runs[(chat_id, run_id)] = {
             "team_id": team_id,
@@ -850,6 +955,15 @@ class WebSocketChannel(BaseChannel):
         run_id = str(metadata.get("expert_team_run_id") or "").strip()
         run = self._team_runs.get((chat_id, run_id))
         if run is None or not isinstance(tool_events, list):
+            return
+        graph_state = run.get("graph_state")
+        if (
+            isinstance(graph_state, dict)
+            and int(graph_state.get("schema_version") or 0) >= 2
+        ):
+            # Runtime-owned DAG snapshots are the only transition authority.
+            # Tool activity remains visible, but a model calling write_file or
+            # update_task_progress cannot move the workflow to another node.
             return
         successful_names = {
             str(event.get("name") or "").strip().lower()
@@ -1416,7 +1530,48 @@ class WebSocketChannel(BaseChannel):
             # Auto-attach on first use so clients can one-shot without a separate attach.
             self._attach(connection, cid)
             await self._hydrate_after_subscribe(cid)
+            team_route, team_route_source = await self._route_expert_team_turn(
+                cid,
+                expert_team,
+                content,
+                has_media=bool(media_paths),
+            )
+            resume_state: dict[str, Any] | None = None
+            resume_artifacts: list[str] = []
+            if team_route["action"] == "resume" and expert_team is not None:
+                prior_run = self.gateway.state.latest_expert_team_resume(
+                    session_key=f"websocket:{cid}",
+                    team_id=str(expert_team.get("id") or ""),
+                )
+                candidate_state = (
+                    prior_run.get("graph_state")
+                    if isinstance(prior_run, dict)
+                    else None
+                )
+                if not isinstance(candidate_state, dict):
+                    team_route = {
+                        "action": "clarify",
+                        "reason": "resume_without_prior_run",
+                    }
+                else:
+                    resume_state = candidate_state
+                    resume_artifacts = [
+                        str(item)
+                        for item in prior_run.get("artifacts", [])
+                        if isinstance(item, str) and str(item).strip()
+                    ]
+                    team_route = {
+                        "action": "run",
+                        "reason": "resume_prior_run",
+                        "previous_run_id": str(prior_run.get("run_id") or ""),
+                    }
+            is_team_run = team_route["action"] == "run"
             metadata: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
+            if expert_team is not None:
+                metadata[EXPERT_TEAM_TURN_ROUTE_KEY] = team_route
+                metadata[EXPERT_TEAM_TURN_ROUTE_SOURCE_KEY] = team_route_source
+                if not is_team_run:
+                    metadata[EXPERT_TEAM_TURN_SUPPRESSED_KEY] = True
             if envelope.get("webui") is True:
                 metadata["webui"] = True
                 metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
@@ -1433,7 +1588,7 @@ class WebSocketChannel(BaseChannel):
             requested_mcp_presets = normalize_mcp_preset_mentions(envelope.get("mcp_presets"))
             team_mcp_presets = (
                 expert_team_mcp_attachments(expert_team)
-                if expert_team is not None and not content.strip().startswith("/")
+                if is_team_run and expert_team is not None
                 else []
             )
             mcp_presets = normalize_mcp_preset_mentions([
@@ -1445,36 +1600,14 @@ class WebSocketChannel(BaseChannel):
             skill_scope = normalize_skill_scope(envelope.get("skill_scope"))
             if skill_scope:
                 metadata["skill_scope"] = skill_scope
-            is_team_run = expert_team is not None and not content.strip().startswith("/")
-            if expert_team is not None:
+            if is_team_run and expert_team is not None:
                 metadata[EXPERT_TEAM_SESSION_KEY] = expert_team
-            resume_state: dict[str, Any] | None = None
-            resume_artifacts: list[str] = []
-            if (
-                is_team_run
-                and expert_team.get("id") == "asset-research-team"
-                and expert_team_resume_requested(
-                    content,
-                    has_media=bool(media_paths),
-                )
-            ):
-                prior_run = self.gateway.state.latest_expert_team_resume(
-                    session_key=f"websocket:{cid}",
-                    team_id="asset-research-team",
-                )
-                if prior_run is not None:
-                    candidate_state = prior_run.get("graph_state")
-                    if isinstance(candidate_state, dict):
-                        resume_state = candidate_state
-                    resume_artifacts = [
-                        str(item)
-                        for item in prior_run.get("artifacts", [])
-                        if isinstance(item, str) and str(item).strip()
-                    ]
-                    metadata[EXPERT_TEAM_RESUME_KEY] = {
-                        "run_id": str(prior_run.get("run_id") or ""),
-                        "artifacts": resume_artifacts,
-                    }
+            if resume_state is not None:
+                metadata[EXPERT_TEAM_RESUME_KEY] = {
+                    "run_id": str(team_route.get("previous_run_id") or ""),
+                    "artifacts": resume_artifacts,
+                    "graph_state": resume_state,
+                }
             if is_team_run:
                 metadata["expert_team_run_id"] = uuid.uuid4().hex[:12]
             if interactive_prompt_answer:
@@ -1483,6 +1616,11 @@ class WebSocketChannel(BaseChannel):
             binding = await self._persist_workspace_scope_or_error(connection, cid, scope)
             if binding is None:
                 return
+            self._set_expert_team_awaiting_target(
+                cid,
+                expert_team,
+                awaiting=team_route["action"] == "clarify",
+            )
             metadata[PROJECT_CONTEXT_METADATA_KEY] = {
                 **binding,
                 "session_key": f"websocket:{cid}",
@@ -1727,6 +1865,11 @@ class WebSocketChannel(BaseChannel):
             member = msg.metadata.get("team_member")
             if isinstance(member, dict):
                 await self.send_team_member_updated(msg.chat_id, member)
+            return
+        if msg.metadata.get("_team_graph_updated"):
+            update = msg.metadata.get("team_graph")
+            if isinstance(update, dict):
+                await self.send_team_graph_updated(msg.chat_id, update)
             return
         # Snapshot the subscriber set so ConnectionClosed cleanups mid-iteration are safe.
         conns = list(self._subs.get(msg.chat_id, ()))
@@ -2775,8 +2918,24 @@ class WebSocketChannel(BaseChannel):
             else "failed"
         )
         graph_state = run.get("graph_state")
+        runtime_owned_graph = (
+            isinstance(graph_state, dict)
+            and int(graph_state.get("schema_version") or 0) >= 2
+        )
+        if runtime_owned_graph and public_status in {"completed", "completed_with_warnings"}:
+            graph_status = str(graph_state.get("status") or "running")
+            graph_delivered = (
+                graph_state.get("node") == DELIVERED
+                and not graph_state.get("active_nodes")
+                and graph_status in {"completed", "completed_with_warnings"}
+            )
+            public_status = graph_status if graph_delivered else "failed"
         run["completed"] = public_status in {"completed", "completed_with_warnings"}
-        if run["completed"] and isinstance(graph_state, dict):
+        if (
+            run["completed"]
+            and isinstance(graph_state, dict)
+            and not runtime_owned_graph
+        ):
             # A durable terminal turn must settle every graph node. Usually the
             # write_file event already moved synthesis -> audit; these guarded
             # transitions also cover renderer/tool payloads that didn't expose
@@ -2813,6 +2972,7 @@ class WebSocketChannel(BaseChannel):
             run["graph_state"] = graph_state
             run["graph_event"] = "audit_completed"
             public_status = str(graph_state.get("status") or public_status)
+            run["completed"] = public_status in {"completed", "completed_with_warnings"}
         run["status"] = (
             "completed"
             if run["completed"]
@@ -2889,11 +3049,126 @@ class WebSocketChannel(BaseChannel):
                 await self._safe_send_to(connection, raw, label=" team_run_completed ")
         self._team_runs.pop((chat_id, run_id), None)
 
+    async def send_team_graph_updated(
+        self,
+        chat_id: str,
+        update: dict[str, Any],
+    ) -> None:
+        """Project one authoritative runtime-owned DAG checkpoint to the UI."""
+
+        run_id = str(update.get("run_id") or "").strip()
+        run = self._team_runs.get((chat_id, run_id))
+        state = update.get("state")
+        if run is None or not isinstance(state, dict):
+            return
+        if str(update.get("team_id") or "") != str(run.get("team_id") or ""):
+            return
+        if str(state.get("run_id") or "") != run_id:
+            return
+        if (
+            int(state.get("schema_version") or 0) < 2
+            or state.get("workflow") != "asset-research"
+        ):
+            return
+        valid_nodes = {DATA_PACKAGE, *MEMBER_NODES, TEAM_LEAD, REPORT_AUDIT}
+        active_nodes = state.get("active_nodes")
+        if (
+            not isinstance(active_nodes, list)
+            or any(str(node) not in valid_nodes for node in active_nodes)
+        ):
+            return
+        previous_state = run.get("graph_state")
+        if (
+            isinstance(previous_state, dict)
+            and int(previous_state.get("schema_version") or 0) >= 2
+            and int(state.get("checkpoint_revision") or 0)
+            < int(previous_state.get("checkpoint_revision") or 0)
+        ):
+            return
+
+        run["graph_state"] = state
+        run["graph_event"] = str(update.get("event") or "graph_updated")
+        raw_stage = str(state.get("node") or PREPARATION)
+        run["stage"] = {
+            DATA_PACKAGE: PREPARATION,
+            TEAM_LEAD: SYNTHESIS,
+            REPORT_AUDIT: AUDIT,
+        }.get(raw_stage, raw_stage)
+        graph_status = str(state.get("status") or "running")
+        run["status"] = (
+            "completed"
+            if graph_status in {"completed", "completed_with_warnings"}
+            else "failed"
+            if graph_status == "failed"
+            else "cancelled"
+            if graph_status in {"cancelled", "interrupted"}
+            else "running"
+        )
+        run["completed"] = run["status"] == "completed"
+        activity = str(update.get("activity") or "").strip()
+        if activity:
+            run["note"] = activity
+
+        node_states = state.get("node_states")
+        member_states = state.get("members")
+        for projected in run.get("members", []):
+            if not isinstance(projected, dict):
+                continue
+            member_id = str(projected.get("id") or "")
+            node_state = (
+                node_states.get(member_id)
+                if isinstance(node_states, Mapping)
+                and isinstance(node_states.get(member_id), Mapping)
+                else {}
+            )
+            member_state = (
+                member_states.get(member_id)
+                if isinstance(member_states, Mapping)
+                and isinstance(member_states.get(member_id), Mapping)
+                else {}
+            )
+            status = str(
+                node_state.get("status")
+                or member_state.get("status")
+                or "pending"
+            )
+            projected["member_status"] = status
+            projected["status"] = (
+                "running" if status == "running"
+                else "completed" if status in {"completed", "failed", "cancelled"}
+                else "pending"
+            )
+            member_activity = str(
+                member_state.get("activity")
+                or node_state.get("activity")
+                or ""
+            ).strip()
+            if member_activity:
+                projected["activity"] = member_activity
+            artifact = str(member_state.get("artifact") or "").strip()
+            if artifact:
+                projected["artifact"] = artifact
+
+        self._persist_team_run_projection(
+            chat_id,
+            run_id,
+            activity=activity or "专家团队工作流已更新",
+        )
+        await self._send_turn_plan_snapshot(
+            chat_id,
+            turn_id=str(run.get("turn_id") or "") or None,
+        )
+
     async def send_team_member_updated(self, chat_id: str, member: dict[str, Any]) -> None:
         run_id = str(member.get("run_id") or "")
         run = self._team_runs.get((chat_id, run_id))
         persist_projection = False
         if run is not None:
+            graph_state = run.get("graph_state")
+            runtime_owned_graph = (
+                isinstance(graph_state, dict)
+                and int(graph_state.get("schema_version") or 0) >= 2
+            )
             member_id = str(member.get("id") or "")
             projected_member = next(
                 (
@@ -2907,28 +3182,32 @@ class WebSocketChannel(BaseChannel):
                 incoming_status = str(member.get("status") or "running")
                 previous_status = str(projected_member.get("member_status") or "")
                 previous_activity = str(projected_member.get("activity") or "").strip()
-                projected_member["member_status"] = incoming_status
-                projected_member["status"] = (
-                    "running" if incoming_status == "running" else "completed"
-                )
                 activity = str(member.get("activity") or "").strip()
                 if activity:
                     projected_member["activity"] = activity
-                artifact = str(member.get("artifact") or "").strip()
-                if artifact:
-                    projected_member["artifact"] = artifact
+                if not runtime_owned_graph:
+                    projected_member["member_status"] = incoming_status
+                    projected_member["status"] = (
+                        "running" if incoming_status == "running" else "completed"
+                    )
+                    artifact = str(member.get("artifact") or "").strip()
+                    if artifact:
+                        projected_member["artifact"] = artifact
                 # Running members can spend minutes in the same lifecycle
                 # state while moving through several visible research actions.
                 # Persist a distinct activity as a new workflow revision so
                 # reconnects and canonical-plan clients do not remain stuck on
                 # the initial "starting" description.
                 persist_projection = (
-                    incoming_status != previous_status
+                    (
+                        not runtime_owned_graph
+                        and incoming_status != previous_status
+                    )
                     or bool(activity and activity != previous_activity)
                 )
-            graph_state = run.get("graph_state")
             if (
-                isinstance(graph_state, dict)
+                not runtime_owned_graph
+                and isinstance(graph_state, dict)
                 and graph_state.get("node") == PREPARATION
                 and str(member.get("status") or "") in {
                     "running",
@@ -2943,7 +3222,19 @@ class WebSocketChannel(BaseChannel):
                 )
                 run["note"] = "基础数据包已建立，四位专家正在并行研究"
                 persist_projection = True
-            if isinstance(graph_state, dict) and graph_state.get("node") == MEMBERS:
+            elif (
+                not runtime_owned_graph
+                and graph_state is None
+                and str(run.get("stage") or "") == PREPARATION
+            ):
+                run["stage"] = MEMBERS
+                run["note"] = "基础数据包已建立，四位专家正在并行研究"
+                persist_projection = True
+            if (
+                not runtime_owned_graph
+                and isinstance(graph_state, dict)
+                and graph_state.get("node") == MEMBERS
+            ):
                 graph_state = advance_asset_research_graph(
                     graph_state,
                     "member_updated",
@@ -2964,14 +3255,16 @@ class WebSocketChannel(BaseChannel):
                 for item in run.get("members", [])
             )
             if (
-                all_members_terminal
+                not runtime_owned_graph
+                and all_members_terminal
                 and str(run.get("stage") or "members") == "members"
             ):
                 run["stage"] = "synthesis"
                 run["note"] = "专家研究已全部交付，主笔正在交叉质证与汇总"
                 persist_projection = True
             elif (
-                isinstance(graph_state, dict)
+                not runtime_owned_graph
+                and isinstance(graph_state, dict)
                 and graph_state.get("node") == SYNTHESIS
             ):
                 run["note"] = "专家研究已全部交付，主笔正在交叉质证与汇总"

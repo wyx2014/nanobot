@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.skill_scope import allowed_workspace_skills_from_scope, explicit_skills_from_scope
+from nanobot.agent.skill_scope import (
+    allowed_workspace_skills_from_scope,
+    explicit_skills_from_scope,
+)
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
@@ -27,9 +30,9 @@ from nanobot.utils.prompt_templates import render_template
 from nanobot.webui.expert_teams import (
     expert_team_resume_runtime_lines,
     expert_team_system_prompt,
+    expert_team_turn_runtime_lines,
 )
 from nanobot.webui.interactive_prompt import interactive_prompt_answer_session_extra
-
 
 _EXPLICIT_INTERACTIVE_INTAKE_PATTERNS = (
     re.compile(r"\bask me (?:one|1|two|2)?\s*(?:or|-)?\s*(?:two|2)?\s*key questions\b", re.IGNORECASE),
@@ -299,6 +302,7 @@ class ContextBuilder:
         unified_session: bool = False,
         skill_scope: Mapping[str, Any] | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        turn_metadata: Mapping[str, Any] | None = None,
         project_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -373,7 +377,10 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        team_prompt = expert_team_system_prompt(session_metadata)
+        team_prompt = expert_team_system_prompt(
+            session_metadata,
+            turn_metadata=turn_metadata,
+        )
         if team_prompt:
             parts.append(team_prompt)
 
@@ -626,6 +633,9 @@ class ContextBuilder:
             *expert_team_resume_runtime_lines(
                 msg_metadata if isinstance(msg_metadata, Mapping) else None
             ),
+            *expert_team_turn_runtime_lines(
+                msg_metadata if isinstance(msg_metadata, Mapping) else None
+            ),
         ]
         if runtime_state is not None and inbound_message is not None:
             extra.extend(runtime_lines(runtime_state, inbound_message, root, skip=skip_runtime_lines))
@@ -672,6 +682,7 @@ class ContextBuilder:
                     unified_session=unified_session,
                     skill_scope=skill_scope if isinstance(skill_scope, Mapping) else None,
                     session_metadata=session_metadata,
+                    turn_metadata=msg_metadata if isinstance(msg_metadata, Mapping) else None,
                     project_id=project_id,
                 ),
             },
@@ -711,7 +722,7 @@ class ContextBuilder:
 
         # Claude vision API only supports these MIME types.
         # SVG and other formats cause count_token_failed errors.
-        _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+        supported_image_mimes = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
         images = []
         for path in media:
@@ -720,7 +731,7 @@ class ContextBuilder:
                 continue
             raw = p.read_bytes()
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-            if not mime or mime not in _SUPPORTED_IMAGE_MIMES:
+            if not mime or mime not in supported_image_mimes:
                 continue
             b64 = base64.b64encode(raw).decode()
             images.append({

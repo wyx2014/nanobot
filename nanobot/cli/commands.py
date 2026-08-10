@@ -38,19 +38,33 @@ _log_handler_id = logger.add(
     filter=lambda record: record["extra"].setdefault("channel", "-") or True,
 )
 
-from prompt_toolkit import PromptSession, print_formatted_text  # noqa: E402
-from prompt_toolkit.application import run_in_terminal  # noqa: E402
-from prompt_toolkit.formatted_text import ANSI, HTML  # noqa: E402
-from prompt_toolkit.history import FileHistory  # noqa: E402
-from prompt_toolkit.patch_stdout import patch_stdout  # noqa: E402
 from rich.console import Console  # noqa: E402
-from rich.markdown import Markdown  # noqa: E402
-from rich.table import Table  # noqa: E402
-from rich.text import Text  # noqa: E402
+
+_DESKTOP_GATEWAY_IMPORT_PROFILE = os.environ.get("NANOBOT_DESKTOP_GATEWAY") == "1"
+
+if not _DESKTOP_GATEWAY_IMPORT_PROFILE:
+    from prompt_toolkit import PromptSession, print_formatted_text  # noqa: E402
+    from prompt_toolkit.application import run_in_terminal  # noqa: E402
+    from prompt_toolkit.formatted_text import ANSI, HTML  # noqa: E402
+    from prompt_toolkit.history import FileHistory  # noqa: E402
+    from prompt_toolkit.patch_stdout import patch_stdout  # noqa: E402
+    from rich.markdown import Markdown  # noqa: E402
+    from rich.table import Table  # noqa: E402
+    from rich.text import Text  # noqa: E402
+
+    from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
+else:
+    # These names are referenced by CLI-only helper definitions below, but
+    # none of those helpers execute for ``desktop-gateway``. Lightweight
+    # placeholders keep annotations and class definitions import-safe without
+    # importing the terminal stack on every desktop cold start.
+    PromptSession = Any
+    FileHistory = object
+    StreamRenderer = Any
+    ThinkingSpinner = Any
 
 from nanobot import __logo__, __version__  # noqa: E402
 from nanobot.agent.loop import AgentLoop  # noqa: E402
-from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
 from nanobot.config.paths import get_workspace_path, is_default_workspace  # noqa: E402
 from nanobot.config.schema import Config  # noqa: E402
 from nanobot.utils.evaluator import evaluate_response  # noqa: E402
@@ -1265,6 +1279,7 @@ def _run_gateway(
         webui_runtime_surface=webui_runtime_surface,
         webui_runtime_capabilities=webui_runtime_capabilities,
         webui_thread_runtime_registry=getattr(agent, "thread_runtime_registry", None),
+        webui_expert_team_turn_router=getattr(agent, "route_expert_team_turn", None),
     )
     channel_map = getattr(channels, "channels", {})
     websocket_channel = (
@@ -1406,7 +1421,10 @@ def _run_gateway(
         transient_tasks: list[asyncio.Task[Any]] = []
         shutdown_waiter: asyncio.Task[bool] | None = None
         services_done: asyncio.Future[list[Any]] | None = None
-        restore_signal_handlers: Callable[[], None] = lambda: None
+
+        def restore_signal_handlers() -> None:
+            pass
+
         try:
             await cron.start()
             service_tasks.extend([

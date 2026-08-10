@@ -16,16 +16,9 @@ from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.context import current_request_context
-from nanobot.agent.tools.request_user_input import InteractivePromptRequested
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.request_user_input import InteractivePromptRequested
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.runtime.trace_context import (
-    TraceContext,
-    current_trace_context,
-    reset_trace_context,
-    set_trace_context,
-)
-from nanobot.security.project_context import current_project_context
 from nanobot.runtime.plan_policy import (
     PLAN_TOOL_NAME,
     PlanPolicyState,
@@ -33,6 +26,13 @@ from nanobot.runtime.plan_policy import (
     decide_plan_policy,
     plan_required_result,
 )
+from nanobot.runtime.trace_context import (
+    TraceContext,
+    current_trace_context,
+    reset_trace_context,
+    set_trace_context,
+)
+from nanobot.security.project_context import current_project_context
 from nanobot.utils.file_edit_events import (
     StreamingFileEditTracker,
     build_file_edit_end_event,
@@ -62,12 +62,14 @@ from nanobot.utils.progress_events import (
 from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
+    available_structured_finance_sources,
     build_budget_exhausted_finalization_message,
     build_finalization_retry_message,
     build_goal_continue_message,
     build_length_recovery_message,
     ensure_nonempty_tool_result,
     is_blank_text,
+    mark_structured_finance_source_attempted,
     mark_structured_finance_source_failed,
     normalize_tool_message_content,
     repeated_external_lookup_error,
@@ -76,6 +78,7 @@ from nanobot.utils.runtime import (
     structured_finance_fallback_instruction,
     structured_finance_result_failed,
     structured_finance_source,
+    structured_finance_source_priority_error,
 )
 
 GoalContinueMessage = str | Callable[[], str | None]
@@ -147,6 +150,7 @@ class AgentRunSpec:
     parent_span_id: str | None = None
     agent_kind: str = "main"
     agent_label: str | None = None
+    enforce_finance_source_priority: bool = False
 
 
 @dataclass(slots=True)
@@ -695,6 +699,22 @@ class AgentRunner:
                     },
                 )
 
+                source_priority_errors: dict[str, str] = {}
+                if spec.enforce_finance_source_priority:
+                    available_sources = available_structured_finance_sources(
+                        spec.tools.tool_names
+                    )
+                    for tool_call in response.tool_calls:
+                        priority_error = structured_finance_source_priority_error(
+                            tool_call.name,
+                            tool_call.arguments,
+                            external_lookup_counts,
+                            available_sources,
+                        )
+                        if priority_error is not None:
+                            source_priority_errors[tool_call.id] = priority_error
+                    context.hidden_tool_call_ids.update(source_priority_errors)
+
                 plan_decision = decide_plan_policy(
                     (tool_call.name for tool_call in response.tool_calls),
                     plan_policy_state,
@@ -704,11 +724,11 @@ class AgentRunner:
                     plan_decision.requires_plan
                     and not plan_policy_state.plan_created
                 ):
-                    context.hidden_tool_call_ids = {
+                    context.hidden_tool_call_ids.update({
                         tool_call.id
                         for tool_call in response.tool_calls
                         if tool_call.name != PLAN_TOOL_NAME
-                    }
+                    })
                 await hook.before_execute_tools(context)
 
                 results, new_events, fatal_error, interactive_prompt_requested = await self._execute_tools(
@@ -719,6 +739,7 @@ class AgentRunner:
                     local_lookup_state,
                     plan_policy_state,
                     expert_team=expert_team_plan,
+                    source_priority_errors=source_priority_errors,
                 )
                 tool_events.extend(new_events)
                 blocked_repeated_external_lookup = any(
@@ -1631,6 +1652,7 @@ class AgentRunner:
         plan_policy_state: PlanPolicyState | None = None,
         *,
         expert_team: bool = False,
+        source_priority_errors: dict[str, str] | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None, bool]:
         local_lookup_state = local_lookup_state if local_lookup_state is not None else {}
         # Direct callers of this internal helper predate PlanPolicy and are
@@ -1683,6 +1705,9 @@ class AgentRunner:
                             external_lookup_counts,
                             workspace_violation_counts,
                             local_lookup_state,
+                            source_priority_error=(
+                                source_priority_errors or {}
+                            ).get(tool_call.id),
                         )
                         tool_results.append(result)
                         if (
@@ -1709,6 +1734,9 @@ class AgentRunner:
                         external_lookup_counts,
                         workspace_violation_counts,
                         local_lookup_state,
+                        source_priority_error=(
+                            source_priority_errors or {}
+                        ).get(tool_call.id),
                     )
                     for tool_call in batch
                 ))
@@ -1722,6 +1750,9 @@ class AgentRunner:
                         external_lookup_counts,
                         workspace_violation_counts,
                         local_lookup_state,
+                        source_priority_error=(
+                            source_priority_errors or {}
+                        ).get(tool_call.id),
                     )
                     tool_results.append(result)
                     batch_results.append(result)
@@ -1755,6 +1786,8 @@ class AgentRunner:
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
         local_lookup_state: dict[str, Any],
+        *,
+        source_priority_error: str | None = None,
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         span_id = (
             await self.trace_collector.begin_span(
@@ -1788,6 +1821,7 @@ class AgentRunner:
                 external_lookup_counts,
                 workspace_violation_counts,
                 local_lookup_state,
+                source_priority_error=source_priority_error,
             )
         except asyncio.CancelledError:
             if self.trace_collector is not None:
@@ -1837,9 +1871,27 @@ class AgentRunner:
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
         local_lookup_state: dict[str, Any],
+        *,
+        source_priority_error: str | None = None,
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         finance_source = structured_finance_source(tool_call.name, tool_call.arguments)
+        if source_priority_error is None and spec.enforce_finance_source_priority:
+            source_priority_error = structured_finance_source_priority_error(
+                tool_call.name,
+                tool_call.arguments,
+                external_lookup_counts,
+                available_structured_finance_sources(spec.tools.tool_names),
+            )
+        if source_priority_error:
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": "asset-research source priority blocked",
+            }
+            if spec.fail_on_tool_error:
+                return source_priority_error + hint, event, RuntimeError(source_priority_error)
+            return source_priority_error + hint, event, None
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,
@@ -1944,6 +1996,11 @@ class AgentRunner:
             }
             return exc, event, None
         except BaseException as exc:
+            if finance_source is not None:
+                mark_structured_finance_source_attempted(
+                    external_lookup_counts,
+                    finance_source,
+                )
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(
                     progress_callback,
@@ -1980,6 +2037,12 @@ class AgentRunner:
             if spec.fail_on_tool_error:
                 return payload, event, exc
             return payload, event, None
+
+        if finance_source is not None:
+            mark_structured_finance_source_attempted(
+                external_lookup_counts,
+                finance_source,
+            )
 
         if isinstance(result, str) and result.startswith("Error"):
             if file_edit_trackers and progress_callback is not None:

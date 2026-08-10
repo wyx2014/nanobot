@@ -2,12 +2,13 @@
 
 import asyncio
 import functools
+import io
 import json
 import random
 import socket
+import sqlite3
 import time
 import zipfile
-import io
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -673,6 +674,71 @@ async def test_thread_resource_anchors_user_before_long_turn_tail(
         assert payload["message_page"]["has_more_before"] is True
         assert payload["message_page"]["before_event_seq"] == 7
         assert payload["message_page"]["loaded_message_count"] == 2
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_thread_resource_tolerates_legacy_malformed_message_projection(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    session_key = "websocket:thread-malformed-json"
+    sm = _seed_session(tmp_path, key=session_key)
+    port = _free_port()
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+        port=port,
+    )
+    project = channel.gateway.state.ensure_project(tmp_path)
+    session = channel.gateway.state.bind_session(session_key, project.id)
+    channel.gateway.journal.commit(
+        session_key,
+        {
+            "event": "user",
+            "turn_id": "turn-malformed",
+            "text": "帮我分析下 特变电工 A股",
+        },
+    )
+    channel.gateway.journal.commit(
+        session_key,
+        {
+            "event": "message",
+            "turn_id": "turn-malformed",
+            "kind": "progress",
+            "text": "working",
+        },
+    )
+    with sqlite3.connect(channel.gateway.state.path) as connection:
+        connection.execute(
+            "UPDATE messages SET content_json = ? "
+            "WHERE session_id = ? AND sequence_no = 2",
+            ('{"truncated":', session.id),
+        )
+        connection.commit()
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get(f"http://127.0.0.1:{port}/webui/bootstrap")
+        auth = {"Authorization": f"Bearer {boot.json()['token']}"}
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/sessions/"
+            "websocket%3Athread-malformed-json/thread?message_limit=200",
+            headers=auth,
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["messages"][0]["role"] == "user"
+        assert payload["messages"][0]["content"] == "帮我分析下 特变电工 A股"
+        assert any(
+            message["content"] == "working"
+            for message in payload["messages"]
+        )
     finally:
         await channel.stop()
         await server_task

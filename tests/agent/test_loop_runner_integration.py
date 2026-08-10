@@ -9,8 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.agent.loop import _generated_artifact_paths
-
+from nanobot.agent.loop import (
+    _generated_artifact_paths,
+    _SingleRewriteAuditToolRegistry,
+)
+from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
@@ -27,10 +31,148 @@ def _make_loop(tmp_path):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
+
+
+@pytest.mark.asyncio
+async def test_state_run_routes_asset_team_to_runtime_graph_not_general_agent(tmp_path):
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.bus.events import InboundMessage
+
+    loop = _make_loop(tmp_path)
+    loop._last_usage = {"total_tokens": 7}
+    loop._run_asset_research_workflow = AsyncMock(return_value=(
+        "graph delivered",
+        ["write_file"],
+        [{"role": "assistant", "content": "graph delivered"}],
+        "completed",
+        False,
+    ))
+    loop._run_agent_loop = AsyncMock()
+    runtime_events = MagicMock()
+    runtime_events.run_status_changed = AsyncMock()
+    loop._runtime_events = MagicMock(return_value=runtime_events)
+    session = MagicMock()
+    session.metadata = {}
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="chat-graph",
+        content="A股 北方华创",
+        metadata={
+            "expert_team": {"id": "asset-research-team"},
+            "expert_team_run_id": "run-graph",
+            "_expert_team_turn_route": {
+                "action": "run",
+                "target": "北方华创",
+            },
+        },
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session_key="websocket:chat-graph",
+        state=TurnState.RUN,
+        turn_id="turn-graph",
+        session=session,
+    )
+
+    event = await loop._state_run(ctx)
+
+    assert event == "ok"
+    loop._run_asset_research_workflow.assert_awaited_once_with(ctx)
+    loop._run_agent_loop.assert_not_awaited()
+    assert ctx.final_content == "graph delivered"
+    assert ctx.stop_reason == "completed"
+    assert ctx.turn_usage == {"total_tokens": 7}
+
+
+@pytest.mark.asyncio
+async def test_asset_workflow_applies_strict_policy_only_to_report_audit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
+    from nanobot.bus.events import InboundMessage
+    from nanobot.graph.workflows.asset_research import REPORT_AUDIT
+    from nanobot.graph.workflows.asset_research_runtime import (
+        AUDIT_MAX_TOOL_ITERATIONS,
+        AssetResearchWorkflowOutcome,
+    )
+    from nanobot.session.manager import Session
+
+    loop = _make_loop(tmp_path)
+    tools = ToolRegistry()
+    tools.register(ReadFileTool(workspace=tmp_path))
+    tools.register(WriteFileTool(workspace=tmp_path))
+    tools.register(EditFileTool(workspace=tmp_path))
+    loop.tools = tools
+    loop._last_usage = {}
+    loop._run_agent_loop = AsyncMock(return_value=(
+        "审校完成",
+        [],
+        [],
+        "completed",
+        False,
+    ))
+
+    class AuditOnlyRuntime:
+        def __init__(self, *, run_agent_node, **_kwargs) -> None:
+            self._run_agent_node = run_agent_node
+
+        async def run(self, **_kwargs) -> AssetResearchWorkflowOutcome:
+            await self._run_agent_node(REPORT_AUDIT, "audit", True)
+            return AssetResearchWorkflowOutcome(
+                final_content="done",
+                stop_reason="completed",
+                graph_state={},
+                tools_used=[],
+                usage={},
+                artifacts=[],
+            )
+
+    monkeypatch.setattr(
+        "nanobot.agent.loop.AssetResearchWorkflowRuntime",
+        AuditOnlyRuntime,
+    )
+    session = Session(key="websocket:audit", metadata={})
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="audit",
+        content="分析安集科技",
+        metadata={
+            "expert_team": {
+                "id": "asset-research-team",
+                "mcp_presets": [],
+            },
+            "expert_team_run_id": "run-audit",
+            "_expert_team_turn_route": {
+                "action": "run",
+                "target": "安集科技",
+            },
+        },
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session_key=session.key,
+        state=TurnState.RUN,
+        turn_id="turn-audit",
+        session=session,
+        initial_messages=[{"role": "system", "content": "system"}],
+        tools=tools,
+    )
+
+    await loop._run_asset_research_workflow(ctx)
+
+    kwargs = loop._run_agent_loop.await_args.kwargs
+    assert kwargs["max_iterations"] == AUDIT_MAX_TOOL_ITERATIONS
+    assert "finalize_on_max_iterations" not in kwargs
+    assert "write_file" in kwargs["tools"].tool_names
+    assert "edit_file" not in kwargs["tools"].tool_names
 
 
 @pytest.mark.asyncio
@@ -148,6 +290,86 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
         "I reached the maximum number of tool call iterations (2) "
         "without completing the task. You can try breaking the task into smaller steps."
     )
+
+
+@pytest.mark.asyncio
+async def test_loop_node_iteration_limit_uses_one_no_tools_finalization(
+    tmp_path,
+):
+    loop = _make_loop(tmp_path)
+    call_index = 0
+
+    async def keep_auditing(*, tools=None, **_kwargs) -> LLMResponse:
+        nonlocal call_index
+        call_index += 1
+        if tools is None:
+            return LLMResponse(
+                content="核心结论：竞争优势明确，估值仍需保留安全边际。",
+                tool_calls=[],
+            )
+        return LLMResponse(
+            content="still auditing",
+            tool_calls=[ToolCallRequest(
+                id=f"call_{call_index}",
+                name="read_file",
+                arguments={"path": f"reports/part-{call_index}.md"},
+            )],
+        )
+
+    loop.provider.chat_with_retry = AsyncMock(side_effect=keep_auditing)
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.tools.execute = AsyncMock(return_value="ok")
+
+    final_content, _, _, stop_reason, _ = await loop._run_agent_loop(
+        [],
+        max_iterations=5,
+    )
+
+    assert stop_reason == "max_iterations"
+    assert loop.provider.chat_with_retry.await_count == 6
+    assert loop.provider.chat_with_retry.await_args_list[-1].kwargs["tools"] is None
+    assert final_content == "核心结论：竞争优势明确，估值仍需保留安全边际。"
+
+
+@pytest.mark.asyncio
+async def test_audit_tool_registry_allows_only_one_complete_rewrite() -> None:
+    class CountingTool(Tool):
+        def __init__(self, name: str) -> None:
+            self._name = name
+            self.calls = 0
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+        @property
+        def description(self) -> str:
+            return self._name
+
+        @property
+        def parameters(self) -> dict[str, Any]:
+            return {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            }
+
+        async def execute(self, **_kwargs: Any) -> str:
+            self.calls += 1
+            return "written"
+
+    source = ToolRegistry()
+    write = CountingTool("write_file")
+    source.register(write)
+    source.register(CountingTool("edit_file"))
+    audit_tools = _SingleRewriteAuditToolRegistry(source)
+
+    assert "edit_file" not in audit_tools.tool_names
+    assert await audit_tools.execute("write_file", {"path": "reports/a.md"}) == "written"
+    second = await audit_tools.execute("write_file", {"path": "reports/a.md"})
+
+    assert "single allowed complete report rewrite" in second
+    assert write.calls == 1
 
 
 @pytest.mark.asyncio

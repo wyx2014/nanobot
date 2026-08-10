@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -201,3 +203,124 @@ def test_display_event_envelopes_keep_only_latest_task_progress_per_plan(
         "plan-b",
     ]
     assert progress[0]["agent_ui"]["revision"] == 2
+
+
+def test_large_projected_message_remains_valid_json(tmp_path: Path) -> None:
+    state, session = _state(tmp_path)
+    files = SessionEventFileStore(tmp_path / "runtime" / "session-events")
+    service = SessionEventService(SessionEventJournal(
+        state=state,
+        logs=StructuredLogStore(tmp_path / "runtime" / "logs.sqlite"),
+        append_record=files.append,
+        read_records=files.read,
+    ))
+    service.commit(
+        session.session_key,
+        {
+            "event": "message",
+            "turn_id": "turn-large",
+            "kind": "progress",
+            "text": "",
+            "tool_events": [
+                {
+                    "name": f"large_lookup_{index}",
+                    "result": "large-result-" * 2_000,
+                }
+                for index in range(8)
+            ],
+        },
+    )
+
+    with sqlite3.connect(state.path) as connection:
+        content_json, event_json = connection.execute(
+            """
+            SELECT m.content_json, pe.payload_json
+            FROM messages AS m
+            JOIN projected_events AS pe
+              ON pe.project_id = m.project_id
+             AND pe.session_id = m.session_id
+             AND pe.event_seq = m.sequence_no
+            WHERE m.session_id = ?
+            """,
+            (session.id,),
+        ).fetchone()
+
+    assert len(str(event_json)) > 64_000
+    assert len(str(content_json)) <= 64_000
+    assert isinstance(json.loads(str(content_json)), dict)
+    display = state.session_display_event_envelopes(session.session_key)
+    assert len(display) == 1
+    assert display[0]["tool_events"][0]["result"].startswith("large-result-")
+
+
+def test_display_event_envelopes_tolerate_legacy_malformed_json(
+    tmp_path: Path,
+) -> None:
+    state, session = _state(tmp_path)
+    files = SessionEventFileStore(tmp_path / "runtime" / "session-events")
+    service = SessionEventService(SessionEventJournal(
+        state=state,
+        logs=StructuredLogStore(tmp_path / "runtime" / "logs.sqlite"),
+        append_record=files.append,
+        read_records=files.read,
+    ))
+    service.commit(
+        session.session_key,
+        {"event": "user", "turn_id": "turn-a", "text": "research"},
+    )
+    service.commit(
+        session.session_key,
+        {
+            "event": "message",
+            "turn_id": "turn-a",
+            "kind": "progress",
+            "text": "working",
+        },
+    )
+    with sqlite3.connect(state.path) as connection:
+        connection.execute(
+            "UPDATE messages SET content_json = ? WHERE sequence_no = 2",
+            ('{"truncated":',),
+        )
+        connection.commit()
+
+    display = state.session_display_event_envelopes(session.session_key)
+
+    assert [event["event_seq"] for event in display] == [1, 2]
+    assert display[1]["text"] == "working"
+
+
+def test_schema_upgrade_repairs_legacy_malformed_message_json(
+    tmp_path: Path,
+) -> None:
+    state, session = _state(tmp_path)
+    files = SessionEventFileStore(tmp_path / "runtime" / "session-events")
+    service = SessionEventService(SessionEventJournal(
+        state=state,
+        logs=StructuredLogStore(tmp_path / "runtime" / "logs.sqlite"),
+        append_record=files.append,
+        read_records=files.read,
+    ))
+    service.commit(
+        session.session_key,
+        {"event": "user", "turn_id": "turn-a", "text": "repair me"},
+    )
+    with sqlite3.connect(state.path) as connection:
+        connection.execute(
+            "UPDATE messages SET content_json = ?",
+            ('{"truncated":',),
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version = 9",
+        )
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+
+    reopened = StateStore(state.path, default_workspace=tmp_path / "inbox")
+
+    with sqlite3.connect(reopened.path) as connection:
+        valid, content_json = connection.execute(
+            "SELECT json_valid(content_json), content_json FROM messages",
+        ).fetchone()
+    assert valid == 1
+    assert json.loads(str(content_json))["text"] == "repair me"

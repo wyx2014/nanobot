@@ -711,8 +711,12 @@ async def test_pending_queue_cleanup_on_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_preserves_running_expert_team_after_early_final_response(tmp_path):
-    """A normal early answer must not cancel unfinished expert-team members."""
+async def test_dispatch_cancels_orphaned_legacy_team_members_after_final_response(tmp_path):
+    """Legacy model-owned members must not outlive a committed final response.
+
+    The fixed asset-research graph waits for its runtime-owned member futures before
+    returning, so any member still visible here is an orphan from a legacy team path.
+    """
     from nanobot.bus.events import InboundMessage, OutboundMessage
 
     loop = _make_loop(tmp_path)
@@ -735,7 +739,7 @@ async def test_dispatch_preserves_running_expert_team_after_early_final_response
     )
     await loop._dispatch(msg)
 
-    loop.subagents.cancel_by_session.assert_not_awaited()
+    loop.subagents.cancel_by_session.assert_awaited_with("websocket:c")
 
 
 def test_expert_team_turns_are_marked_for_memory_isolation(tmp_path):
@@ -763,6 +767,56 @@ def test_expert_team_turns_are_marked_for_memory_isolation(tmp_path):
 
     assert session.messages[0][EXPERT_TEAM_TURN_KEY] == "asset-research-team"
     assert session.messages[1][EXPERT_TEAM_TURN_KEY] == "asset-research-team"
+
+
+def test_suppressed_expert_team_turn_does_not_inherit_session_binding(tmp_path):
+    from nanobot.agent.loop import _expert_team_binding
+    from nanobot.bus.events import InboundMessage
+    from nanobot.session.manager import Session
+    from nanobot.webui.expert_teams import EXPERT_TEAM_TURN_SUPPRESSED_KEY
+
+    loop = _make_loop(tmp_path)
+    session = Session(
+        key="websocket:chat",
+        metadata={"expert_team": {"id": "asset-research-team"}},
+    )
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="u",
+        chat_id="chat",
+        content="今天天气怎么样",
+        metadata={EXPERT_TEAM_TURN_SUPPRESSED_KEY: True},
+    )
+
+    assert _expert_team_binding(msg.metadata, session.metadata) is None
+    assert loop._persist_user_message_early(msg, session) is True
+    assert "_expert_team_turn" not in session.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_routes_expert_team_with_active_model(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content='{"action":"run","target":"比亚迪","reason":"specific stock"}',
+    ))
+
+    with patch("nanobot.webui.token_usage.record_token_usage") as record_usage:
+        decision = await loop.route_expert_team_turn(
+            history=[],
+            user_message="比亚迪",
+        )
+
+    assert decision == {
+        "action": "run",
+        "reason": "specific stock",
+        "target": "比亚迪",
+    }
+    loop.provider.chat_with_retry.assert_awaited_once()
+    record_usage.assert_called_once_with(
+        {},
+        source="user",
+        timezone_name=loop.context.timezone,
+    )
 
 
 @pytest.mark.asyncio

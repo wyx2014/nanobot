@@ -21,7 +21,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
-STATE_SCHEMA_VERSION = 8
+STATE_SCHEMA_VERSION = 9
+_VALID_MESSAGE_JSON_MIGRATION_VERSION = 9
+_SAFE_JSON_CHAR_LIMIT = 64_000
+_PROJECTED_MESSAGE_ENVELOPE_KEYS = frozenset({
+    "event_id",
+    "event_seq",
+    "schema_version",
+    "recorded_at",
+    "project_id",
+    "session_id",
+})
 _ID_NAMESPACE = uuid.UUID("8b77d594-7dc0-4f27-b76c-7b96e80743c9")
 _ARTIFACT_RELATIONS = {
     "generated",
@@ -707,11 +717,63 @@ def _redact_json_value(value: Any) -> Any:
 
 
 def _safe_json(value: Any) -> str:
-    return json.dumps(
-        _redact_json_value(value),
-        ensure_ascii=False,
-        sort_keys=True,
-    )[:64_000]
+    """Serialize a bounded value without ever cutting through JSON syntax."""
+
+    redacted = _redact_json_value(value)
+
+    def _encode(item: Any) -> str:
+        return json.dumps(item, ensure_ascii=False, sort_keys=True)
+
+    encoded = _encode(redacted)
+    if len(encoded) <= _SAFE_JSON_CHAR_LIMIT:
+        return encoded
+
+    def _compact(item: Any, *, string_limit: int, item_limit: int) -> Any:
+        if isinstance(item, dict):
+            return {
+                str(key): _compact(
+                    child,
+                    string_limit=string_limit,
+                    item_limit=item_limit,
+                )
+                for key, child in list(item.items())[:item_limit]
+            }
+        if isinstance(item, list):
+            return [
+                _compact(
+                    child,
+                    string_limit=string_limit,
+                    item_limit=item_limit,
+                )
+                for child in item[:item_limit]
+            ]
+        if isinstance(item, str):
+            return item[:string_limit]
+        return item
+
+    for string_limit, item_limit in (
+        (8_000, 200),
+        (4_000, 128),
+        (2_000, 64),
+        (1_000, 32),
+        (512, 16),
+        (256, 8),
+        (128, 4),
+    ):
+        encoded = _encode(_compact(
+            redacted,
+            string_limit=string_limit,
+            item_limit=item_limit,
+        ))
+        if len(encoded) <= _SAFE_JSON_CHAR_LIMIT:
+            return encoded
+
+    # Pathological nesting can still exceed the projection budget. Preserve a
+    # valid, redacted diagnostic preview rather than corrupting the JSON row.
+    return _encode({
+        "_truncated": True,
+        "preview": encoded[: _SAFE_JSON_CHAR_LIMIT // 4],
+    })
 
 
 def _redact_event_value(value: Any) -> Any:
@@ -921,6 +983,12 @@ class StateStore:
                 WHERE terminal_event_id IS NOT NULL
                 """
             )
+            repair_needed = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = ?",
+                (_VALID_MESSAGE_JSON_MIGRATION_VERSION,),
+            ).fetchone() is None
+            if repair_needed:
+                self._repair_invalid_message_json(connection)
             for version in range(1, STATE_SCHEMA_VERSION + 1):
                 connection.execute(
                     "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -928,6 +996,42 @@ class StateStore:
                 )
             connection.execute(f"PRAGMA user_version = {STATE_SCHEMA_VERSION}")
             connection.commit()
+
+    @staticmethod
+    def _repair_invalid_message_json(connection: sqlite3.Connection) -> int:
+        """Rebuild legacy truncated message projections from canonical events."""
+
+        rows = connection.execute(
+            """
+            SELECT m.id, pe.payload_json
+            FROM messages AS m
+            JOIN projected_events AS pe
+              ON pe.project_id = m.project_id
+             AND pe.session_id = m.session_id
+             AND pe.event_seq = m.sequence_no
+            WHERE json_valid(m.content_json) = 0
+              AND json_valid(pe.payload_json) = 1
+            """
+        ).fetchall()
+        repaired = 0
+        for row in rows:
+            try:
+                event = json.loads(str(row["payload_json"]))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            content = {
+                key: value
+                for key, value in event.items()
+                if key not in _PROJECTED_MESSAGE_ENVELOPE_KEYS
+            }
+            cursor = connection.execute(
+                "UPDATE messages SET content_json = ? WHERE id = ?",
+                (_safe_json(content), str(row["id"])),
+            )
+            repaired += max(0, int(cursor.rowcount))
+        return repaired
 
     @staticmethod
     def _ensure_column(
@@ -3011,14 +3115,7 @@ class StateStore:
         content = {
             key: value
             for key, value in event.items()
-            if key not in {
-                "event_id",
-                "event_seq",
-                "schema_version",
-                "recorded_at",
-                "project_id",
-                "session_id",
-            }
+            if key not in _PROJECTED_MESSAGE_ENVELOPE_KEYS
         }
         connection.execute(
             """
@@ -3732,26 +3829,37 @@ class StateStore:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
                 f"""
-                WITH ranked_messages AS (
+                WITH safe_messages AS (
+                    SELECT
+                        source.*,
+                        CASE
+                            WHEN json_valid(source.content_json)
+                            THEN source.content_json
+                            ELSE '{{}}'
+                        END AS safe_content_json
+                    FROM messages AS source
+                    WHERE source.project_id = ? AND source.session_id = ?
+                ),
+                ranked_messages AS (
                     SELECT
                         source.*,
                         ROW_NUMBER() OVER (
                             PARTITION BY CASE
                                 WHEN json_extract(
-                                    source.content_json,
+                                    source.safe_content_json,
                                     '$.agent_ui.kind'
                                 ) = 'task_progress'
                                 THEN 'task-progress:' || COALESCE(
                                     NULLIF(json_extract(
-                                        source.content_json,
+                                        source.safe_content_json,
                                         '$.agent_ui.plan_id'
                                     ), ''),
                                     NULLIF(json_extract(
-                                        source.content_json,
+                                        source.safe_content_json,
                                         '$.agent_ui.team_run_id'
                                     ), ''),
                                     NULLIF(json_extract(
-                                        source.content_json,
+                                        source.safe_content_json,
                                         '$.agent_ui.turn_id'
                                     ), ''),
                                     NULLIF(source.turn_id, ''),
@@ -3761,8 +3869,7 @@ class StateStore:
                             END
                             ORDER BY source.sequence_no DESC
                         ) AS display_rank
-                    FROM messages AS source
-                    WHERE source.project_id = ? AND source.session_id = ?
+                    FROM safe_messages AS source
                 )
                 SELECT
                     pe.event_id,
@@ -5093,12 +5200,21 @@ def open_state_store_with_recovery(
     path: str | Path,
     *,
     default_workspace: str | Path,
+    verify_integrity: bool = True,
 ) -> StateStoreRecovery:
-    """Open state.sqlite, backing up corrupt files before rebuilding projection."""
+    """Open state.sqlite, backing up corrupt files before rebuilding projection.
+
+    ``StateStore`` initialization already exercises the database header, schema,
+    migrations, and writable journal.  ``PRAGMA quick_check`` additionally scans
+    the entire projection, which can take many seconds once long-running desktop
+    workspaces grow into hundreds of megabytes.  Callers on a latency-sensitive
+    startup path may disable that full scan while retaining open/migration
+    recovery; maintenance and diagnostic callers keep the safer default.
+    """
     database_path = Path(path).expanduser()
     try:
         store = StateStore(database_path, default_workspace=default_workspace)
-        if not store.quick_check():
+        if verify_integrity and not store.quick_check():
             raise sqlite3.DatabaseError("PRAGMA quick_check failed")
         return StateStoreRecovery(store=store, backup_dir=None, reason=None)
     except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:

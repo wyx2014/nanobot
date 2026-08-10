@@ -303,6 +303,35 @@ class TestAnnounceResult:
         assert msg.metadata["subagent_task_id"] == "t1"
 
     @pytest.mark.asyncio
+    async def test_workflow_owned_result_returns_directly_without_new_agent_turn(
+        self,
+        tmp_path,
+    ):
+        sm = _manager(tmp_path)
+        sm.bus.publish_inbound = AsyncMock()
+        sm._workflow_task_ids.add("wf1")
+        sm._workflow_completion_futures["wf1"] = (
+            asyncio.get_running_loop().create_future()
+        )
+
+        await sm._announce_result(
+            "wf1",
+            "business-analyst",
+            "research business",
+            "current-run role report",
+            {"channel": "websocket", "chat_id": "chat-1"},
+            "ok",
+            expert_team=True,
+        )
+        [result] = await sm.wait_for_workflow_tasks(["wf1"])
+
+        sm.bus.publish_inbound.assert_not_awaited()
+        assert result.task_id == "wf1"
+        assert result.label == "business-analyst"
+        assert result.status == "ok"
+        assert result.content == "current-run role report"
+
+    @pytest.mark.asyncio
     async def test_session_key_override(self, tmp_path):
         sm = _manager(tmp_path)
         published = []

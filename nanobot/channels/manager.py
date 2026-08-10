@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -66,6 +66,9 @@ class ChannelManager:
         webui_runtime_surface: str = "browser",
         webui_runtime_capabilities: dict[str, Any] | None = None,
         webui_thread_runtime_registry: Any | None = None,
+        webui_expert_team_turn_router: (
+            Callable[..., Awaitable[dict[str, Any] | None]] | None
+        ) = None,
     ):
         self.config = config
         self.bus = bus
@@ -79,6 +82,7 @@ class ChannelManager:
         self._webui_runtime_surface = webui_runtime_surface
         self._webui_runtime_capabilities = dict(webui_runtime_capabilities or {})
         self._webui_thread_runtime_registry = webui_thread_runtime_registry
+        self._webui_expert_team_turn_router = webui_expert_team_turn_router
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
@@ -139,6 +143,7 @@ class ChannelManager:
                         cron_service=self._cron_service,
                         cron_pending_job_ids=self._webui_cron_pending_job_ids,
                         thread_runtime_registry=self._webui_thread_runtime_registry,
+                        expert_team_turn_router=self._webui_expert_team_turn_router,
                         logger=logger,
                     )
                     kwargs["gateway"] = gateway
