@@ -50,7 +50,25 @@ _DEFAULT_CUSTOM_TIMEOUT = 30
 _CUSTOM_ACTIONS = {"custom", "import", "import-cursor", "tools"}
 PLAYWRIGHT_MCP_PACKAGE = "@playwright/mcp@0.0.78"
 JUYUAN_MCP_URL = "https://api.gildata.com/mcp-servers/aidata-assistant-srv-api"
-DESKTOP_DEFAULT_MCP_PRESETS = ("juyuan", "playwright")
+CAIHUI_MCP_URL = "https://mcp.finchina.com/finchina-data-mcp-server/mcp"
+ANYSEARCH_MCP_URL = "https://api.anysearch.com/mcp"
+IFIND_MCP_BASE_URL = "https://api-mcp.51ifind.com:8643/ds-mcp-servers"
+IFIND_MCP_PRESET_NAMES = (
+    "hexin-ifind-ds-stock-mcp",
+    "hexin-ifind-ds-fund-mcp",
+    "hexin-ifind-ds-edb-mcp",
+    "hexin-ifind-ds-news-mcp",
+    "hexin-ifind-ds-bond-mcp",
+    "hexin-ifind-ds-global-stock-mcp",
+    "hexin-ifind-ds-index-mcp",
+)
+DESKTOP_DEFAULT_MCP_PRESETS = (
+    "juyuan",
+    "caihui_mcp",
+    *IFIND_MCP_PRESET_NAMES,
+    "anysearch",
+    "playwright",
+)
 RETIRED_DESKTOP_MCP_PRESETS = frozenset({
     "aws-docs",
     "brave-search",
@@ -86,6 +104,7 @@ class McpPresetField:
     required: bool = True
     env_var: str | None = None
     placeholder: str = ""
+    value_prefix: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,6 +128,37 @@ def _favicon_url(domain: str) -> str:
     return f"https://www.google.com/s2/favicons?domain={domain}&sz=64"
 
 
+def _ifind_preset(name: str, display_suffix: str, description: str) -> McpPreset:
+    return McpPreset(
+        name=name,
+        display_name=f"同花顺 iFinD {display_suffix}",
+        category="finance",
+        description=description,
+        docs_url="https://www.51ifind.com/",
+        transport="streamableHttp",
+        install_supported=True,
+        brand_domain="51ifind.com",
+        brand_color="#D71920",
+        requires="同花顺 iFinD MCP Key",
+        server=MCPServerConfig(
+            type="streamableHttp",
+            url=f"{IFIND_MCP_BASE_URL}/{name}",
+            connect_timeout=15,
+            tool_timeout=30,
+        ),
+        fields=(
+            McpPresetField(
+                name="ifind_api_key",
+                label="同花顺 iFinD Key",
+                target=("header", "Authorization"),
+                env_var="IFIND_MCP_API_KEY",
+                placeholder="请输入同花顺 iFinD MCP Key",
+            ),
+        ),
+        note="首次安装会预置连接器；填写 Key 后即可连接。",
+    )
+
+
 MCP_PRESETS: tuple[McpPreset, ...] = (
     McpPreset(
         name="juyuan",
@@ -120,7 +170,7 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
         install_supported=True,
         brand_domain="gildata.com",
         brand_color="#B42318",
-        requires="聚源 MCP 服务地址（含 token 参数）",
+        requires="聚源 MCP token",
         server=MCPServerConfig(
             type="streamableHttp",
             url=JUYUAN_MCP_URL,
@@ -136,7 +186,99 @@ MCP_PRESETS: tuple[McpPreset, ...] = (
                 placeholder="请输入聚源 MCP token",
             ),
         ),
-        note="首次安装会预置连接器；请在 MCP 服务地址中附带 token 参数后再启用。",
+        note="首次安装会预置连接器；填写 token 后即可连接。",
+    ),
+    McpPreset(
+        name="caihui_mcp",
+        display_name="财汇金融数据",
+        category="finance",
+        description="通过财汇金融数据 MCP 查询行情、公司、财务、公告及宏观区域数据。",
+        docs_url="https://www.finchina.com/",
+        transport="streamableHttp",
+        install_supported=True,
+        brand_domain="finchina.com",
+        brand_color="#C92027",
+        requires="财汇 MCP API Key",
+        server=MCPServerConfig(
+            type="streamableHttp",
+            url=CAIHUI_MCP_URL,
+            connect_timeout=15,
+            tool_timeout=30,
+        ),
+        fields=(
+            McpPresetField(
+                name="caihui_api_key",
+                label="财汇 API Key",
+                target=("header", "x-api-key"),
+                env_var="CAIHUI_MCP_API_KEY",
+                placeholder="请输入财汇 MCP API Key",
+            ),
+        ),
+        note="首次安装会预置连接器；填写 API Key 后即可连接。",
+    ),
+    _ifind_preset(
+        "hexin-ifind-ds-stock-mcp",
+        "股票",
+        "查询 A 股行情、公司资料、财务指标与股票结构化数据。",
+    ),
+    _ifind_preset(
+        "hexin-ifind-ds-fund-mcp",
+        "基金",
+        "查询公募基金、基金经理、净值与持仓等结构化数据。",
+    ),
+    _ifind_preset(
+        "hexin-ifind-ds-edb-mcp",
+        "宏观",
+        "查询宏观经济、行业与区域经济数据库指标。",
+    ),
+    _ifind_preset(
+        "hexin-ifind-ds-news-mcp",
+        "新闻",
+        "查询财经新闻、公司动态与市场资讯。",
+    ),
+    _ifind_preset(
+        "hexin-ifind-ds-bond-mcp",
+        "债券",
+        "查询债券行情、发行主体、条款与信用数据。",
+    ),
+    _ifind_preset(
+        "hexin-ifind-ds-global-stock-mcp",
+        "全球股票",
+        "查询港股、美股及其他全球股票市场数据。",
+    ),
+    _ifind_preset(
+        "hexin-ifind-ds-index-mcp",
+        "指数",
+        "查询境内外指数行情、成分与估值数据。",
+    ),
+    McpPreset(
+        name="anysearch",
+        display_name="AnySearch",
+        category="search",
+        description="通过 AnySearch MCP 搜索公开网页与实时资料。",
+        docs_url="https://anysearch.com/",
+        transport="streamableHttp",
+        install_supported=True,
+        brand_domain="anysearch.com",
+        brand_color="#2563EB",
+        requires="AnySearch API Key",
+        server=MCPServerConfig(
+            type="streamableHttp",
+            url=ANYSEARCH_MCP_URL,
+            connect_timeout=15,
+            tool_timeout=30,
+        ),
+        fields=(
+            McpPresetField(
+                name="anysearch_api_key",
+                label="AnySearch API Key",
+                target=("header", "Authorization"),
+                env_var="ANYSEARCH_API_KEY",
+                placeholder="请输入 AnySearch API Key",
+                value_prefix="Bearer ",
+            ),
+        ),
+        note="首次安装会预置连接器；填写 API Key 后即可连接。",
     ),
     McpPreset(
         name="playwright",
@@ -347,6 +489,13 @@ def _field_payload(field: McpPresetField, cfg: MCPServerConfig | None) -> dict[s
     }
 
 
+def _format_field_value(field: McpPresetField, value: str) -> str:
+    prefix = field.value_prefix
+    if not prefix or value.lower().startswith(prefix.lower()):
+        return value
+    return f"{prefix}{value}"
+
+
 def _resolve_field_value(
     field: McpPresetField,
     query: QueryParams,
@@ -354,27 +503,22 @@ def _resolve_field_value(
 ) -> str | None:
     provided = _query_value(query, field.name)
     if provided:
-        return provided
+        return _format_field_value(field, provided)
     current = _field_value_from_config(field, existing)
     if current:
         return current
     if field.env_var and os.environ.get(field.env_var):
-        return f"${{{field.env_var}}}"
+        return _format_field_value(field, f"${{{field.env_var}}}")
     return None
 
 
-def _materialize_server(
+def _apply_preset_fields(
     preset: McpPreset,
     query: QueryParams,
+    cfg: MCPServerConfig,
+    *,
     existing: MCPServerConfig | None,
 ) -> MCPServerConfig:
-    if preset.server is None or not preset.install_supported:
-        raise McpPresetError(f"{preset.display_name} is not supported yet", status=409)
-
-    cfg = _clone_server(preset.server)
-    provided_url = _query_first(query, "url")
-    if provided_url is not None and provided_url.strip():
-        cfg.url = provided_url.strip()
     for field_spec in preset.fields:
         value = _resolve_field_value(field_spec, query, existing)
         if not value:
@@ -393,6 +537,21 @@ def _materialize_server(
         elif target_kind == "url_param":
             cfg.url = _url_with_param(cfg.url, target_name, value)
     return _with_managed_stdio_cwd(preset.name, cfg)
+
+
+def _materialize_server(
+    preset: McpPreset,
+    query: QueryParams,
+    existing: MCPServerConfig | None,
+) -> MCPServerConfig:
+    if preset.server is None or not preset.install_supported:
+        raise McpPresetError(f"{preset.display_name} is not supported yet", status=409)
+
+    cfg = _clone_server(preset.server)
+    provided_url = _query_first(query, "url")
+    if provided_url is not None and provided_url.strip():
+        cfg.url = provided_url.strip()
+    return _apply_preset_fields(preset, query, cfg, existing=existing)
 
 
 def _update_server(existing: MCPServerConfig, query: QueryParams) -> MCPServerConfig:
@@ -435,14 +594,20 @@ def install_desktop_default_mcp_servers(config: Any) -> bool:
         if name in config.tools.mcp_servers:
             continue
         preset = _preset_by_name(name)
-        if name == "juyuan" and not os.environ.get("JUYUAN_MCP_TOKEN"):
+        missing_credentials = any(
+            field.required and not _field_configured(field, None)
+            for field in preset.fields
+        )
+        if missing_credentials:
             # Keep a credential-free placeholder in config so the connector is
             # installed in the toolbox, but do not make startup connect to an
             # unauthenticated remote endpoint.
+            template = preset.server or MCPServerConfig(type=preset.transport)
             server = MCPServerConfig(
-                type="streamableHttp",
-                connect_timeout=10,
-                tool_timeout=60,
+                type=template.type,
+                connect_timeout=template.connect_timeout,
+                tool_timeout=template.tool_timeout,
+                enabled_tools=list(template.enabled_tools),
             )
         else:
             server = _materialize_server(preset, {}, None)
@@ -497,6 +662,38 @@ def _connection_summary(cfg: MCPServerConfig | None) -> str:
         parsed = urllib.parse.urlsplit(cfg.url)
         return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     return ""
+
+
+def _connection_url_for_payload(
+    cfg: MCPServerConfig | None,
+    fields: tuple[McpPresetField, ...] = (),
+) -> str:
+    """Return an editable endpoint URL without exposing secret query values."""
+    if cfg is None or not cfg.url:
+        return ""
+    secret_params = {
+        target_name.lower()
+        for field in fields
+        for target_kind, target_name in (field.target,)
+        if field.secret and target_kind == "url_param"
+    }
+    if not secret_params:
+        return _SECRET_QUERY_RE.sub(r"\1<redacted>", cfg.url)
+    parsed = urllib.parse.urlsplit(cfg.url)
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in secret_params
+    ]
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urllib.parse.urlencode(query),
+            parsed.fragment,
+        )
+    )
 
 
 def _tool_allowlist(cfg: MCPServerConfig | None) -> list[str]:
@@ -630,7 +827,7 @@ def _preset_payload(preset: McpPreset, configured_servers: dict[str, MCPServerCo
             "command": cfg.command if cfg else "",
             "args": list(cfg.args) if cfg else [],
             "cwd": cfg.cwd if cfg else "",
-            "url": cfg.url if cfg else "",
+            "url": _connection_url_for_payload(cfg, preset.fields),
             "tool_timeout": cfg.tool_timeout if cfg else (preset.server.tool_timeout if preset.server else 30),
             "has_env": bool(cfg and cfg.env),
             "has_headers": bool(cfg and cfg.headers),
@@ -674,7 +871,7 @@ def _custom_payload(
             "command": cfg.command if cfg else "",
             "args": list(cfg.args) if cfg else [],
             "cwd": cfg.cwd if cfg else "",
-            "url": cfg.url if cfg else "",
+            "url": _connection_url_for_payload(cfg),
             "tool_timeout": cfg.tool_timeout if cfg else 30,
             "has_env": bool(cfg and cfg.env),
             "has_headers": bool(cfg and cfg.headers),
@@ -1058,15 +1255,6 @@ def custom_mcp_action(action: str, query: QueryParams) -> dict[str, Any]:
         payload["requires_restart"] = True
         return payload
 
-    if action == "update":
-        if existing is None:
-            raise McpPresetError("install the MCP preset before editing it", status=409)
-        config.tools.mcp_servers[name] = _update_server(existing, query)
-        save_config(config)
-        payload = mcp_presets_payload(last_action=_action_message(action, preset) if preset is not None else _server_action_message(action, name))
-        payload["requires_restart"] = True
-        return payload
-
     if action in {"import", "import-cursor"}:
         servers = _import_mcp_servers(_query_first(query, "config"))
         config.tools.mcp_servers.update(servers)
@@ -1108,6 +1296,26 @@ def mcp_presets_action(action: str, query: QueryParams) -> dict[str, Any]:
         config.tools.mcp_servers[preset.name] = _materialize_server(preset, query, existing)
         save_config(config)
         payload = mcp_presets_payload(last_action=_action_message(action, preset))
+        payload["requires_restart"] = True
+        return payload
+
+    if action == "update":
+        if existing is None:
+            raise McpPresetError("install the MCP preset before editing it", status=409)
+        updated = _update_server(existing, query)
+        if preset is not None:
+            # Blank credential inputs mean "keep the current key", including
+            # when the user edits the endpoint URL or other connection fields.
+            updated = _apply_preset_fields(preset, query, updated, existing=existing)
+        config.tools.mcp_servers[name] = updated
+        save_config(config)
+        payload = mcp_presets_payload(
+            last_action=(
+                _action_message(action, preset)
+                if preset is not None
+                else _server_action_message(action, name)
+            )
+        )
         payload["requires_restart"] = True
         return payload
 

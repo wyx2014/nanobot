@@ -8,6 +8,7 @@ import pytest
 from nanobot.config.loader import load_config
 from nanobot.config.schema import Config, MCPServerConfig
 from nanobot.webui.mcp_presets_api import (
+    DESKTOP_DEFAULT_MCP_PRESETS,
     McpPresetError,
     custom_mcp_action,
     install_desktop_default_mcp_servers,
@@ -20,6 +21,19 @@ from nanobot.webui.mcp_presets_api import (
 
 mcp_module = importlib.import_module("nanobot.agent.tools.mcp")
 
+EXPECTED_FINANCE_AND_SEARCH_PRESETS = {
+    "juyuan",
+    "caihui_mcp",
+    "hexin-ifind-ds-stock-mcp",
+    "hexin-ifind-ds-fund-mcp",
+    "hexin-ifind-ds-edb-mcp",
+    "hexin-ifind-ds-news-mcp",
+    "hexin-ifind-ds-bond-mcp",
+    "hexin-ifind-ds-global-stock-mcp",
+    "hexin-ifind-ds-index-mcp",
+    "anysearch",
+}
+
 
 def _use_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("nanobot.config.loader._current_config_path", tmp_path / "config.json")
@@ -31,7 +45,7 @@ def test_mcp_presets_payload_lists_supported_cards(tmp_path, monkeypatch: pytest
     payload = mcp_presets_payload()
     names = {preset["name"] for preset in payload["presets"]}
 
-    assert names == {"juyuan", "playwright"}
+    assert names == {*EXPECTED_FINANCE_AND_SEARCH_PRESETS, "playwright"}
     juyuan = next(preset for preset in payload["presets"] if preset["name"] == "juyuan")
     assert juyuan["installed"] is False
     assert juyuan["install_supported"] is True
@@ -48,22 +62,53 @@ def test_mcp_presets_payload_lists_supported_cards(tmp_path, monkeypatch: pytest
     assert manifest["trust"]["review_status"] == "builtin_preset"
 
 
-def test_desktop_defaults_install_only_juyuan_and_playwright(
+def test_desktop_defaults_install_builtin_connectors_without_secrets(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _use_config(tmp_path, monkeypatch)
-    monkeypatch.delenv("JUYUAN_MCP_TOKEN", raising=False)
+    for env_var in (
+        "JUYUAN_MCP_TOKEN",
+        "CAIHUI_MCP_API_KEY",
+        "IFIND_MCP_API_KEY",
+        "ANYSEARCH_API_KEY",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
     config = Config()
 
     assert install_desktop_default_mcp_servers(config) is True
-    assert set(config.tools.mcp_servers) == {"juyuan", "playwright"}
-    assert config.tools.mcp_servers["juyuan"].url == ""
+    assert set(config.tools.mcp_servers) == set(DESKTOP_DEFAULT_MCP_PRESETS)
+    for name in EXPECTED_FINANCE_AND_SEARCH_PRESETS:
+        server = config.tools.mcp_servers[name]
+        assert server.type == "streamableHttp"
+        assert server.url == ""
+        assert server.headers == {}
     assert config.tools.mcp_servers["playwright"].args == [
         "-y",
         "@playwright/mcp@0.0.78",
     ]
     assert config.tools.mcp_servers["playwright"].cwd == str(tmp_path / "mcp" / "playwright")
+    assert install_desktop_default_mcp_servers(config) is False
+
+
+def test_desktop_defaults_preserve_existing_user_connector_settings(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+    config = Config()
+    config.tools.mcp_servers["anysearch"] = MCPServerConfig(
+        type="streamableHttp",
+        url="https://user.example/mcp",
+        headers={"Authorization": "Bearer user-key"},
+        tool_timeout=91,
+    )
+
+    assert install_desktop_default_mcp_servers(config) is True
+    existing = config.tools.mcp_servers["anysearch"]
+    assert existing.url == "https://user.example/mcp"
+    assert existing.headers == {"Authorization": "Bearer user-key"}
+    assert existing.tool_timeout == 91
     assert install_desktop_default_mcp_servers(config) is False
 
 
@@ -80,6 +125,21 @@ def test_desktop_defaults_use_juyuan_token_from_environment(
     assert config.tools.mcp_servers["juyuan"].url.endswith(
         "?token=%24%7BJUYUAN_MCP_TOKEN%7D"
     )
+
+
+def test_desktop_defaults_format_anysearch_environment_key_as_bearer(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANYSEARCH_API_KEY", "environment-secret")
+    config = Config()
+
+    install_desktop_default_mcp_servers(config)
+
+    assert config.tools.mcp_servers["anysearch"].headers == {
+        "Authorization": "Bearer ${ANYSEARCH_API_KEY}",
+    }
 
 
 def test_prune_retired_desktop_presets_preserves_custom_servers() -> None:
@@ -120,6 +180,108 @@ def test_enable_juyuan_writes_scrubbed_config_payload(
     assert "juyuan-secret" not in str(payload)
     config = load_config()
     assert "token=juyuan-secret" in config.tools.mcp_servers["juyuan"].url
+
+
+@pytest.mark.parametrize(
+    ("name", "field", "header", "value", "stored", "url"),
+    [
+        (
+            "caihui_mcp",
+            "caihui_api_key",
+            "x-api-key",
+            "caihui-secret",
+            "caihui-secret",
+            "https://mcp.finchina.com/finchina-data-mcp-server/mcp",
+        ),
+        (
+            "hexin-ifind-ds-stock-mcp",
+            "ifind_api_key",
+            "Authorization",
+            "ifind-secret",
+            "ifind-secret",
+            "https://api-mcp.51ifind.com:8643/ds-mcp-servers/hexin-ifind-ds-stock-mcp",
+        ),
+        (
+            "anysearch",
+            "anysearch_api_key",
+            "Authorization",
+            "anysearch-secret",
+            "Bearer anysearch-secret",
+            "https://api.anysearch.com/mcp",
+        ),
+    ],
+)
+def test_enable_builtin_finance_connector_writes_key_to_expected_header(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    field: str,
+    header: str,
+    value: str,
+    stored: str,
+    url: str,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+
+    payload = mcp_presets_action("enable", {"name": [name], field: [value]})
+
+    config = load_config()
+    server = config.tools.mcp_servers[name]
+    assert server.url == url
+    assert server.headers[header] == stored
+    assert value not in str(payload)
+    row = next(item for item in payload["presets"] if item["name"] == name)
+    assert row["source"] == "preset"
+    assert row["configured"] is True
+
+
+def test_update_builtin_connector_key_preserves_user_connection_settings(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+    mcp_presets_action(
+        "enable",
+        {"name": ["anysearch"], "anysearch_api_key": ["old-secret"]},
+    )
+    custom_mcp_action(
+        "tools",
+        {"name": ["anysearch"], "enabled_tools": ['["mcp_anysearch_search"]']},
+    )
+
+    payload = mcp_presets_action(
+        "update",
+        {"name": ["anysearch"], "anysearch_api_key": ["new-secret"]},
+    )
+
+    server = load_config().tools.mcp_servers["anysearch"]
+    assert server.url == "https://api.anysearch.com/mcp"
+    assert server.headers == {"Authorization": "Bearer new-secret"}
+    assert server.enabled_tools == ["mcp_anysearch_search"]
+    assert "old-secret" not in str(payload)
+    assert "new-secret" not in str(payload)
+
+
+def test_update_builtin_connector_url_keeps_existing_key(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+    mcp_presets_action(
+        "enable",
+        {"name": ["juyuan"], "juyuan_token": ["existing-secret"]},
+    )
+
+    payload = mcp_presets_action(
+        "update",
+        {"name": ["juyuan"], "url": ["https://finance.example/mcp"]},
+    )
+
+    server = load_config().tools.mcp_servers["juyuan"]
+    assert server.url == "https://finance.example/mcp?token=existing-secret"
+    assert "existing-secret" not in str(payload)
+    row = next(item for item in payload["presets"] if item["name"] == "juyuan")
+    assert row["connection"]["url"] == "https://finance.example/mcp"
 
 
 def test_enable_requires_missing_secret(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

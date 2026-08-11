@@ -21,6 +21,7 @@ from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
 from nanobot.providers.factory import ProviderSnapshot, make_provider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
+from nanobot.webui.mcp_presets_api import DESKTOP_DEFAULT_MCP_PRESETS
 from nanobot.webui.metadata import (
     WEBUI_MESSAGE_SOURCE_METADATA_KEY,
     WEBUI_TURN_METADATA_KEY,
@@ -52,7 +53,13 @@ def test_desktop_first_launch_installs_voice_and_mcp_defaults(
 
     original_config_path = get_config_path()
     config_path = tmp_path / "desktop" / "config.json"
-    monkeypatch.delenv("JUYUAN_MCP_TOKEN", raising=False)
+    for env_var in (
+        "JUYUAN_MCP_TOKEN",
+        "CAIHUI_MCP_API_KEY",
+        "IFIND_MCP_API_KEY",
+        "ANYSEARCH_API_KEY",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
     try:
         runtime = cli_commands._load_or_create_desktop_config(
             str(config_path),
@@ -71,7 +78,7 @@ def test_desktop_first_launch_installs_voice_and_mcp_defaults(
     assert persisted.model_presets[speech_preset].provider == "stepfun"
     assert persisted.model_presets[speech_preset].model == "stepaudio-2.5-asr"
     assert persisted.model_presets[speech_preset].capabilities == ["speech_to_text"]
-    assert set(persisted.tools.mcp_servers) == {"juyuan", "playwright"}
+    assert set(persisted.tools.mcp_servers) == set(DESKTOP_DEFAULT_MCP_PRESETS)
     assert persisted.tools.mcp_servers["juyuan"].url == ""
     assert persisted.tools.mcp_servers["playwright"].args == [
         "-y",
