@@ -72,6 +72,7 @@ def build_gateway_services(
         verify_integrity=runtime_surface != "native",
     )
     state = state_recovery.store
+    state.reconcile_default_workspace_project()
     logs = StructuredLogStore(workspace_path / ".nanobot" / "logs.sqlite")
     traces = TraceStore(logs.path)
     if state_recovery.backup_dir is not None:

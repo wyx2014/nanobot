@@ -45,7 +45,7 @@ def test_desktop_playwright_mcp_migration_pins_latest() -> None:
     assert cli_commands._pin_desktop_playwright_mcp(config) is False
 
 
-def test_desktop_first_launch_installs_voice_and_mcp_defaults(
+def test_desktop_first_launch_leaves_voice_empty_and_installs_mcp_defaults(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -69,25 +69,26 @@ def test_desktop_first_launch_installs_voice_and_mcp_defaults(
     finally:
         set_config_path(original_config_path)
 
-    assert persisted.transcription.enabled is True
-    assert persisted.transcription.provider == "stepfun"
-    assert persisted.transcription.model == "stepaudio-2.5-asr"
-    assert persisted.transcription.language == "zh"
-    speech_preset = persisted.model_defaults.speech_to_text
-    assert speech_preset
-    assert persisted.model_presets[speech_preset].provider == "stepfun"
-    assert persisted.model_presets[speech_preset].model == "stepaudio-2.5-asr"
-    assert persisted.model_presets[speech_preset].capabilities == ["speech_to_text"]
+    assert persisted.transcription.enabled is False
+    assert persisted.transcription.provider is None
+    assert persisted.transcription.model is None
+    assert persisted.transcription.language is None
+    assert persisted.model_defaults.speech_to_text is None
+    assert not any(
+        "speech_to_text" in preset.capabilities
+        for preset in persisted.model_presets.values()
+    )
     assert set(persisted.tools.mcp_servers) == set(DESKTOP_DEFAULT_MCP_PRESETS)
     assert persisted.tools.mcp_servers["juyuan"].url == ""
     assert persisted.tools.mcp_servers["playwright"].args == [
         "-y",
         "@playwright/mcp@0.0.78",
     ]
-    assert runtime.transcription.provider == "stepfun"
+    assert runtime.transcription.enabled is False
+    assert runtime.transcription.provider is None
 
 
-def test_desktop_existing_config_migrates_empty_transcription_to_step(
+def test_desktop_existing_config_keeps_empty_transcription_disabled(
     tmp_path: Path,
 ) -> None:
     from nanobot.config.loader import get_config_path, load_config, set_config_path
@@ -105,13 +106,90 @@ def test_desktop_existing_config_migrates_empty_transcription_to_step(
     finally:
         set_config_path(original_config_path)
 
+    assert persisted.transcription.enabled is False
+    assert persisted.transcription.provider is None
+    assert persisted.transcription.model is None
+    assert persisted.model_defaults.speech_to_text is None
+    assert runtime.transcription.enabled is False
+    assert runtime.transcription.provider is None
+
+
+def test_desktop_existing_config_preserves_explicit_voice_service(
+    tmp_path: Path,
+) -> None:
+    from nanobot.config.loader import get_config_path, load_config, save_config, set_config_path
+
+    original_config_path = get_config_path()
+    config_path = tmp_path / "desktop" / "config.json"
+    config = Config()
+    config.transcription.enabled = True
+    config.transcription.provider = "stepfun"
+    config.transcription.model = "stepaudio-2.5-asr"
+    config.providers.stepfun.api_key = "voice-key"
+    save_config(config, config_path)
+    try:
+        runtime = cli_commands._load_or_create_desktop_config(
+            str(config_path),
+            None,
+        )
+        persisted = load_config(config_path)
+    finally:
+        set_config_path(original_config_path)
+
+    assert persisted.transcription.enabled is True
     assert persisted.transcription.provider == "stepfun"
     assert persisted.transcription.model == "stepaudio-2.5-asr"
-    assert persisted.transcription.language == "zh"
     speech_preset = persisted.model_defaults.speech_to_text
     assert speech_preset
     assert persisted.model_presets[speech_preset].capabilities == ["speech_to_text"]
     assert runtime.transcription.provider == "stepfun"
+
+
+def test_desktop_migrates_stepfun_custom_alias_before_startup(
+    tmp_path: Path,
+) -> None:
+    from nanobot.config.loader import get_config_path, load_config, save_config, set_config_path
+    from nanobot.config.schema import Config, ModelPresetConfig
+
+    original_config_path = get_config_path()
+    config_path = tmp_path / "desktop" / "config.json"
+    config = Config.model_validate(
+        {
+            "providers": {
+                "step": {
+                    "label": "step",
+                    "apiKey": "step-test",
+                    "apiBase": "https://api.stepfun.com/step_plan/v1",
+                }
+            }
+        }
+    )
+    config.model_presets["step-chat"] = ModelPresetConfig(
+        label="Step Chat",
+        provider="step",
+        model="stepaudio-2.5-chat",
+    )
+    config.model_presets["step-tts"] = ModelPresetConfig(
+        label="Step TTS",
+        provider="step",
+        model="stepaudio-2.5-tts",
+    )
+    save_config(config, config_path)
+    try:
+        runtime = cli_commands._load_or_create_desktop_config(
+            str(config_path),
+            None,
+        )
+        persisted = load_config(config_path)
+    finally:
+        set_config_path(original_config_path)
+
+    assert "step" not in (persisted.providers.model_extra or {})
+    assert persisted.providers.stepfun.api_key == "step-test"
+    assert persisted.model_presets["step-chat"].provider == "stepfun"
+    assert persisted.model_presets["step-tts"].provider == "stepfun"
+    assert persisted.model_presets["step-tts"].capabilities == ["text_to_speech"]
+    assert runtime.providers.stepfun.api_key == "step-test"
 
 
 def test_proactive_websocket_delivery_gets_fresh_turn_id() -> None:

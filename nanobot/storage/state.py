@@ -1143,6 +1143,80 @@ class StateStore:
         assert row is not None
         return self._project_record(row)
 
+    def reconcile_default_workspace_project(self) -> ProjectRecord:
+        """Attach the current default path to its existing Inbox project."""
+        canonical = self.default_workspace
+        root_path = str(Path(canonical).expanduser().resolve(strict=False))
+        filesystem_identity = _filesystem_identity(canonical)
+        display_name = Path(self.default_workspace).name or self.default_workspace
+        now = _now_ms()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM projects
+                WHERE canonical_root_path = ?
+                   OR (? IS NOT NULL AND filesystem_identity = ?)
+                ORDER BY
+                    CASE WHEN canonical_root_path = ? THEN 0 ELSE 1 END,
+                    CASE WHEN status = 'archived' THEN 1 ELSE 0 END,
+                    updated_at DESC
+                LIMIT 1
+                """,
+                (
+                    canonical,
+                    filesystem_identity,
+                    filesystem_identity,
+                    canonical,
+                ),
+            ).fetchone()
+            if row is None:
+                inbox_rows = connection.execute(
+                    """
+                    SELECT * FROM projects
+                    WHERE kind = 'inbox' AND status != 'archived'
+                    ORDER BY updated_at DESC
+                    """
+                ).fetchall()
+                if len(inbox_rows) == 1:
+                    # The projection database belongs to this default
+                    # workspace. This fallback keeps its Inbox identity even
+                    # when a cross-device copy could not preserve the root inode.
+                    row = inbox_rows[0]
+
+            if row is None:
+                return self.ensure_project(
+                    canonical,
+                    name=display_name,
+                    kind="inbox",
+                )
+
+            connection.execute(
+                """
+                UPDATE projects
+                SET kind = 'inbox', name = ?, root_path = ?,
+                    canonical_root_path = ?,
+                    filesystem_identity = COALESCE(?, filesystem_identity),
+                    status = 'active', last_opened_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    display_name,
+                    root_path,
+                    canonical,
+                    filesystem_identity,
+                    now,
+                    now,
+                    row["id"],
+                ),
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT * FROM projects WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        assert row is not None
+        return self._project_record(row)
+
     def bind_session(
         self,
         session_key: str,

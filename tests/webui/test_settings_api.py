@@ -6,13 +6,16 @@ import httpx
 import pytest
 
 from nanobot.config.loader import load_config, save_config
-from nanobot.config.schema import Config, ModelPresetConfig
+from nanobot.config.schema import Config, InlineFallbackConfig, ModelPresetConfig
 from nanobot.providers.registry import find_by_name
 from nanobot.webui.settings_api import (
     WebUISettingsError,
     _oauth_provider_status,
     create_model_configuration,
+    create_provider_settings,
+    delete_provider_settings,
     ensure_model_capability_defaults,
+    normalize_official_dynamic_providers,
     provider_models_payload,
     settings_payload,
     settings_usage_payload,
@@ -114,6 +117,180 @@ def test_create_model_configuration_accepts_dynamic_custom_provider(
     saved = load_config(config_path)
     assert saved.model_presets["tenant-model"].provider == DYNAMIC_PROVIDER_NAME
     assert saved.model_presets["tenant-model"].model == "gpt-4o-mini"
+
+
+def test_delete_provider_settings_removes_custom_provider_and_its_references(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = _dynamic_provider_config(defaults=True)
+    config.providers.openai.api_key = "sk-keep"
+    config.model_presets["tenant-primary"] = ModelPresetConfig(
+        label="Tenant primary",
+        provider=DYNAMIC_PROVIDER_NAME,
+        model="gpt-4o-mini",
+    )
+    config.model_presets["tenant-fallback"] = ModelPresetConfig(
+        label="Tenant fallback",
+        provider=DYNAMIC_PROVIDER_NAME,
+        model="gpt-4o",
+    )
+    config.model_presets["keep"] = ModelPresetConfig(
+        label="Keep",
+        provider="openai",
+        model="openai/gpt-4o-mini",
+    )
+    config.agents.defaults.model_preset = "tenant-primary"
+    config.agents.defaults.fallback_models = [
+        "tenant-fallback",
+        "keep",
+        InlineFallbackConfig(
+            provider=DYNAMIC_PROVIDER_NAME,
+            model="gpt-4.1-mini",
+        ),
+    ]
+    config.model_defaults.text = "tenant-primary"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    payload = delete_provider_settings({"provider": [DYNAMIC_PROVIDER_NAME]})
+
+    saved = load_config(config_path)
+    assert DYNAMIC_PROVIDER_NAME not in (saved.providers.model_extra or {})
+    assert set(saved.model_presets) == {"keep"}
+    assert saved.agents.defaults.provider == "auto"
+    assert saved.agents.defaults.model_preset is None
+    assert saved.model_defaults.text == "default"
+    assert saved.agents.defaults.fallback_models == ["keep"]
+    assert payload["requires_restart"] is False
+    assert not any(
+        provider["name"] == DYNAMIC_PROVIDER_NAME
+        for provider in payload["providers"]
+    )
+
+
+def test_delete_provider_settings_resets_builtin_provider_and_its_models(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.providers.stepfun.label = "Step"
+    config.providers.stepfun.api_key = "step-test"
+    config.providers.stepfun.api_base = "https://api.stepfun.com/step_plan/v1"
+    config.model_presets["step-asr"] = ModelPresetConfig(
+        label="Step ASR",
+        provider="stepfun",
+        model="stepaudio-2.5-asr",
+        capabilities=["speech_to_text"],
+    )
+    config.model_defaults.speech_to_text = "step-asr"
+    config.transcription.enabled = True
+    config.transcription.provider = "stepfun"
+    config.transcription.model = "stepaudio-2.5-asr"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    payload = delete_provider_settings({"provider": ["stepfun"]})
+
+    saved = load_config(config_path)
+    assert saved.providers.stepfun.api_key is None
+    assert saved.providers.stepfun.api_base is None
+    assert "step-asr" not in saved.model_presets
+    assert saved.model_defaults.speech_to_text is None
+    assert saved.transcription.enabled is False
+    assert saved.transcription.provider is None
+    assert saved.transcription.model is None
+    stepfun = next(row for row in payload["providers"] if row["name"] == "stepfun")
+    assert stepfun["configured"] is False
+
+
+def test_create_stepfun_provider_uses_canonical_runtime_id_and_classifies_audio_models(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    save_config(Config(), config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    payload = create_provider_settings(
+        {
+            "name": ["step"],
+            "apiBase": ["https://api.stepfun.com/step_plan/v1"],
+            "apiKey": ["step-test"],
+            "api_type": ["chat_completions"],
+        }
+    )
+
+    assert payload["provider_mutation"] == {"name": "stepfun", "created": True}
+    saved = load_config(config_path)
+    assert "step" not in (saved.providers.model_extra or {})
+    assert saved.providers.stepfun.label == "step"
+    assert saved.providers.stepfun.api_base == "https://api.stepfun.com/step_plan/v1"
+    assert saved.providers.stepfun.api_type == "auto"
+
+    payload = create_model_configuration(
+        {
+            "label": ["Step ASR"],
+            "provider": ["stepfun"],
+            "model": ["stepaudio-2.5-asr"],
+        }
+    )
+    payload = create_model_configuration(
+        {
+            "label": ["Step TTS"],
+            "provider": ["stepfun"],
+            "model": ["stepaudio-2.5-tts"],
+        }
+    )
+
+    rows = {row["label"]: row for row in payload["model_presets"]}
+    assert rows["Step ASR"]["capabilities"] == ["speech_to_text"]
+    assert rows["Step TTS"]["capabilities"] == ["text_to_speech"]
+    assert payload["model_defaults"]["speech_to_text"] == rows["Step ASR"]["name"]
+    assert payload["model_defaults"]["text_to_speech"] is None
+
+
+def test_normalize_official_dynamic_step_provider_rewrites_references() -> None:
+    config = Config.model_validate(
+        {
+            "providers": {
+                "step": {
+                    "label": "step",
+                    "apiKey": "step-test",
+                    "apiBase": "https://api.stepfun.com/step_plan/v1",
+                }
+            },
+            "agents": {
+                "defaults": {
+                    "provider": "step",
+                    "model": "step-3.7-flash",
+                    "fallbackModels": [
+                        {"provider": "step", "model": "step-router-v1"}
+                    ],
+                }
+            },
+            "modelPresets": {
+                "step-chat": {
+                    "provider": "step",
+                    "model": "stepaudio-2.5-chat",
+                },
+                "step-tts": {
+                    "provider": "step",
+                    "model": "stepaudio-2.5-tts",
+                },
+            },
+        }
+    )
+
+    assert normalize_official_dynamic_providers(config) is True
+    assert normalize_official_dynamic_providers(config) is False
+    assert "step" not in (config.providers.model_extra or {})
+    assert config.providers.stepfun.api_key == "step-test"
+    assert config.agents.defaults.provider == "stepfun"
+    assert config.agents.defaults.fallback_models[0].provider == "stepfun"
+    assert {preset.provider for preset in config.model_presets.values()} == {"stepfun"}
 
 
 def test_create_model_configuration_rejects_dynamic_custom_provider_without_api_base(
@@ -634,6 +811,7 @@ def test_capability_default_migration_removes_retired_model_purposes() -> None:
     config = Config()
     config.transcription.provider = "stepfun"
     config.transcription.model = "stepaudio-2-asr"
+    config.providers.stepfun.api_key = "stepfun-test"
     config.tools.image_generation.provider = "openai"
     config.tools.image_generation.model = "gpt-image-1"
     config.model_presets["legacy-multimodal"] = ModelPresetConfig(
@@ -655,6 +833,35 @@ def test_capability_default_migration_removes_retired_model_purposes() -> None:
     assert config.model_defaults.text_to_speech is None
     assert config.model_defaults.image_generation is None
     assert config.model_presets["legacy-multimodal"].capabilities == ["text"]
+    assert ensure_model_capability_defaults(config) is False
+
+
+def test_disabled_transcription_does_not_create_a_fallback_speech_model() -> None:
+    config = Config()
+    config.transcription.enabled = False
+
+    assert ensure_model_capability_defaults(config) is True
+
+    assert config.model_defaults.text == "default"
+    assert config.model_defaults.speech_to_text is None
+    assert not any(
+        "speech_to_text" in preset.capabilities
+        for preset in config.model_presets.values()
+    )
+    assert ensure_model_capability_defaults(config) is False
+
+
+def test_unconfigured_transcription_does_not_create_a_fallback_speech_model() -> None:
+    config = Config()
+
+    assert ensure_model_capability_defaults(config) is True
+
+    assert config.model_defaults.text == "default"
+    assert config.model_defaults.speech_to_text is None
+    assert not any(
+        "speech_to_text" in preset.capabilities
+        for preset in config.model_presets.values()
+    )
     assert ensure_model_capability_defaults(config) is False
 
 
@@ -1003,6 +1210,47 @@ def test_provider_models_payload_fetches_dynamic_custom_provider_models(
     assert payload["models"][0]["id"] == "custom-gpt"
 
 
+def test_provider_models_payload_detects_stepfun_and_audio_capabilities(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    save_config(Config(), config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    def fake_get(url: str, **kwargs):
+        assert url == "https://api.stepfun.com/step_plan/v1/models"
+        assert kwargs["headers"]["Authorization"] == "Bearer step-test"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "step-3.7-flash"},
+                    {"id": "stepaudio-2.5-asr"},
+                    {"id": "stepaudio-2.5-tts"},
+                ]
+            },
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("nanobot.webui.settings_api.httpx.get", fake_get)
+
+    payload = provider_models_payload(
+        {
+            "provider": ["custom"],
+            "apiBase": ["https://api.stepfun.com/step_plan/v1"],
+            "apiKey": ["step-test"],
+        }
+    )
+
+    assert payload["provider"] == "stepfun"
+    assert [row["capabilities"] for row in payload["models"]] == [
+        ["text"],
+        ["speech_to_text"],
+        ["text_to_speech"],
+    ]
+
+
 @pytest.mark.parametrize(
     ("api_base", "expected_url"),
     [
@@ -1045,6 +1293,7 @@ def test_provider_models_payload_fetches_minimax_anthropic_models(
             "label": None,
             "owned_by": None,
             "context_window": None,
+            "capabilities": ["text"],
         }
     ]
 

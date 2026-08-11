@@ -884,14 +884,18 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
 
     if first_launch:
         changed = install_desktop_default_mcp_servers(loaded) or changed
-    if not loaded.transcription.provider:
-        loaded.transcription.enabled = True
-        loaded.transcription.provider = "stepfun"
-        loaded.transcription.model = "stepaudio-2.5-asr"
-        loaded.transcription.language = "zh"
+    # Desktop does not provision an ASR provider. Keep voice input disabled
+    # until the user explicitly selects and configures a speech model instead
+    # of silently materializing a StepFun service.
+    if not loaded.transcription.provider and loaded.transcription.enabled:
+        loaded.transcription.enabled = False
         changed = True
-    from nanobot.webui.settings_api import ensure_model_capability_defaults
+    from nanobot.webui.settings_api import (
+        ensure_model_capability_defaults,
+        normalize_official_dynamic_providers,
+    )
 
+    changed = normalize_official_dynamic_providers(loaded) or changed
     changed = ensure_model_capability_defaults(loaded) or changed
     changed = prune_retired_desktop_mcp_presets(loaded) or changed
 

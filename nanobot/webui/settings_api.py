@@ -11,6 +11,7 @@ import re
 import time
 from contextlib import suppress
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -43,6 +44,7 @@ RuntimeSurface = Literal["browser", "native"]
 MODEL_CAPABILITIES: tuple[ModelCapability, ...] = (
     "text",
     "speech_to_text",
+    "text_to_speech",
 )
 _STORED_MODEL_CAPABILITIES: tuple[ModelCapability, ...] = (
     *MODEL_CAPABILITIES,
@@ -51,8 +53,13 @@ _STORED_MODEL_CAPABILITIES: tuple[ModelCapability, ...] = (
     "image_generation",
 )
 _REMOVED_MODEL_CAPABILITIES = frozenset(
-    {"text_to_speech", "vision", "image_generation"}
+    {"vision", "image_generation"}
 )
+
+_OFFICIAL_PROVIDER_BY_API_HOST = {
+    "api.stepfun.com": "stepfun",
+    "api.stepfun.ai": "stepfun",
+}
 
 
 def _version_payload() -> dict[str, Any]:
@@ -372,6 +379,92 @@ def _dynamic_provider_items(config: Any) -> list[tuple[str, ProviderConfig]]:
     ]
 
 
+def _canonical_provider_name_for_api_base(api_base: str | None) -> str | None:
+    """Map an official API host to the provider id understood by runtimes.
+
+    Display names are user-editable and therefore cannot safely double as
+    runtime provider ids.  Keep this allowlist deliberately small: some
+    vendors expose multiple incompatible products from the same host.
+    """
+    raw = (api_base or "").strip()
+    if not raw:
+        return None
+    try:
+        hostname = (urlsplit(raw).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    return _OFFICIAL_PROVIDER_BY_API_HOST.get(hostname)
+
+
+def _provider_has_explicit_settings(provider_config: ProviderConfig) -> bool:
+    return bool(
+        provider_config.api_key
+        or provider_config.api_base
+        or provider_config.api_type != "auto"
+        or provider_config.extra_headers
+        or provider_config.extra_body
+        or provider_config.extra_query
+    )
+
+
+def normalize_official_dynamic_providers(config: Any) -> bool:
+    """Migrate custom aliases of official endpoints to canonical providers.
+
+    In particular, a user may call the StepFun service simply ``step``.  That
+    works for OpenAI-compatible chat, but speech adapters resolve the canonical
+    id ``stepfun``.  Rewriting the id once keeps chat, ASR and settings aligned.
+    """
+    changed = False
+    extra_providers = config.providers.model_extra or {}
+    for source_name, source_config in list(_dynamic_provider_items(config)):
+        canonical_name = _canonical_provider_name_for_api_base(source_config.api_base)
+        if not canonical_name or canonical_name == source_name:
+            continue
+        target_config = getattr(config.providers, canonical_name, None)
+        if not isinstance(target_config, ProviderConfig):
+            continue
+        # Never overwrite a separately configured canonical account.
+        if _provider_has_explicit_settings(target_config):
+            continue
+
+        for field in (
+            "label",
+            "api_key",
+            "api_base",
+            "extra_headers",
+            "extra_body",
+            "extra_query",
+        ):
+            setattr(target_config, field, getattr(source_config, field))
+        # Built-in providers select their protocol from the registry; the
+        # custom-provider-only api_type override cannot be carried across.
+        target_config.api_type = "auto"
+
+        def matches_source(value: str | None) -> bool:
+            return bool(
+                value
+                and value.replace("-", "_") == source_name.replace("-", "_")
+            )
+
+        for preset in config.model_presets.values():
+            if matches_source(preset.provider):
+                preset.provider = canonical_name
+        defaults = config.agents.defaults
+        if matches_source(defaults.provider):
+            defaults.provider = canonical_name
+        for fallback in defaults.fallback_models:
+            if not isinstance(fallback, str) and matches_source(fallback.provider):
+                fallback.provider = canonical_name
+        if matches_source(config.transcription.provider):
+            config.transcription.provider = canonical_name
+        if matches_source(config.tools.image_generation.provider):
+            config.tools.image_generation.provider = canonical_name
+
+        del extra_providers[source_name]
+        changed = True
+    return changed
+
+
 def _resolve_settings_provider(
     config: Any,
     provider_name: str,
@@ -619,8 +712,13 @@ def provider_models_payload(query: QueryParams) -> dict[str, Any]:
             "message": f"Could not load models: {exc}",
         }
 
+    detected_provider = _canonical_provider_name_for_api_base(api_base) or provider_key
+    for row in rows:
+        row["capabilities"] = _infer_model_capabilities(detected_provider, row["id"])
+
     return {
         **base_payload,
+        "provider": detected_provider,
         "status": "available",
         "models": rows,
         "model_count": len(rows),
@@ -681,6 +779,9 @@ def _infer_model_capabilities(provider: str, model: str) -> list[ModelCapability
     an advanced override.
     """
     normalized = model.strip().lower()
+    synthesis_markers = ("text-to-speech", "text_to_speech", "-tts", "_tts")
+    if normalized == "tts" or any(marker in normalized for marker in synthesis_markers):
+        return ["text_to_speech"]
     speech_markers = ("whisper", "transcribe", "transcription", "-asr", "_asr", "sensevoice")
     if any(marker in normalized for marker in speech_markers):
         return ["speech_to_text"]
@@ -741,7 +842,7 @@ def _ensure_capability_preset(
 
 
 def ensure_model_capability_defaults(config: Any) -> bool:
-    """Keep the two user-facing model purposes and remove retired purpose tags."""
+    """Normalize user-facing model purposes and remove retired purpose tags."""
     changed = False
     for capability in _REMOVED_MODEL_CAPABILITIES:
         if getattr(config.model_defaults, capability) is not None:
@@ -762,13 +863,33 @@ def ensure_model_capability_defaults(config: Any) -> bool:
             preset.capabilities = capabilities
             changed = True
 
+    # A default may have pointed at a legacy preset whose inferred purpose has
+    # changed.  Do not keep a default that no longer supports its capability.
+    for capability in MODEL_CAPABILITIES:
+        preset_name = getattr(config.model_defaults, capability)
+        if not preset_name or preset_name == "default":
+            continue
+        preset = config.model_presets.get(preset_name)
+        if preset is None or capability not in preset.capabilities:
+            setattr(config.model_defaults, capability, None)
+            changed = True
+
     text_default = config.agents.defaults.model_preset or "default"
     if config.model_defaults.text != text_default:
         config.model_defaults.text = text_default
         changed = True
 
     transcription = resolve_transcription_config(config)
-    if transcription.provider and transcription.model:
+    # A disabled transcription feature must not materialize a fallback ASR
+    # model in Model Configuration. Desktop deployments that only provision a
+    # text provider intentionally keep transcription disabled until the user
+    # explicitly configures it.
+    if (
+        transcription.enabled
+        and transcription.configured
+        and transcription.provider
+        and transcription.model
+    ):
         name, created = _ensure_capability_preset(
             config,
             provider=transcription.provider,
@@ -804,6 +925,10 @@ def _validate_provider_for_capabilities(
 ) -> None:
     """Validate a provider against every capability assigned to a model preset."""
     if any(capability in {"text", "vision"} for capability in capabilities):
+        _validate_configured_provider(config, provider)
+    if "text_to_speech" in capabilities:
+        # TTS models are catalogued separately even though desktop speech
+        # synthesis is not yet an executable model default.
         _validate_configured_provider(config, provider)
     if "speech_to_text" in capabilities:
         if resolve_transcription_provider(provider) is None:
@@ -1024,6 +1149,7 @@ def settings_payload(
         "model_defaults": {
             "text": config.agents.defaults.model_preset or "default",
             "speech_to_text": config.model_defaults.speech_to_text,
+            "text_to_speech": config.model_defaults.text_to_speech,
         },
         "providers": providers,
         "web_search": {
@@ -1398,6 +1524,8 @@ def update_model_default(query: QueryParams) -> dict[str, Any]:
     name = (_query_first(query, "name") or "").strip()
     if capability not in MODEL_CAPABILITIES:
         raise WebUISettingsError("unknown model capability")
+    if capability == "text_to_speech":
+        raise WebUISettingsError("speech synthesis defaults are not available yet", status=409)
     if not name:
         raise WebUISettingsError("model configuration is required")
 
@@ -1443,11 +1571,33 @@ def create_provider_settings(query: QueryParams) -> dict[str, Any]:
     api_key = (_query_first_alias(query, "api_key", "apiKey") or "").strip() or None
     api_type = (_query_first(query, "api_type") or "auto").strip()
 
-    provider_key = _custom_provider_slug(raw_name)
     if not api_base:
         raise WebUISettingsError("api_base is required")
+    if api_type not in {"auto", "chat_completions", "responses"}:
+        raise WebUISettingsError("api_type must be auto, chat_completions, or responses")
 
     config = load_config()
+    canonical_name = _canonical_provider_name_for_api_base(api_base)
+    if canonical_name:
+        spec = find_by_name(canonical_name)
+        provider_config = getattr(config.providers, canonical_name, None)
+        if spec is None or not isinstance(provider_config, ProviderConfig):
+            raise WebUISettingsError("unknown provider")
+        created = not _provider_configured_for_settings(spec, provider_config)
+        provider_config.label = raw_name or spec.label
+        provider_config.api_key = api_key
+        provider_config.api_base = api_base
+        # Built-in providers select their protocol from the registry.
+        provider_config.api_type = "auto"
+        save_config(config)
+        payload = settings_payload()
+        payload["provider_mutation"] = {
+            "name": canonical_name,
+            "created": created,
+        }
+        return payload
+
+    provider_key = _custom_provider_slug(raw_name)
     extra_providers = config.providers.model_extra
     if find_by_name(provider_key):
         provider_key = f"{provider_key}-custom"
@@ -1463,6 +1613,79 @@ def create_provider_settings(query: QueryParams) -> dict[str, Any]:
         api_base=api_base,
         api_type=api_type,
     )
+    save_config(config)
+    payload = settings_payload()
+    payload["provider_mutation"] = {
+        "name": provider_key,
+        "created": True,
+    }
+    return payload
+
+
+def delete_provider_settings(query: QueryParams) -> dict[str, Any]:
+    provider_name = (_query_first(query, "provider") or "").strip()
+    if not provider_name:
+        raise WebUISettingsError("provider is required")
+
+    config = load_config()
+    resolved_provider = _resolve_settings_provider(config, provider_name)
+    if resolved_provider is None:
+        raise WebUISettingsError("unknown provider", status=404)
+    spec, provider_key, provider_config = resolved_provider
+
+    extra_providers = config.providers.model_extra or {}
+
+    def matches_provider(value: str | None) -> bool:
+        if not value:
+            return False
+        return value.replace("-", "_") == provider_key.replace("-", "_")
+
+    removed_presets = {
+        name
+        for name, preset in config.model_presets.items()
+        if matches_provider(preset.provider)
+    }
+    for name in removed_presets:
+        del config.model_presets[name]
+
+    defaults = config.agents.defaults
+    if defaults.model_preset in removed_presets:
+        defaults.model_preset = None
+    if matches_provider(defaults.provider):
+        defaults.provider = "auto"
+
+    for capability in _STORED_MODEL_CAPABILITIES:
+        preset_name = getattr(config.model_defaults, capability)
+        if preset_name in removed_presets:
+            setattr(
+                config.model_defaults,
+                capability,
+                "default" if capability == "text" else None,
+            )
+
+    defaults.fallback_models = [
+        fallback
+        for fallback in defaults.fallback_models
+        if not (
+            (isinstance(fallback, str) and fallback in removed_presets)
+            or (
+                not isinstance(fallback, str)
+                and matches_provider(getattr(fallback, "provider", None))
+            )
+        )
+    ]
+
+    if matches_provider(config.transcription.provider):
+        config.transcription.enabled = False
+        config.transcription.provider = None
+        config.transcription.model = None
+
+    if provider_key in extra_providers:
+        del extra_providers[provider_key]
+    else:
+        if spec.is_oauth:
+            raise WebUISettingsError("OAuth providers must be disconnected", status=409)
+        setattr(config.providers, provider_key, type(provider_config)())
     save_config(config)
     return settings_payload()
 

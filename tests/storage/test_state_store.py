@@ -102,6 +102,42 @@ def test_project_and_session_ids_are_stable_and_session_project_is_immutable(
             )
 
 
+def test_default_workspace_rename_preserves_inbox_project_and_sessions(
+    tmp_path: Path,
+) -> None:
+    legacy_workspace = tmp_path / "nanobot-workspace"
+    legacy_workspace.mkdir()
+    store = StateStore(
+        legacy_workspace / ".nanobot" / "state.sqlite",
+        default_workspace=legacy_workspace,
+    )
+    legacy_project = store.reconcile_default_workspace_project()
+    session = store.bind_session(
+        "websocket:existing-chat",
+        legacy_project.id,
+        title="Existing chat",
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (legacy_workspace / ".nanobot").rename(workspace / ".nanobot")
+    legacy_workspace.rmdir()
+    reopened = StateStore(
+        workspace / ".nanobot" / "state.sqlite",
+        default_workspace=workspace,
+    )
+    project = reopened.reconcile_default_workspace_project()
+
+    assert project.id == legacy_project.id
+    assert project.kind == "inbox"
+    assert project.name == "workspace"
+    assert project.root_path == str(workspace.resolve())
+    assert project.canonical_root_path == str(workspace.resolve())
+    reopened_session = reopened.get_session(session.session_key)
+    assert reopened_session is not None
+    assert reopened_session.project_id == project.id
+
+
 def test_artifacts_are_explicitly_linked_and_project_scoped(tmp_path: Path) -> None:
     store = _store(tmp_path)
     project_a_path = tmp_path / "project-a"
