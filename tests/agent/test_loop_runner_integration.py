@@ -103,6 +103,7 @@ async def test_asset_workflow_applies_strict_policy_only_to_report_audit(
         AssetResearchWorkflowOutcome,
     )
     from nanobot.session.manager import Session
+    from nanobot.utils.markdown_html import HTML_TEMPLATE_METADATA_KEY
 
     loop = _make_loop(tmp_path)
     tools = ToolRegistry()
@@ -170,6 +171,7 @@ async def test_asset_workflow_applies_strict_policy_only_to_report_audit(
 
     kwargs = loop._run_agent_loop.await_args.kwargs
     assert kwargs["max_iterations"] == AUDIT_MAX_TOOL_ITERATIONS
+    assert kwargs["metadata"][HTML_TEMPLATE_METADATA_KEY] == "research_report"
     assert "finalize_on_max_iterations" not in kwargs
     assert "write_file" in kwargs["tools"].tool_names
     assert "edit_file" not in kwargs["tools"].tool_names

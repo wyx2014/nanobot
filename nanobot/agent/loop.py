@@ -53,6 +53,7 @@ from nanobot.cron.session_turns import (
 from nanobot.graph.workflows.asset_research import (
     MEMBER_NODES,
     REPORT_AUDIT,
+    TEAM_LEAD,
     public_asset_research_state,
 )
 from nanobot.graph.workflows.asset_research_runtime import (
@@ -102,6 +103,7 @@ from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.utils.markdown_html import HTML_TEMPLATE_METADATA_KEY
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
@@ -1838,6 +1840,11 @@ class AgentLoop:
                 {"role": "system", "content": node_system},
                 {"role": "user", "content": prompt},
             ]
+            render_template = (
+                "research_report"
+                if node_id in {TEAM_LEAD, REPORT_AUDIT}
+                else "simple"
+            )
             final_content, tools_used, messages, stop_reason, _had_injections = (
                 await self._run_agent_loop(
                     node_messages,
@@ -1849,7 +1856,11 @@ class AgentLoop:
                     channel=ctx.msg.channel,
                     chat_id=ctx.msg.chat_id,
                     message_id=f"{ctx.msg.metadata.get('message_id') or ctx.turn_id}:{node_id}",
-                    metadata={**node_metadata, "_asset_research_graph_node": node_id},
+                    metadata={
+                        **node_metadata,
+                        "_asset_research_graph_node": node_id,
+                        HTML_TEMPLATE_METADATA_KEY: render_template,
+                    },
                     session_key=ctx.session_key,
                     pending_queue=None,
                     ephemeral=True,

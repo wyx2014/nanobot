@@ -9,6 +9,7 @@ provider, tools, tracing, and WebSocket progress surfaces.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -267,9 +268,11 @@ Current-run graph evidence:
 
 When the audit is complete, give the user a concise Chinese executive summary
 of the report's core conclusion, supporting reasons, valuation/risk view, and
-explicitly identify the HTML report path. This is business-facing delivery
-copy: never mention internal iteration limits, fallbacks, degradation, tool
-budgets, or runtime control state. Do not merely describe what you would audit.
+key risks. The GUI will present the generated HTML as a separate attachment
+card, so do not repeat its path, filename, Markdown link, or a line such as
+"完整 HTML 报告" in the response. This is business-facing delivery copy: never
+mention internal iteration limits, fallbacks, degradation, tool budgets, or
+runtime control state. Do not merely describe what you would audit.
 """
 
 
@@ -286,6 +289,39 @@ def _preferred_report_artifact(paths: list[str], report_path: str) -> str | None
         ):
             return path
     return None
+
+
+_HTML_DELIVERY_REFERENCE_RE = re.compile(
+    r"(?P<lead>^|[。！？；;!?\s]+)"
+    r"(?:[*_`>#-]+\s*)?"
+    r"(?:请\s*(?:查看|打开)\s*)?"
+    r"(?:完整\s*)?HTML\s*(?:报告|文件)?"
+    r"(?:\s*(?:路径|链接|地址))?\s*[:：]?",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_duplicate_report_reference(content: str, report_artifact: str) -> str:
+    """Keep the business summary while the GUI owns the artifact entry point."""
+    normalized_artifact = report_artifact.replace("\\", "/").casefold()
+    identifiers = {
+        normalized_artifact,
+        Path(normalized_artifact).name,
+    }
+    cleaned_lines: list[str] = []
+    for line in content.splitlines():
+        normalized_line = line.replace("\\", "/").casefold()
+        if not any(identifier and identifier in normalized_line for identifier in identifiers):
+            cleaned_lines.append(line)
+            continue
+        match = _HTML_DELIVERY_REFERENCE_RE.search(line)
+        if match is None:
+            cleaned_lines.append(line)
+            continue
+        lead = re.sub(r"\s+", "", match.group("lead"))
+        prefix = (line[:match.start()] + lead).rstrip()
+        cleaned_lines.append("" if prefix.strip() in {"-", "*", "+"} else prefix)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
 
 
 def _merge_usage(target: dict[str, int], addition: Mapping[str, Any]) -> None:
@@ -530,8 +566,7 @@ class AssetResearchWorkflowRuntime:
         )
 
         final_content = audit_outcome.content.strip() or (
-            "资产投研报告已完成。"
-            f"完整 HTML 报告：`{report_artifact}`"
+            "资产投研报告已完成，请通过下方报告卡片查看完整内容。"
         )
         internal_runtime_markers = (
             "maximum number of tool call iterations",
@@ -550,12 +585,12 @@ class AssetResearchWorkflowRuntime:
         ):
             final_content = (
                 "资产投研报告已完成复核，请查看报告中的核心结论、估值情景与"
-                f"风险分析。完整 HTML 报告：`{report_artifact}`"
+                "风险分析。"
             )
-        elif report_artifact not in final_content:
-            final_content = (
-                f"{final_content}\n\n完整 HTML 报告：`{report_artifact}`"
-            )
+        final_content = _strip_duplicate_report_reference(
+            final_content,
+            report_artifact,
+        ) or "资产投研报告已完成，请通过下方报告卡片查看完整内容。"
         return AssetResearchWorkflowOutcome(
             final_content=final_content,
             stop_reason=(

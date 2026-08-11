@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
-_GENERATED_MARKER = "<!-- Generated from Markdown by TpaRuyi -->"
+_GENERATED_MARKER = "<!-- Generated from Markdown by TPACowork -->"
+_GENERATED_MARKERS = {
+    _GENERATED_MARKER,
+    "<!-- Generated from Markdown by TpaRuyi -->",
+}
+HTML_TEMPLATE_METADATA_KEY = "_html_template"
+_HTML_TEMPLATES = {"simple", "research_report"}
 _MARKDOWN_SUFFIXES = {".md", ".markdown"}
 _CONTROL_FILES = {
     "agents.md", "skill.md", "soul.md", "user.md", "memory.md", "readme.md",
@@ -33,7 +39,12 @@ def _title(markdown: str, source: Path) -> str:
     return source.stem.replace("_", " ").replace("-", " ").strip() or "Document"
 
 
-def _desktop_html(markdown: str, title: str, source: Path) -> str | None:
+def _desktop_html(
+    markdown: str,
+    title: str,
+    source: Path,
+    template: str,
+) -> str | None:
     url = os.environ.get("NANOBOT_HTML_RENDER_URL")
     token = os.environ.get("NANOBOT_HTML_RENDER_TOKEN")
     if not url or not token or not url.startswith("http://127.0.0.1:"):
@@ -41,7 +52,12 @@ def _desktop_html(markdown: str, title: str, source: Path) -> str | None:
     try:
         request = Request(
             url,
-            data=json.dumps({"markdown": markdown, "title": title, "source_path": str(source)}).encode(),
+            data=json.dumps({
+                "markdown": markdown,
+                "title": title,
+                "source_path": str(source),
+                "template": template,
+            }).encode(),
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
         )
@@ -73,19 +89,45 @@ def _fallback_html(markdown: str, title: str) -> str:
 </html>"""
 
 
-def write_html_companion(source: Path, markdown: str) -> Path | None:
+def _active_html_template() -> str:
+    """Resolve the explicit per-node template without guessing from content."""
+    try:
+        from nanobot.agent.tools.context import current_request_context
+
+        context = current_request_context()
+        template = (
+            context.metadata.get(HTML_TEMPLATE_METADATA_KEY)
+            if context is not None
+            else None
+        )
+    except (AttributeError, ImportError):
+        template = None
+    return template if template in _HTML_TEMPLATES else "simple"
+
+
+def write_html_companion(
+    source: Path,
+    markdown: str,
+    *,
+    template: str | None = None,
+) -> Path | None:
     """Write `<source-stem>.html`, preserving unrelated hand-authored HTML."""
     if not should_generate_html_companion(source) or not markdown.strip():
         return None
     output = source.with_suffix(".html")
     if output.exists():
         try:
-            if _GENERATED_MARKER not in output.read_text(encoding="utf-8")[:256]:
+            prefix = output.read_text(encoding="utf-8")[:256]
+            if not any(marker in prefix for marker in _GENERATED_MARKERS):
                 return None
         except OSError:
             return None
     title = _title(markdown, source)
-    rendered = _desktop_html(markdown, title, source) or _fallback_html(markdown, title)
+    resolved_template = template if template in _HTML_TEMPLATES else _active_html_template()
+    rendered = (
+        _desktop_html(markdown, title, source, resolved_template)
+        or _fallback_html(markdown, title)
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(rendered, encoding="utf-8")
     return output

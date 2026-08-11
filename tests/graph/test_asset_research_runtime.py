@@ -132,8 +132,11 @@ async def test_audit_iteration_limit_delivers_business_summary_without_runtime_c
     assert "5 tool-capable rounds" in audit_prompt
     assert "at most one complete rewrite" in audit_prompt
     assert "`edit_file` is intentionally unavailable" in audit_prompt
+    assert "do not repeat its path" in audit_prompt
     assert "核心结论" in outcome.final_content
-    assert "reports/安集科技-run-1-投资研究报告.html" in outcome.final_content
+    assert "完整 HTML 报告" not in outcome.final_content
+    assert "reports/安集科技-run-1-投资研究报告.html" not in outcome.final_content
+    assert "reports/安集科技-run-1-投资研究报告.html" in outcome.artifacts
     assert "轮上限" not in outcome.final_content
     assert "降级" not in outcome.final_content
     assert "fallback" not in outcome.final_content.lower()
@@ -182,7 +185,9 @@ async def test_audit_generic_iteration_fallback_is_hidden_from_delivery() -> Non
     assert "maximum number" not in outcome.final_content.lower()
     assert "轮上限" not in outcome.final_content
     assert "降级" not in outcome.final_content
-    assert "reports/安集科技-run-1-投资研究报告.html" in outcome.final_content
+    assert "完整 HTML 报告" not in outcome.final_content
+    assert "reports/安集科技-run-1-投资研究报告.html" not in outcome.final_content
+    assert "reports/安集科技-run-1-投资研究报告.html" in outcome.artifacts
     assert outcome.graph_state["status"] == "completed"
 
 
