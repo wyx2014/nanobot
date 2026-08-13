@@ -500,7 +500,7 @@ async def test_concurrent_mcp_reconnect_reuses_fresh_session(
 
     class _DeadSession:
         async def read_resource(self, _uri: str) -> Any:
-            raise McpError(ErrorData(code=-32000, message="Session terminated"))
+            raise anyio.ClosedResourceError
 
     class _LiveSession:
         async def read_resource(self, uri: str) -> Any:

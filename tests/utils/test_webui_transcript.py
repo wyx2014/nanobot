@@ -1624,6 +1624,111 @@ def test_replay_tool_events_keeps_phase_update_when_trace_is_deduped() -> None:
     assert msgs[0]["toolEvents"][0]["error"] == "Error: CLI app 'github' not found"
 
 
+def test_replay_interrupted_turn_closes_parallel_tools_plan_and_file_edits() -> None:
+    completed_at = 1_785_220_302_866
+    msgs = replay_transcript_to_ui_messages([
+        {
+            "event": "message",
+            "chat_id": "t-interrupted",
+            "kind": "progress",
+            "text": "",
+            "turn_id": "turn-interrupted",
+            "agent_ui": {
+                "kind": "task_progress",
+                "status": "running",
+                "active_step_ids": ["research"],
+                "current_step_id": "research",
+                "steps": [
+                    {"id": "research", "title": "查询资料", "status": "running"},
+                    {"id": "report", "title": "撰写报告", "status": "pending"},
+                ],
+            },
+        },
+        {
+            "event": "message",
+            "chat_id": "t-interrupted",
+            "kind": "progress",
+            "text": "",
+            "turn_id": "turn-interrupted",
+            "tool_events": [
+                {
+                    "phase": "start",
+                    "call_id": "search-finance",
+                    "batch_id": "parallel-search",
+                    "name": "web_search",
+                    "occurred_at": completed_at - 1_334,
+                    "arguments": {"query": "青岛啤酒 财务数据"},
+                },
+                {
+                    "phase": "start",
+                    "call_id": "search-report",
+                    "batch_id": "parallel-search",
+                    "name": "web_search",
+                    "occurred_at": completed_at - 1_334,
+                    "arguments": {"query": "青岛啤酒 年报"},
+                },
+            ],
+        },
+        {
+            "event": "file_edit",
+            "chat_id": "t-interrupted",
+            "turn_id": "turn-interrupted",
+            "edits": [{
+                "version": 1,
+                "call_id": "write-report",
+                "tool": "write_file",
+                "path": "report.md",
+                "phase": "start",
+                "status": "editing",
+                "added": 0,
+                "deleted": 0,
+            }],
+        },
+        {
+            "event": "turn_completed",
+            "chat_id": "t-interrupted",
+            "turn_id": "turn-interrupted",
+            "recorded_at": completed_at + 16,
+            "turn": {
+                "id": "turn-interrupted",
+                "status": "interrupted",
+                "finish_reason": "userInterrupted",
+                "completed_at": completed_at,
+            },
+        },
+    ])
+
+    plan = next(message for message in msgs if message.get("agentUI"))
+    assert plan["agentUI"]["status"] == "interrupted"
+    assert plan["agentUI"]["active_step_ids"] == []
+    assert plan["agentUI"]["current_step_id"] is None
+    assert [step["status"] for step in plan["agentUI"]["steps"]] == [
+        "interrupted",
+        "interrupted",
+    ]
+
+    tools = next(message for message in msgs if message.get("toolEvents"))
+    assert [event["phase"] for event in tools["toolEvents"]] == ["error", "error"]
+    assert [event["occurred_at"] for event in tools["toolEvents"]] == [
+        completed_at,
+        completed_at,
+    ]
+    assert all(
+        event["error"] == "Task interrupted by user."
+        for event in tools["toolEvents"]
+    )
+    assert not any(
+        event.get("phase") == "start"
+        for message in msgs
+        for event in message.get("toolEvents", [])
+    )
+
+    file_edit = next(message for message in msgs if message.get("fileEdits"))
+    assert file_edit["fileEdits"][0]["phase"] == "error"
+    assert file_edit["fileEdits"][0]["status"] == "error"
+    assert file_edit["fileEdits"][0]["error"] == "Task interrupted by user."
+
+
 def test_replay_keeps_consecutive_task_progress_snapshots() -> None:
     msgs = replay_transcript_to_ui_messages([
         {

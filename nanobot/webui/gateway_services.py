@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import sqlite3
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +16,7 @@ from loguru import logger as default_logger
 
 from nanobot.observability.trace_store import TraceStore
 from nanobot.storage.journal import SessionEventJournal
+from nanobot.storage.lifecycle import LifecycleRegistry
 from nanobot.storage.logs import StructuredLogStore
 from nanobot.storage.session_events import SessionEventFileStore, SessionEventService
 from nanobot.storage.state import StateStore, open_state_store_with_recovery
@@ -35,10 +40,143 @@ class GatewayServices:
     logs: StructuredLogStore
     traces: TraceStore
     journal: SessionEventService
+    lifecycle: LifecycleRegistry
     session_manager: Any | None
     cron_service: Any | None
     cron_pending_job_ids: Callable[[str], set[str]] | None
     expert_team_turn_router: Callable[..., Awaitable[dict[str, Any] | None]] | None
+
+
+@dataclass(frozen=True)
+class ProjectionBindingRecovery:
+    """Recoverable quarantine result for a healthy but mis-bound projection."""
+
+    backup_dir: Path | None
+    mismatch_count: int = 0
+
+
+def _canonical_root(value: str | Path) -> str:
+    return os.path.normcase(
+        os.path.normpath(str(Path(value).expanduser().resolve(strict=False)))
+    )
+
+
+def quarantine_mismatched_session_projection(
+    path: str | Path,
+    *,
+    session_manager: Any | None,
+    logger: Any = default_logger,
+) -> ProjectionBindingRecovery:
+    """Quarantine a query projection that contradicts durable session identity.
+
+    Conversation JSONL metadata is durable; ``state.sqlite`` is rebuilt query
+    state.  A previous recovery bug could attach many old sessions to the
+    Inbox project.  Detect that condition before opening the projection and
+    move the database aside so normal startup can reconstruct it safely.
+
+    A changed path alone is not enough: when the durable project id still
+    matches, the project may have been intentionally relocated.  Conversely,
+    the same canonical root with a legacy id is harmless after a directory
+    rename and does not require a rebuild.
+    """
+
+    database_path = Path(path).expanduser()
+    if session_manager is None or not database_path.is_file():
+        return ProjectionBindingRecovery(backup_dir=None)
+
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.resolve(strict=False).as_uri()}?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT s.session_key, s.project_id, p.canonical_root_path
+                FROM sessions AS s
+                JOIN projects AS p ON p.id = s.project_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.DatabaseError, sqlite3.OperationalError):
+        # Header/schema corruption remains the responsibility of
+        # open_state_store_with_recovery(), which records its own reason.
+        return ProjectionBindingRecovery(backup_dir=None)
+
+    mismatches = 0
+    for row in rows:
+        session_key = str(row["session_key"])
+        metadata_record = session_manager.read_session_metadata(session_key)
+        metadata = (
+            metadata_record.get("metadata")
+            if isinstance(metadata_record, dict)
+            else None
+        )
+        if not isinstance(metadata, dict):
+            continue
+        scope = metadata.get("workspace_scope")
+        durable_path = scope.get("project_path") if isinstance(scope, dict) else None
+        if not isinstance(durable_path, str) or not durable_path.strip():
+            continue
+        projected_root = _canonical_root(str(row["canonical_root_path"]))
+        durable_root = _canonical_root(durable_path)
+        if projected_root == durable_root:
+            continue
+        durable_project_id = metadata.get("project_id")
+        identity_matches = (
+            isinstance(durable_project_id, str)
+            and bool(durable_project_id.strip())
+            and durable_project_id == str(row["project_id"])
+        )
+        if identity_matches:
+            continue
+        mismatches += 1
+
+    if mismatches == 0:
+        return ProjectionBindingRecovery(backup_dir=None)
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    recovery_root = database_path.parent / "recovery"
+    backup_dir = recovery_root / f"projection-bindings-{timestamp}"
+    suffix = 1
+    while backup_dir.exists():
+        backup_dir = recovery_root / f"projection-bindings-{timestamp}-{suffix}"
+        suffix += 1
+    moved_files: list[tuple[Path, Path]] = []
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        for database_suffix in ("", "-wal", "-shm"):
+            source = Path(f"{database_path}{database_suffix}")
+            if source.exists():
+                destination = backup_dir / source.name
+                shutil.move(str(source), str(destination))
+                moved_files.append((source, destination))
+    except OSError:
+        for source, destination in reversed(moved_files):
+            if destination.exists() and not source.exists():
+                with suppress(OSError):
+                    shutil.move(str(destination), str(source))
+        with suppress(OSError):
+            backup_dir.rmdir()
+        logger.exception(
+            "failed to quarantine mismatched state projection path={}",
+            database_path,
+        )
+        return ProjectionBindingRecovery(backup_dir=None, mismatch_count=mismatches)
+
+    logger.error(
+        "quarantined mismatched session projection path={} backup={} sessions={}",
+        database_path,
+        backup_dir,
+        mismatches,
+    )
+    return ProjectionBindingRecovery(
+        backup_dir=backup_dir,
+        mismatch_count=mismatches,
+    )
 
 
 def build_gateway_services(
@@ -61,8 +199,14 @@ def build_gateway_services(
     expert_team_turn_router: Callable[..., Awaitable[dict[str, Any] | None]] | None = None,
     logger: Any = default_logger,
 ) -> GatewayServices:
+    state_path = workspace_path / ".nanobot" / "state.sqlite"
+    binding_recovery = quarantine_mismatched_session_projection(
+        state_path,
+        session_manager=session_manager,
+        logger=logger,
+    )
     state_recovery = open_state_store_with_recovery(
-        workspace_path / ".nanobot" / "state.sqlite",
+        state_path,
         default_workspace=workspace_path,
         # Native desktop startup is user-facing and state.sqlite is a
         # rebuildable projection. StateStore initialization still validates
@@ -72,7 +216,43 @@ def build_gateway_services(
         verify_integrity=runtime_surface != "native",
     )
     state = state_recovery.store
+    database_rebuilt = (
+        state_recovery.backup_dir is not None
+        or binding_recovery.backup_dir is not None
+    )
     state.reconcile_default_workspace_project()
+    lifecycle = LifecycleRegistry(
+        workspace_path / ".nanobot" / "lifecycle.jsonl"
+    )
+    # Upgrade existing soft archives once while the healthy projection still
+    # knows which rows the user hid.  Thereafter lifecycle.jsonl is authoritative
+    # and survives a state.sqlite rebuild.
+    if not database_rebuilt:
+        archived_projects = {
+            project.id: project
+            for project in state.list_projects(include_archived=True)
+            if project.status == "archived"
+        }
+        for project in archived_projects.values():
+            if lifecycle.project_state(project.id) is None:
+                lifecycle.archive_project(
+                    project.id,
+                    canonical_root_path=project.canonical_root_path,
+                    root_path=project.root_path,
+                    name=project.name,
+                )
+        for session in state.list_sessions(include_archived=True):
+            if (
+                session.status == "archived"
+                and session.project_id not in archived_projects
+                and lifecycle.session_state(session.session_key) is None
+            ):
+                lifecycle.archive_session(
+                    session.session_key,
+                    session_id=session.id,
+                    project_id=session.project_id,
+                    title=session.title,
+                )
     logs = StructuredLogStore(workspace_path / ".nanobot" / "logs.sqlite")
     traces = TraceStore(logs.path)
     if state_recovery.backup_dir is not None:
@@ -85,6 +265,18 @@ def build_gateway_services(
             details={
                 "backup_dir": str(state_recovery.backup_dir),
                 "reason": state_recovery.reason,
+            },
+        )
+    if binding_recovery.backup_dir is not None:
+        logs.write(
+            level="error",
+            component="recovery",
+            event_name="state_projection_bindings_rebuilt",
+            message="mis-bound session projection was backed up and rebuilt",
+            error_code="STATE_PROJECTION_BINDING_MISMATCH",
+            details={
+                "backup_dir": str(binding_recovery.backup_dir),
+                "mismatch_count": binding_recovery.mismatch_count,
             },
         )
     logs.write(
@@ -142,6 +334,8 @@ def build_gateway_services(
         logs_store=logs,
         trace_store=traces,
         journal_store=journal,
+        lifecycle_registry=lifecycle,
+        session_event_files=event_files,
         skills_workspace_path=workspace_path,
         disabled_skills=disabled_skills,
         cron_service=cron_service,
@@ -149,13 +343,17 @@ def build_gateway_services(
         thread_runtime_registry=thread_runtime_registry,
         log=logger,
     )
+    # A crash between recording a permanent-delete tombstone and cleaning all
+    # backing files is completed here before any session can be listed again.
+    http.reconcile_archived_lifecycle()
+    http.reconcile_purged_lifecycle()
     # If state.sqlite was rebuilt, re-register disk-backed sessions from their
     # own persisted workspace metadata. Historical event projection is
     # intentionally lazy: SessionEventJournal.append() replays one session
     # before its next write. Eagerly replaying every transcript here can block
     # gateway startup for minutes on established workspaces.
     rebuilt_sessions = 0
-    if state_recovery.backup_dir is not None and session_manager is not None:
+    if database_rebuilt and session_manager is not None:
         rebuilt_payload = http._sessions_list_payload()
         rebuilt_sessions = len(rebuilt_payload.get("sessions", []))
     journal_reconciled_runs = 0
@@ -218,7 +416,8 @@ def build_gateway_services(
         event_name="gateway_recovery_completed",
         message="gateway state recovery initialized",
         details={
-            "database_rebuilt": state_recovery.backup_dir is not None,
+            "database_rebuilt": database_rebuilt,
+            "projection_binding_mismatches": binding_recovery.mismatch_count,
             "rebuilt_sessions": rebuilt_sessions,
             "journal_recovery_mode": "lazy_on_append",
             "reconciled_runs": reconciled_runs,
@@ -237,6 +436,7 @@ def build_gateway_services(
         logs=logs,
         traces=traces,
         journal=journal,
+        lifecycle=lifecycle,
         session_manager=session_manager,
         cron_service=cron_service,
         cron_pending_job_ids=cron_pending_job_ids,

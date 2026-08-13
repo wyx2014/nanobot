@@ -736,6 +736,16 @@ class TraceStore:
                 connection.execute("PRAGMA incremental_vacuum(200)")
             return removed
 
+    def delete_session(self, session_id: str) -> int:
+        """Remove traces and cascading run/span data for one deleted session."""
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM traces WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.commit()
+            return max(0, int(cursor.rowcount))
+
     @staticmethod
     def _row_payload(row: sqlite3.Row) -> dict[str, Any]:
         payload = {str(key): row[key] for key in row.keys()}

@@ -72,6 +72,15 @@ class SessionEventFileStore:
                 return []
             return self._read_locked(path)
 
+    def delete(self, session_key: str) -> bool:
+        """Permanently remove the canonical event journal for one session."""
+        with self._lock:
+            path = self.path_for(session_key)
+            if not path.is_file():
+                return False
+            path.unlink()
+            return True
+
     def _migrate_legacy_locked(self, session_key: str, path: Path) -> None:
         if self._legacy_reader is None:
             return

@@ -50,6 +50,7 @@ class SubagentStatus:
     phase: str = "initializing"  # initializing | awaiting_tools | tools_completed | final_response | done | error
     iteration: int = 0
     tool_events: list = field(default_factory=list)   # [{name, status, detail}, ...]
+    completed_tool_events: list = field(default_factory=list)  # survives cancellation/timeout
     usage: dict = field(default_factory=dict)          # token usage
     stop_reason: str | None = None
     error: str | None = None
@@ -63,6 +64,43 @@ class WorkflowSubagentResult:
     label: str
     status: str
     content: str
+
+
+def _expert_team_member_runtime(
+    expert_team: dict[str, Any] | None,
+    label: str,
+) -> dict[str, int]:
+    """Return trusted, normalized limits for one expert-team member.
+
+    Team bindings are normalized by the WebUI resource loader. Keeping the
+    lookup here intentionally opt-in preserves the existing runtime behavior
+    for every team that does not declare ``member_runtime``.
+    """
+
+    raw = expert_team.get("member_runtime") if isinstance(expert_team, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    bounds = {
+        "max_iterations": (4, _EXPERT_TEAM_MAX_ITERATIONS),
+        "timeout_seconds": (30, _EXPERT_TEAM_MEMBER_TIMEOUT_S),
+        "max_retries": (0, 1),
+    }
+
+    def _limits(source: dict[str, Any]) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        for key, (minimum, maximum) in bounds.items():
+            value = source.get(key)
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            normalized[key] = max(minimum, min(maximum, value))
+        return normalized
+
+    limits = _limits(raw)
+    raw_members = raw.get("members")
+    member = raw_members.get(label) if isinstance(raw_members, dict) else None
+    if isinstance(member, dict):
+        limits.update(_limits(member))
+    return limits
 
 
 class _SubagentHook(AgentHook):
@@ -488,6 +526,7 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        member_runtime = _expert_team_member_runtime(expert_team, label)
         await self._publish_team_member_update(
             origin,
             expert_team,
@@ -501,6 +540,47 @@ class SubagentManager:
         async def _on_checkpoint(payload: dict) -> None:
             status.phase = payload.get("phase", status.phase)
             status.iteration = payload.get("iteration", status.iteration)
+            if not member_runtime:
+                return
+            completed = payload.get("completed_tool_results")
+            if not isinstance(completed, list):
+                return
+            by_call_id = {
+                str(item.get("tool_call_id") or ""): item
+                for item in completed
+                if isinstance(item, dict)
+            }
+            assistant = payload.get("assistant_message")
+            tool_calls = (
+                assistant.get("tool_calls")
+                if isinstance(assistant, dict)
+                else None
+            )
+            if not isinstance(tool_calls, list):
+                return
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or "")
+                result = by_call_id.get(call_id)
+                function = call.get("function")
+                name = (
+                    str(function.get("name") or "")
+                    if isinstance(function, dict)
+                    else ""
+                )
+                if not name or not isinstance(result, dict):
+                    continue
+                detail = str(result.get("content") or "").replace("\n", " ").strip()
+                if len(detail) > 240:
+                    detail = detail[:240] + "..."
+                event = {
+                    "name": name,
+                    "status": "error" if detail.startswith("Error") else "ok",
+                    "detail": detail or "(empty)",
+                }
+                if event not in status.completed_tool_events:
+                    status.completed_tool_events.append(event)
 
         async def _on_activity(activity: str) -> None:
             await self._publish_team_member_update(
@@ -564,9 +644,16 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             run_max_iterations = (
-                min(self.max_iterations, _EXPERT_TEAM_MAX_ITERATIONS)
+                min(
+                    self.max_iterations,
+                    member_runtime.get("max_iterations", _EXPERT_TEAM_MAX_ITERATIONS),
+                )
                 if expert_team is not None
                 else self.max_iterations
+            )
+            member_timeout_s = member_runtime.get(
+                "timeout_seconds",
+                _EXPERT_TEAM_MEMBER_TIMEOUT_S,
             )
             try:
                 run_spec = AgentRunSpec(
@@ -610,7 +697,7 @@ class SubagentManager:
                 result = (
                     await asyncio.wait_for(
                         self.runner.run(run_spec),
-                        timeout=_EXPERT_TEAM_MEMBER_TIMEOUT_S,
+                        timeout=member_timeout_s,
                     )
                     if expert_team is not None
                     else await self.runner.run(run_spec)
@@ -791,16 +878,38 @@ class SubagentManager:
         except asyncio.TimeoutError:
             status.phase = "error"
             status.stop_reason = "timeout"
+            member_timeout_s = member_runtime.get(
+                "timeout_seconds",
+                _EXPERT_TEAM_MEMBER_TIMEOUT_S,
+            )
             status.error = (
-                f"expert-team member exceeded {_EXPERT_TEAM_MEMBER_TIMEOUT_S} seconds"
+                f"expert-team member exceeded {member_timeout_s} seconds"
             )
-            timeout_result = (
-                "Error: this research member exceeded its runtime deadline and was stopped. "
-                "Treat the missing dimension as a degradable evidence gap. Use the Team Lead "
-                "data package, configured iFinD MCP, Juyuan MCP, and Caihui MCP sources, and "
-                "completed member reports to fill it; do not restart the same failed lookup "
-                "loop."
-            )
+            if member_runtime:
+                partial_progress = self._format_partial_progress_from_events(
+                    status.completed_tool_events or status.tool_events,
+                    status.error,
+                    limit=12,
+                )
+                timeout_result = (
+                    "Error: this research member exceeded its runtime deadline and was stopped. "
+                    "Treat the missing dimension as a degradable evidence gap. Use the Team Lead "
+                    "shared context, configured expert-team sources, and completed member reports "
+                    "to fill it; do not restart the same failed lookup loop."
+                    + (
+                        "\n\nPartial completed research before timeout:\n" + partial_progress
+                        if partial_progress
+                        else ""
+                    )
+                )
+            else:
+                timeout_result = (
+                    "Error: this research member exceeded its runtime deadline and was stopped. "
+                    "Treat the missing dimension as a degradable evidence gap. Use the Team Lead "
+                    "data package, configured iFinD MCP, Juyuan MCP, and Caihui MCP sources, and "
+                    "completed member reports to fill it; do not restart the same failed lookup "
+                    "loop."
+                )
             artifact = await self._persist_expert_team_member_artifact(
                 content=timeout_result,
                 label=label,
@@ -828,7 +937,11 @@ class SubagentManager:
                 task_id=task_id,
                 label=label,
                 status="failed",
-                activity="运行超时，已停止重复取数；Team Lead 将使用结构化数据和现有证据降级补齐",
+                activity=(
+                    "运行超时，已停止重复取数；Team Lead 将使用已绑定来源和现有证据降级补齐"
+                    if member_runtime
+                    else "运行超时，已停止重复取数；Team Lead 将使用结构化数据和现有证据降级补齐"
+                ),
                 artifact=artifact,
             )
         except asyncio.CancelledError:
@@ -937,7 +1050,9 @@ class SubagentManager:
         expert_team: dict[str, Any] | None,
         expert_team_run_id: str | None,
     ) -> bool:
-        if expert_team is None or retry_count >= 1:
+        member_runtime = _expert_team_member_runtime(expert_team, label)
+        max_retries = member_runtime.get("max_retries", 1)
+        if expert_team is None or retry_count >= max_retries:
             return False
         status.phase = "initializing"
         status.error = None
@@ -1229,24 +1344,41 @@ class SubagentManager:
 
     @staticmethod
     def _format_partial_progress(result) -> str:
-        completed = [e for e in result.tool_events if e["status"] == "ok"]
-        failure = next((e for e in reversed(result.tool_events) if e["status"] == "error"), None)
+        return SubagentManager._format_partial_progress_from_events(
+            result.tool_events,
+            result.error,
+        )
+
+    @staticmethod
+    def _format_partial_progress_from_events(
+        tool_events: list[dict[str, Any]],
+        error: str | None,
+        *,
+        limit: int = 3,
+    ) -> str:
+        completed = [e for e in tool_events if e.get("status") == "ok"]
+        failure = next(
+            (e for e in reversed(tool_events) if e.get("status") == "error"),
+            None,
+        )
         lines: list[str] = []
         if completed:
             lines.append("Completed steps:")
-            for event in completed[-3:]:
-                lines.append(f"- {event['name']}: {event['detail']}")
+            for event in completed[-max(1, limit):]:
+                lines.append(
+                    f"- {event.get('name', 'tool')}: {event.get('detail', '')}"
+                )
         if failure:
             if lines:
                 lines.append("")
             lines.append("Failure:")
             lines.append(f"- {failure['name']}: {failure['detail']}")
-        if result.error and not failure:
+        if error and not failure:
             if lines:
                 lines.append("")
             lines.append("Failure:")
-            lines.append(f"- {result.error}")
-        return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
+            lines.append(f"- {error}")
+        return "\n".join(lines) or (error or "Error: subagent execution failed.")
 
     def _build_subagent_prompt(
         self,

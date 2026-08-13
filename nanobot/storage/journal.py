@@ -38,6 +38,11 @@ class SessionEventJournal:
     def append(self, session_key: str, event: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self._recover_session_locked(session_key)
+            watermark = self.state.projector_watermark(session_key)
+            if watermark is not None and watermark.get("error") is not None:
+                raise EventProjectionError(
+                    "cannot append while the session event projection is incomplete"
+                )
             session = self.state.get_session(session_key)
             if session is None:
                 raise EventProjectionError(
@@ -251,7 +256,7 @@ class SessionEventJournal:
         # seconds on established conversations.
         watermark = self.state.projector_watermark(session_key)
         projected_through = 0
-        if watermark and watermark.get("error") is None:
+        if watermark:
             candidate_seq = int(watermark.get("last_event_seq") or 0)
             candidate_id = watermark.get("last_event_id")
             if candidate_seq > 0 and isinstance(candidate_id, str):
@@ -270,6 +275,8 @@ class SessionEventJournal:
                     projected_through = candidate_seq
 
         recovered = 0
+        quarantined = 0
+        complete = True
         for event in normalized_events:
             if event["event_seq"] <= projected_through:
                 continue
@@ -279,6 +286,40 @@ class SessionEventJournal:
                 if self.state.project_event(session_key, event):
                     recovered += 1
             except EventProjectionError as exc:
+                surrogate = self._legacy_progress_surrogate(event, str(exc))
+                if surrogate is not None:
+                    try:
+                        if self.state.project_event(session_key, surrogate):
+                            recovered += 1
+                        quarantined += 1
+                        self.logs.write(
+                            level="warning",
+                            component="projector",
+                            event_name="legacy_progress_event_quarantined",
+                            message=(
+                                "an invalid legacy progress snapshot was ignored "
+                                "while later durable events continued replaying"
+                            ),
+                            project_id=session.project_id,
+                            session_id=session.id,
+                            error_code="LEGACY_PROGRESS_QUARANTINED",
+                            details={
+                                "session_key": session_key,
+                                "event_id": event_id,
+                                "event_seq": event_seq,
+                                "reason": str(exc),
+                            },
+                        )
+                        continue
+                    except EventProjectionError:
+                        pass
+                complete = False
+                self.state.record_projector_error(
+                    session_key,
+                    event_id=event_id,
+                    event_seq=event_seq,
+                    message=str(exc),
+                )
                 self.logs.write(
                     level="error",
                     component="projector",
@@ -308,10 +349,61 @@ class SessionEventJournal:
                 details={
                     "session_key": session_key,
                     "recovered_events": recovered,
+                    "quarantined_legacy_progress_events": quarantined,
                     "journal_rows": len(rows),
+                    "complete": complete,
                 },
             )
         return recovered
+
+    @staticmethod
+    def _legacy_progress_surrogate(
+        event: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Advance past a known-invalid legacy progress-only snapshot.
+
+        Older desktop builds could persist a serial plan between steps with no
+        running item.  Modern validation correctly rejects that shape, but a
+        rebuild must not stop before later terminal events.  Project a private,
+        no-op envelope at the same sequence instead of inventing progress.
+        """
+        agent_ui = event.get("agent_ui")
+        if (
+            str(event.get("event") or "") != "message"
+            or not isinstance(agent_ui, dict)
+            or agent_ui.get("kind") != "task_progress"
+        ):
+            return None
+        known_progress_errors = (
+            "task progress ",
+            "workflow progress ",
+        )
+        if not reason.startswith(known_progress_errors):
+            return None
+        envelope_keys = {
+            "schema_version",
+            "event_id",
+            "event_seq",
+            "recorded_at",
+            "project_id",
+            "session_id",
+            "session_key",
+        }
+        surrogate = {
+            key: value
+            for key, value in event.items()
+            if key in envelope_keys
+        }
+        surrogate.update({
+            "event": "legacy_progress_quarantined",
+            "visibility": "private",
+            "payload": {
+                "reason": reason[:1_000],
+                "original_event": "message",
+            },
+        })
+        return surrogate
 
     @staticmethod
     def _legacy_event_id(

@@ -26,7 +26,7 @@ def _session_data(*, created_at: datetime, messages: list[dict] | None = None) -
     }
 
 
-def test_discovery_is_time_bounded_and_keeps_explicit_outputs(
+def test_discovery_keeps_explicit_outputs_and_ignores_unrelated_recent_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -40,6 +40,8 @@ def test_discovery_is_time_bounded_and_keeps_explicit_outputs(
     recent = tmp_path / "reports" / "summary.pdf"
     recent.parent.mkdir()
     recent.write_bytes(b"%PDF-report")
+    unrelated_recent = tmp_path / "reports" / "another-session.pdf"
+    unrelated_recent.write_bytes(b"%PDF-other-session")
     ignored = tmp_path / "node_modules" / "noise.js"
     ignored.parent.mkdir()
     ignored.write_text("noise", encoding="utf-8")
@@ -52,7 +54,12 @@ def test_discovery_is_time_bounded_and_keeps_explicit_outputs(
         messages=[
             {
                 "role": "tool",
-                "content": json.dumps({"files": [{"path": str(old)}]}),
+                "content": json.dumps({
+                    "files": [
+                        {"path": str(old)},
+                        {"path": str(recent)},
+                    ],
+                }),
             },
             {
                 "role": "tool",
@@ -72,6 +79,7 @@ def test_discovery_is_time_bounded_and_keeps_explicit_outputs(
 
     rows = {row["path"]: row for row in payload["artifacts"]}
     assert set(rows) == {"old.txt", "reports/summary.pdf"}
+    assert "reports/another-session.pdf" not in rows
     assert rows["reports/summary.pdf"]["kind"] == "document"
     assert rows["reports/summary.pdf"]["mime_type"] == "application/pdf"
     assert rows["reports/summary.pdf"]["preview_url"].startswith(
@@ -81,24 +89,56 @@ def test_discovery_is_time_bounded_and_keeps_explicit_outputs(
     assert all("local_path" not in row for row in rows.values())
 
 
-def test_discovery_caps_workspace_walk(
+def test_discovery_caps_explicit_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(artifacts_module, "read_transcript_lines", lambda _key: [])
-    monkeypatch.setattr(artifacts_module, "MAX_SCANNED_ARTIFACT_FILES", 2)
+    files = []
     for index in range(5):
-        (tmp_path / f"result-{index}.txt").write_text(str(index), encoding="utf-8")
-    session = _session_data(created_at=datetime.now().astimezone() - timedelta(seconds=10))
+        path = tmp_path / f"result-{index}.txt"
+        path.write_text(str(index), encoding="utf-8")
+        files.append({"path": str(path)})
+    session = _session_data(
+        created_at=datetime.now().astimezone() - timedelta(seconds=10),
+        messages=[{"role": "tool", "content": json.dumps({"files": files})}],
+    )
 
     payload = discover_session_artifacts(
         "websocket:artifact-test",
         session,
         scope=build_workspace_scope(tmp_path, "restricted"),
+        max_items=2,
     )
 
     assert payload["truncated"] is True
     assert len(payload["artifacts"]) <= 2
+
+
+def test_discovery_preserves_the_turn_that_explicitly_emitted_a_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = tmp_path / "report.md"
+    report.write_text("report", encoding="utf-8")
+    monkeypatch.setattr(
+        artifacts_module,
+        "read_transcript_lines",
+        lambda _key: [{
+            "event": "file_edit",
+            "turn_id": "turn-report",
+            "edits": [{"absolute_path": str(report)}],
+        }],
+    )
+
+    payload = discover_session_artifacts(
+        "websocket:artifact-test",
+        _session_data(created_at=datetime.now().astimezone()),
+        scope=build_workspace_scope(tmp_path, "restricted"),
+    )
+
+    assert payload["artifacts"][0]["path"] == "report.md"
+    assert payload["artifacts"][0]["_turn_id"] == "turn-report"
 
 
 def test_content_rechecks_containment_after_listing(
@@ -108,7 +148,13 @@ def test_content_rechecks_containment_after_listing(
     monkeypatch.setattr(artifacts_module, "read_transcript_lines", lambda _key: [])
     target = tmp_path / "report.docx"
     target.write_bytes(b"office-data")
-    session = _session_data(created_at=datetime.now().astimezone() - timedelta(seconds=10))
+    session = _session_data(
+        created_at=datetime.now().astimezone() - timedelta(seconds=10),
+        messages=[{
+            "role": "tool",
+            "content": json.dumps({"files": [{"path": str(target)}]}),
+        }],
+    )
     scope = build_workspace_scope(tmp_path, "restricted")
 
     resolved = resolve_session_artifact(

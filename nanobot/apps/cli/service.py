@@ -1333,7 +1333,16 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
-                env=os.environ.copy(),
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {
+                        "JUYUAN_MCP_TOKEN",
+                        "CAIHUI_MCP_API_KEY",
+                        "IFIND_MCP_API_KEY",
+                        "ANYSEARCH_API_KEY",
+                    }
+                },
             )
         except subprocess.TimeoutExpired:
             return f"CLI app '{name}' timed out after {effective_timeout}s"

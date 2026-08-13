@@ -324,3 +324,100 @@ def test_schema_upgrade_repairs_legacy_malformed_message_json(
         ).fetchone()
     assert valid == 1
     assert json.loads(str(content_json))["text"] == "repair me"
+
+
+def test_recovery_quarantines_invalid_legacy_progress_and_reaches_terminal_event(
+    tmp_path: Path,
+) -> None:
+    state, session = _state(tmp_path)
+    files = SessionEventFileStore(tmp_path / "runtime" / "session-events")
+    logs = StructuredLogStore(tmp_path / "runtime" / "logs.sqlite")
+    service = SessionEventService(SessionEventJournal(
+        state=state,
+        logs=logs,
+        append_record=files.append,
+        read_records=files.read,
+    ))
+    common = {
+        "schema_version": 2,
+        "project_id": session.project_id,
+        "session_id": session.id,
+        "session_key": session.session_key,
+        "turn_id": "turn-legacy-progress",
+    }
+    rows = [
+        {
+            **common,
+            "event": "turn_started",
+            "event_id": "evt-start",
+            "event_seq": 1,
+            "recorded_at": 1_000,
+            "turn": {"id": "turn-legacy-progress", "started_at": 1_000},
+        },
+        {
+            **common,
+            "event": "message",
+            "event_id": "evt-invalid-progress",
+            "event_seq": 2,
+            "recorded_at": 1_100,
+            "kind": "progress",
+            "text": "between steps",
+            "agent_ui": {
+                "kind": "task_progress",
+                "plan_id": "plan-legacy",
+                "execution": "serial",
+                "steps": [
+                    {"id": "one", "title": "One", "status": "completed"},
+                    {"id": "two", "title": "Two", "status": "pending"},
+                ],
+            },
+        },
+        {
+            **common,
+            "event": "message",
+            "event_id": "evt-terminal-progress",
+            "event_seq": 3,
+            "recorded_at": 1_200,
+            "kind": "progress",
+            "text": "done",
+            "agent_ui": {
+                "kind": "task_progress",
+                "plan_id": "plan-legacy",
+                "execution": "serial",
+                "steps": [
+                    {"id": "one", "title": "One", "status": "completed"},
+                    {"id": "two", "title": "Two", "status": "completed"},
+                ],
+            },
+        },
+        {
+            **common,
+            "event": "turn_completed",
+            "event_id": "evt-completed",
+            "event_seq": 4,
+            "recorded_at": 1_300,
+            "turn": {
+                "id": "turn-legacy-progress",
+                "status": "completed",
+                "started_at": 1_000,
+                "completed_at": 1_300,
+            },
+        },
+    ]
+    for row in rows:
+        files.append(session.session_key, row)
+
+    assert service.ensure_recovered(session.session_key) == 4
+
+    watermark = state.projector_watermark(session.session_key)
+    assert watermark is not None
+    assert watermark["last_event_seq"] == 4
+    assert watermark["error"] is None
+    plan = state.turn_plan_snapshot(
+        session_key=session.session_key,
+        turn_id="turn-legacy-progress",
+    )
+    assert plan is not None
+    assert plan["status"] == "completed"
+    assert state.latest_turn_snapshot(session.session_key)["status"] == "completed"
+    assert logs.query(error_code="LEGACY_PROGRESS_QUARANTINED", limit=10)

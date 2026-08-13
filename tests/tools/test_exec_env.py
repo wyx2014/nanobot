@@ -90,6 +90,17 @@ async def test_exec_allowed_env_keys_does_not_leak_others(monkeypatch):
 
 @_UNIX_ONLY
 @pytest.mark.asyncio
+async def test_exec_never_forwards_desktop_shared_mcp_keys(monkeypatch):
+    monkeypatch.setenv("ANYSEARCH_API_KEY", "desktop-shared-secret")
+    tool = ExecTool(allowed_env_keys=["ANYSEARCH_API_KEY"])
+
+    result = await tool.execute(command="printenv ANYSEARCH_API_KEY")
+
+    assert "desktop-shared-secret" not in result
+
+
+@_UNIX_ONLY
+@pytest.mark.asyncio
 async def test_exec_allowed_env_keys_missing_var_ignored(monkeypatch):
     """If an allowed key is not set in the parent process, it should be silently skipped."""
     monkeypatch.delenv("NONEXISTENT_VAR_12345", raising=False)

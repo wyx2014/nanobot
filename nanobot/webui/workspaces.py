@@ -19,6 +19,7 @@ from nanobot.security.workspace_access import (
     default_workspace_scope,
     validate_workspace_scope_payload,
 )
+from nanobot.session.keys import webui_session_key_for_chat_id
 from nanobot.storage.state import SessionProjectMismatch, StateStore
 
 WEBUI_WORKSPACE_STATE_SCHEMA_VERSION = 1
@@ -195,34 +196,93 @@ class WebUIWorkspaceController:
         Session list routes call this in a loop.  Accepting the SQLite project
         and the JSONL metadata record avoids reopening both stores per row.
         """
-        if state_project is not None:
-            raw_scope = (
-                metadata.get(WORKSPACE_SCOPE_METADATA_KEY)
-                if isinstance(metadata, dict)
-                else None
+        metadata_scope: WorkspaceScope | None = None
+        if isinstance(metadata, dict) and WORKSPACE_SCOPE_METADATA_KEY in metadata:
+            raw_scope = metadata.get(WORKSPACE_SCOPE_METADATA_KEY)
+            try:
+                metadata_scope = validate_workspace_scope_payload(
+                    raw_scope,
+                    default_workspace=self._default_workspace,
+                    default_restrict_to_workspace=self._default_restrict_to_workspace,
+                    source_channel=_WEBUI_SCOPE_CHANNEL,
+                )
+            except WorkspaceScopeError:
+                # Persisted identity must not silently fall back to Inbox just
+                # because a user removed the project directory.  Listing and
+                # recovery still need the original absolute root so lifecycle
+                # tombstones can archive the correct project.  Fresh client
+                # input continues to use validate_workspace_scope_payload(),
+                # which requires an existing directory.
+                raw_path = (
+                    raw_scope.get("project_path") or raw_scope.get("path")
+                    if isinstance(raw_scope, dict)
+                    else None
+                )
+                raw_mode = (
+                    raw_scope.get("access_mode")
+                    if isinstance(raw_scope, dict)
+                    else None
+                )
+                candidate = (
+                    Path(raw_path).expanduser()
+                    if isinstance(raw_path, str) and "\0" not in raw_path
+                    else None
+                )
+                if candidate is not None and candidate.is_absolute():
+                    try:
+                        metadata_scope = build_workspace_scope(
+                            candidate,
+                            (
+                                raw_mode
+                                if isinstance(raw_mode, str)
+                                else self.default_scope().access_mode
+                            ),
+                            source_channel=_WEBUI_SCOPE_CHANNEL,
+                        )
+                    except WorkspaceScopeError:
+                        metadata_scope = None
+
+        if state_project is None:
+            return metadata_scope or self.default_scope()
+
+        metadata_project_id = (
+            metadata.get(PROJECT_ID_METADATA_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        state_project_id = str(getattr(state_project, "id", ""))
+        # JSONL metadata and canonical events are the durable identity source
+        # after a projection rebuild.  If SQLite points this session at a
+        # different project, using its root would silently mix conversations,
+        # plans and artifacts.  A matching project id still lets an explicit
+        # relocate operation update the path without rewriting old metadata.
+        if metadata_scope is not None:
+            metadata_root = os.path.normcase(os.path.normpath(str(metadata_scope.project_path)))
+            state_root = os.path.normcase(os.path.normpath(str(state_project.canonical_root_path)))
+            identity_disagrees = bool(
+                isinstance(metadata_project_id, str)
+                and metadata_project_id
+                and metadata_project_id != state_project_id
             )
-            access_mode = (
-                raw_scope.get("access_mode")
-                if isinstance(raw_scope, dict)
-                and isinstance(raw_scope.get("access_mode"), str)
-                else self.default_scope().access_mode
-            )
-            return build_workspace_scope(
-                state_project.canonical_root_path,
-                access_mode,
-                source_channel=_WEBUI_SCOPE_CHANNEL,
-            )
-        if not isinstance(metadata, dict) or WORKSPACE_SCOPE_METADATA_KEY not in metadata:
-            return self.default_scope()
-        try:
-            return validate_workspace_scope_payload(
-                metadata.get(WORKSPACE_SCOPE_METADATA_KEY),
-                default_workspace=self._default_workspace,
-                default_restrict_to_workspace=self._default_restrict_to_workspace,
-                source_channel=_WEBUI_SCOPE_CHANNEL,
-            )
-        except WorkspaceScopeError:
-            return self.default_scope()
+            if metadata_root != state_root and (identity_disagrees or not metadata_project_id):
+                return metadata_scope
+
+        raw_scope = (
+            metadata.get(WORKSPACE_SCOPE_METADATA_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        access_mode = (
+            raw_scope.get("access_mode")
+            if isinstance(raw_scope, dict)
+            and isinstance(raw_scope.get("access_mode"), str)
+            else self.default_scope().access_mode
+        )
+        return build_workspace_scope(
+            state_project.canonical_root_path,
+            access_mode,
+            source_channel=_WEBUI_SCOPE_CHANNEL,
+        )
 
     def scope_for_session_key(self, session_key: str) -> WorkspaceScope:
         state_session = self._state.get_session(session_key) if self._state is not None else None
@@ -304,7 +364,7 @@ class WebUIWorkspaceController:
             raise WorkspaceScopeError("chat_running", status=409)
         return self.scope_from_envelope(
             envelope,
-            session_key=f"websocket:{chat_id}",
+            session_key=webui_session_key_for_chat_id(chat_id),
             controls_available=controls_available,
         )
 
@@ -318,20 +378,22 @@ class WebUIWorkspaceController:
     ) -> WorkspaceScope:
         scope = self.scope_from_envelope(
             envelope,
-            session_key=f"websocket:{chat_id}",
+            session_key=webui_session_key_for_chat_id(chat_id),
             controls_available=controls_available,
         )
         if (
             WORKSPACE_SCOPE_METADATA_KEY in envelope
             and chat_running
-            and scope.metadata() != self.scope_for_session_key(f"websocket:{chat_id}").metadata()
+            and scope.metadata() != self.scope_for_session_key(
+                webui_session_key_for_chat_id(chat_id)
+            ).metadata()
         ):
             raise WorkspaceScopeError("chat_running", status=409)
         return scope
 
     def persist_scope(self, chat_id: str, scope: WorkspaceScope) -> dict[str, str]:
         binding: dict[str, str] = {}
-        session_key = f"websocket:{chat_id}"
+        session_key = webui_session_key_for_chat_id(chat_id)
         session = (
             self._sessions.get_or_create(session_key)
             if self._sessions is not None

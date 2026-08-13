@@ -30,6 +30,7 @@ from nanobot.agent.skill_scope import (
     reset_allowed_workspace_skills,
 )
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tool_scope import build_webui_turn_tools
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
@@ -62,6 +63,18 @@ from nanobot.graph.workflows.asset_research_runtime import (
     AssetResearchWorkflowRuntime,
     MemberBatchOutcome,
     MemberNodeOutcome,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck import (
+    MEMBER_NODES as BOTTLENECK_MEMBER_NODES,
+    REPORT_AUDIT as BOTTLENECK_REPORT_AUDIT,
+    SCOPE_BRIEF,
+    TEAM_LEAD as BOTTLENECK_TEAM_LEAD,
+    public_supply_chain_bottleneck_state,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck_runtime import (
+    SCOPE_MAX_TOOL_ITERATIONS as BOTTLENECK_SCOPE_MAX_TOOL_ITERATIONS,
+    TEAM_LEAD_MAX_TOOL_ITERATIONS as BOTTLENECK_TEAM_LEAD_MAX_TOOL_ITERATIONS,
+    SupplyChainBottleneckWorkflowRuntime,
 )
 from nanobot.observability.trace_collector import TraceCollector
 from nanobot.observability.trace_store import TraceStore
@@ -112,6 +125,7 @@ from nanobot.webui.expert_teams import (
     EXPERT_TEAM_RESUME_KEY,
     EXPERT_TEAM_TURN_ROUTE_KEY,
     EXPERT_TEAM_TURN_SUPPRESSED_KEY,
+    SUPPLY_CHAIN_BOTTLENECK_TEAM_ID,
     classify_expert_team_turn_with_model,
 )
 from nanobot.webui.interactive_prompt import (
@@ -766,8 +780,9 @@ class AgentLoop:
         user_message: str,
         awaiting_target: bool = False,
         has_media: bool = False,
+        team_id: str = ASSET_RESEARCH_TEAM_ID,
     ) -> dict[str, Any] | None:
-        """Classify one selected asset-team turn with the active runtime model."""
+        """Classify one selected guarded expert-team turn with the active model."""
 
         self._refresh_provider_snapshot()
 
@@ -792,13 +807,14 @@ class AgentLoop:
                         awaiting_target=awaiting_target,
                         has_media=has_media,
                         usage_callback=_record_usage,
+                        team_id=team_id,
                     ),
                     timeout=20,
                 )
         except TimeoutError:
-            logger.warning("Asset-research model routing timed out; using safe fallback")
+            logger.warning("Expert-team model routing timed out for {}; using safe fallback", team_id)
         except Exception:
-            logger.exception("Asset-research model routing failed; using safe fallback")
+            logger.exception("Expert-team model routing failed for {}; using safe fallback", team_id)
         return None
 
     @property
@@ -1653,7 +1669,7 @@ class AgentLoop:
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
-                tools=tools or self.tools,
+                tools=tools if tools is not None else self.tools,
                 model=self.model,
                 max_iterations=run_max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
@@ -1765,7 +1781,7 @@ class AgentLoop:
         if not target:
             raise RuntimeError("asset-research workflow requires a validated target")
 
-        source_registry = ctx.tools or self.tools
+        source_registry = ctx.tools if ctx.tools is not None else self.tools
         configured_prefixes = tuple(
             f"mcp_{str(item.get('name') or '').strip().lower()}_"
             for item in team.get("mcp_presets", [])
@@ -2025,6 +2041,356 @@ class AgentLoop:
                 publish_state=_publish_state,
             )
             outcome = await runtime.run(
+                run_id=run_id,
+                target=target,
+                request=request,
+                team=team,
+                report_path=report_path,
+                resume_from=resume_state,
+                supplemental_artifacts=[*resume_artifacts, *(ctx.msg.media or [])],
+            )
+        finally:
+            reset_project_context(project_context_token)
+            reset_workspace_scope(workspace_token)
+            reset_request_context(request_token)
+            reset_file_states(file_state_token)
+
+        self._last_usage = dict(outcome.usage)
+        ctx.artifact_paths = list(outcome.artifacts)
+        messages = [
+            *ctx.initial_messages,
+            *(
+                [{
+                    "role": "user",
+                    "content": (
+                        "[Active-turn user correction]\n"
+                        + "\n".join(workflow_corrections)
+                    ),
+                }]
+                if workflow_corrections
+                else []
+            ),
+            {"role": "assistant", "content": outcome.final_content},
+        ]
+        return (
+            outcome.final_content,
+            outcome.tools_used,
+            messages,
+            outcome.stop_reason,
+            bool(workflow_corrections),
+        )
+
+    async def _run_supply_chain_bottleneck_workflow(
+        self,
+        ctx: TurnContext,
+    ) -> tuple[str, list[str], list[dict[str, Any]], str, bool]:
+        """Execute the runtime-owned two-wave bottleneck research DAG."""
+
+        team = _expert_team_binding(ctx.msg.metadata, ctx.session.metadata)
+        if (
+            not isinstance(team, dict)
+            or team.get("id") != SUPPLY_CHAIN_BOTTLENECK_TEAM_ID
+        ):
+            raise RuntimeError("supply-chain workflow invoked without its team binding")
+        run_id = str(ctx.msg.metadata.get("expert_team_run_id") or "").strip()
+        if not run_id:
+            raise RuntimeError("supply-chain workflow requires a run id")
+        raw_route = ctx.msg.metadata.get(EXPERT_TEAM_TURN_ROUTE_KEY)
+        target = (
+            str(raw_route.get("target") or "").strip()
+            if isinstance(raw_route, dict)
+            else ""
+        )
+        if not target:
+            raise RuntimeError("supply-chain workflow requires a validated research theme")
+
+        source_registry = ctx.tools if ctx.tools is not None else self.tools
+        configured_prefixes = tuple(
+            f"mcp_{str(item.get('name') or '').strip().lower()}_"
+            for item in team.get("mcp_presets", [])
+            if isinstance(item, dict)
+            and item.get("configured") is True
+            and str(item.get("name") or "").strip()
+        )
+        evidence_tools = self._workflow_tool_subset(
+            source_registry,
+            allowed_names={"web_search", "web_fetch"},
+            allowed_prefixes=configured_prefixes,
+        )
+        report_tools = self._workflow_tool_subset(
+            source_registry,
+            allowed_names={
+                "web_search",
+                "web_fetch",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "create_research_chart",
+            },
+            allowed_prefixes=configured_prefixes,
+        )
+        audit_tools = _SingleRewriteAuditToolRegistry(
+            self._workflow_tool_subset(
+                source_registry,
+                allowed_names={"read_file", "write_file", "web_search", "web_fetch"},
+                allowed_prefixes=configured_prefixes,
+            )
+        )
+
+        system_content = next(
+            (
+                message.get("content")
+                for message in ctx.initial_messages
+                if message.get("role") == "system"
+            ),
+            "",
+        )
+        system_text = _message_content_text(system_content)
+        node_system = (
+            "# Runtime-owned Supply Chain Bottleneck Graph\n\n"
+            "The graph runtime is the sole control-flow authority. Execute only the "
+            "node named in the user message. Never select, skip, or simulate another "
+            "node and never publish model-authored workflow progress.\n\n"
+            f"{system_text}"
+        )
+        node_metadata = {
+            **dict(ctx.msg.metadata or {}),
+            EXPERT_TEAM_TURN_SUPPRESSED_KEY: True,
+            "webui": False,
+        }
+        node_tool_map = {
+            SCOPE_BRIEF: evidence_tools,
+            BOTTLENECK_TEAM_LEAD: report_tools,
+            BOTTLENECK_REPORT_AUDIT: audit_tools,
+        }
+
+        async def _run_node(
+            node_id: str,
+            prompt: str,
+            final_stream: bool,
+        ) -> AgentNodeOutcome:
+            node_messages = [
+                {"role": "system", "content": node_system},
+                {"role": "user", "content": prompt},
+            ]
+            render_template = (
+                "research_report"
+                if node_id in {BOTTLENECK_TEAM_LEAD, BOTTLENECK_REPORT_AUDIT}
+                else "simple"
+            )
+            final_content, tools_used, messages, stop_reason, _had_injections = (
+                await self._run_agent_loop(
+                    node_messages,
+                    on_progress=ctx.on_progress,
+                    on_stream=ctx.on_stream if final_stream else None,
+                    on_stream_end=ctx.on_stream_end if final_stream else None,
+                    on_retry_wait=ctx.on_retry_wait,
+                    session=None,
+                    channel=ctx.msg.channel,
+                    chat_id=ctx.msg.chat_id,
+                    message_id=(
+                        f"{ctx.msg.metadata.get('message_id') or ctx.turn_id}:{node_id}"
+                    ),
+                    metadata={
+                        **node_metadata,
+                        "_supply_chain_bottleneck_graph_node": node_id,
+                        HTML_TEMPLATE_METADATA_KEY: render_template,
+                    },
+                    session_key=ctx.session_key,
+                    pending_queue=None,
+                    ephemeral=True,
+                    tools=node_tool_map[node_id],
+                    max_iterations=(
+                        AUDIT_MAX_TOOL_ITERATIONS
+                        if node_id == BOTTLENECK_REPORT_AUDIT
+                        else BOTTLENECK_SCOPE_MAX_TOOL_ITERATIONS
+                        if node_id == SCOPE_BRIEF
+                        else BOTTLENECK_TEAM_LEAD_MAX_TOOL_ITERATIONS
+                    ),
+                )
+            )
+            return AgentNodeOutcome(
+                content=final_content or "",
+                stop_reason=stop_reason,
+                tools_used=list(tools_used or []),
+                messages=messages,
+                usage=dict(self._last_usage),
+                artifacts=_generated_artifact_paths(messages),
+            )
+
+        effective_scope = self.workspace_scopes.for_turn(
+            channel=ctx.msg.channel,
+            message_metadata=ctx.msg.metadata,
+            session_metadata=ctx.session.metadata,
+        )
+        workflow_corrections: list[str] = []
+
+        async def _run_members(tasks: dict[str, str]) -> MemberBatchOutcome:
+            task_ids: list[str] = []
+            member_by_task: dict[str, str] = {}
+            immediate: dict[str, MemberNodeOutcome] = {}
+            for member_id, task in tasks.items():
+                if member_id not in BOTTLENECK_MEMBER_NODES:
+                    continue
+                task_id = await self.subagents.spawn_for_workflow(
+                    task=task,
+                    label=member_id,
+                    origin_channel=ctx.msg.channel,
+                    origin_chat_id=ctx.msg.chat_id,
+                    session_key=ctx.session_key,
+                    origin_message_id=(
+                        str(ctx.msg.metadata.get("message_id") or "") or None
+                    ),
+                    workspace_scope=effective_scope,
+                    expert_team=team,
+                    expert_team_run_id=run_id,
+                )
+                if re.fullmatch(r"[0-9a-f]{8}", task_id):
+                    task_ids.append(task_id)
+                    member_by_task[task_id] = member_id
+                else:
+                    immediate[member_id] = MemberNodeOutcome(
+                        member_id=member_id,
+                        status="failed",
+                        content=task_id,
+                        activity="该角色未能启动，主笔将按降级流程补齐",
+                    )
+
+            completed = (
+                await self.subagents.wait_for_workflow_tasks(task_ids)
+                if task_ids
+                else []
+            )
+            members = dict(immediate)
+            for result in completed:
+                member_id = member_by_task[result.task_id]
+                artifact_match = re.search(r"Role artifact: `([^`]+)`", result.content)
+                status = (
+                    "completed" if result.status == "ok"
+                    else "cancelled" if result.status == "cancelled"
+                    else "failed"
+                )
+                members[member_id] = MemberNodeOutcome(
+                    member_id=member_id,
+                    status=status,
+                    content=result.content,
+                    artifact=artifact_match.group(1) if artifact_match else None,
+                    activity=(
+                        "研究完成，完整结果已交付 Team Lead"
+                        if status == "completed"
+                        else "该角色结果已降级，Team Lead 将补齐缺失维度"
+                    ),
+                )
+
+            supplements: list[str] = []
+            if ctx.pending_queue is not None:
+                while True:
+                    try:
+                        pending = ctx.pending_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if not isinstance(pending, InboundMessage):
+                        continue
+                    content = pending.content.strip()
+                    if content:
+                        supplements.append(content)
+                    supplements.extend(
+                        str(path) for path in (pending.media or []) if str(path).strip()
+                    )
+            workflow_corrections.extend(supplements)
+            return MemberBatchOutcome(members=members, supplements=supplements)
+
+        async def _publish_state(
+            state: dict[str, Any],
+            event: str,
+            activity: str,
+        ) -> None:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content="",
+                metadata={
+                    **dict(ctx.msg.metadata or {}),
+                    "_team_graph_updated": True,
+                    "team_graph": {
+                        "run_id": run_id,
+                        "team_id": SUPPLY_CHAIN_BOTTLENECK_TEAM_ID,
+                        "event": event,
+                        "activity": activity,
+                        "state": public_supply_chain_bottleneck_state(state),
+                    },
+                },
+            ))
+
+        async def _write_report(report_relative: str, content: str) -> list[str]:
+            """Persist a Team Lead draft through the scoped filesystem tool."""
+
+            result = await report_tools.execute(
+                "write_file",
+                {"path": report_relative, "content": content},
+            )
+            if not isinstance(result, dict):
+                return []
+            paths: list[str] = []
+            for item in result.get("files", []):
+                path = item.get("path") if isinstance(item, dict) else None
+                if isinstance(path, str) and path.strip() and Path(path).is_file():
+                    paths.append(path.strip())
+            return list(dict.fromkeys(paths))
+
+        resume_metadata = ctx.msg.metadata.get(EXPERT_TEAM_RESUME_KEY)
+        resume_state = (
+            resume_metadata.get("graph_state")
+            if isinstance(resume_metadata, dict)
+            and isinstance(resume_metadata.get("graph_state"), dict)
+            else None
+        )
+        resume_artifacts = (
+            [
+                str(item) for item in resume_metadata.get("artifacts", [])
+                if str(item).strip()
+            ]
+            if isinstance(resume_metadata, dict)
+            else []
+        )
+        request = ctx.msg.content.strip()
+        safe_target = re.sub(
+            r"[^0-9A-Za-z_\-\u4e00-\u9fff]+",
+            "-",
+            target,
+        ).strip("-")
+        report_path = (
+            f"reports/bottleneck-map/{(safe_target or 'theme')[:48]}-"
+            f"{run_id}-供应链瓶颈地图.md"
+        )
+
+        file_state_token = bind_file_states(
+            self._file_state_store.for_session(ctx.session_key)
+        )
+        request_token = bind_request_context(RequestContext(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            message_id=str(ctx.msg.metadata.get("message_id") or "") or None,
+            session_key=ctx.session_key,
+            metadata={
+                **dict(ctx.msg.metadata or {}),
+                HTML_TEMPLATE_METADATA_KEY: "research_report",
+            },
+        ))
+        workspace_token = bind_workspace_scope(effective_scope)
+        bound_project_context = project_context_from_metadata(
+            ctx.msg.metadata.get(PROJECT_CONTEXT_METADATA_KEY),
+            session_key=ctx.session_key,
+            root_path=effective_scope.project_path,
+        )
+        project_context_token = bind_project_context(bound_project_context)
+        try:
+            outcome = await SupplyChainBottleneckWorkflowRuntime(
+                run_agent_node=_run_node,
+                run_member_wave=_run_members,
+                publish_state=_publish_state,
+                write_report=_write_report,
+            ).run(
                 run_id=run_id,
                 target=target,
                 request=request,
@@ -3114,7 +3480,26 @@ class AgentLoop:
                 and isinstance(ctx.msg.metadata.get("expert_team_run_id"), str)
             ):
                 result = await self._run_asset_research_workflow(ctx)
+            elif (
+                isinstance(expert_team, dict)
+                and expert_team.get("id") == SUPPLY_CHAIN_BOTTLENECK_TEAM_ID
+                and isinstance(ctx.msg.metadata.get("expert_team_run_id"), str)
+            ):
+                result = await self._run_supply_chain_bottleneck_workflow(ctx)
             else:
+                normal_tools = ctx.tools
+                if (
+                    normal_tools is None
+                    and ctx.msg.channel == "websocket"
+                    and ctx.msg.metadata.get("webui") is True
+                ):
+                    normal_tools = build_webui_turn_tools(
+                        self.tools,
+                        content=ctx.msg.content,
+                        media=ctx.msg.media,
+                        metadata=ctx.msg.metadata,
+                        has_history=bool(ctx.history),
+                    )
                 result = await self._run_agent_loop(
                     ctx.initial_messages,
                     on_progress=ctx.on_progress,
@@ -3131,7 +3516,7 @@ class AgentLoop:
                     ephemeral=ctx.ephemeral,
                     run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
                     hooks=ctx.hooks,
-                    tools=ctx.tools,
+                    tools=normal_tools,
                 )
         finally:
             prompt_requested = interactive_prompt_requested_in_turn()

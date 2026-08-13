@@ -30,6 +30,38 @@ from nanobot.webui.metadata import (
 runner = CliRunner()
 
 
+def test_desktop_gateway_enables_background_provider_prewarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli_commands,
+        "_load_or_create_desktop_config",
+        lambda _config, _workspace: config,
+    )
+    monkeypatch.setattr(cli_commands, "_configure_desktop_gateway", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli_commands,
+        "_run_gateway",
+        lambda _config, **kwargs: captured.update(kwargs),
+    )
+
+    cli_commands.desktop_gateway(
+        webui_port=8900,
+        webui_socket=None,
+        token_issue_secret="desktop-secret",
+        workspace=None,
+        config=None,
+        verbose=False,
+    )
+
+    assert captured["webui_runtime_surface"] == "native"
+    assert captured["health_server_enabled"] is False
+    assert captured["provider_prewarm_enabled"] is True
+
+
 def test_desktop_playwright_mcp_migration_pins_latest() -> None:
     config = Config()
     config.tools.mcp_servers["playwright"] = MCPServerConfig(
@@ -86,6 +118,50 @@ def test_desktop_first_launch_leaves_voice_empty_and_installs_mcp_defaults(
     ]
     assert runtime.transcription.enabled is False
     assert runtime.transcription.provider is None
+
+
+def test_desktop_keeps_shared_mcp_references_on_disk_and_resolves_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nanobot.config.loader import (
+        get_config_path,
+        load_config,
+        save_config,
+        set_config_path,
+    )
+
+    original_config_path = get_config_path()
+    config_path = tmp_path / "desktop" / "config.json"
+    config = Config()
+    config.tools.mcp_servers["juyuan"] = MCPServerConfig(
+        type="streamableHttp",
+        url=(
+            "https://api.gildata.com/mcp-servers/aidata-assistant-srv-api"
+            "?token=${JUYUAN_MCP_TOKEN}"
+        ),
+    )
+    monkeypatch.setenv("JUYUAN_MCP_TOKEN", "shared-secret")
+    config.providers.openai.api_key = "${TEST_DESKTOP_PROVIDER_KEY}"
+    monkeypatch.setenv("TEST_DESKTOP_PROVIDER_KEY", "provider-secret")
+    save_config(config, config_path)
+    try:
+        runtime = cli_commands._load_or_create_desktop_config(
+            str(config_path),
+            str(tmp_path / "workspace"),
+        )
+        persisted = load_config(config_path)
+    finally:
+        set_config_path(original_config_path)
+
+    assert persisted.tools.mcp_servers["juyuan"].url.endswith(
+        "?token=${JUYUAN_MCP_TOKEN}"
+    )
+    assert runtime.tools.mcp_servers["juyuan"].url.endswith(
+        "?token=shared-secret"
+    )
+    assert persisted.providers.openai.api_key == "${TEST_DESKTOP_PROVIDER_KEY}"
+    assert runtime.providers.openai.api_key == "provider-secret"
 
 
 def test_desktop_existing_config_keeps_empty_transcription_disabled(

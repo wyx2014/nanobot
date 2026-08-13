@@ -470,6 +470,128 @@ async def test_expert_team_member_retries_once_before_degrading(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_team_member_runtime_can_disable_retry_and_bound_iterations(tmp_path):
+    from nanobot.agent.subagent import SubagentManager, SubagentStatus
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        max_iterations=100,
+    )
+    mgr._announce_result = AsyncMock()
+
+    async def fail_once(spec):
+        assert spec.max_iterations == 24
+        return SimpleNamespace(
+            stop_reason="tool_error",
+            final_content=None,
+            error="source failed",
+            tool_events=[{"name": "web_fetch", "status": "error", "detail": "blocked"}],
+        )
+
+    mgr.runner.run = AsyncMock(side_effect=fail_once)
+    status = SubagentStatus(
+        task_id="bounded-team",
+        label="company-screener",
+        task_description="screen candidates",
+        started_at=time.monotonic(),
+    )
+
+    await mgr._run_subagent(
+        "bounded-team",
+        "screen candidates",
+        "company-screener",
+        {"channel": "websocket", "chat_id": "c1", "session_key": "websocket:c1"},
+        status,
+        expert_team={
+            "id": "supply-chain-bottleneck-team",
+            "members": [],
+            "member_runtime": {
+                "max_iterations": 24,
+                "timeout_seconds": 360,
+                "max_retries": 0,
+            },
+        },
+        expert_team_run_id="run-1",
+    )
+
+    assert mgr.runner.run.await_count == 1
+    assert mgr._announce_result.await_args.args[5] == "error"
+
+
+@pytest.mark.asyncio
+async def test_bounded_team_timeout_preserves_completed_query_evidence(tmp_path):
+    from nanobot.agent.subagent import SubagentManager, SubagentStatus
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    mgr = SubagentManager(
+        provider=provider,
+        workspace=tmp_path,
+        bus=bus,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    )
+    mgr._announce_result = AsyncMock()
+    mgr._persist_expert_team_member_artifact = AsyncMock(return_value=None)
+
+    async def checkpoint_then_stall(spec):
+        await spec.checkpoint_callback({
+            "phase": "tools_completed",
+            "iteration": 1,
+            "assistant_message": {
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {
+                        "name": "mcp_juyuan_company_financials",
+                        "arguments": "{}",
+                    },
+                }],
+            },
+            "completed_tool_results": [{
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "中际旭创：最近报告期收入与估值字段已取得",
+            }],
+        })
+        await asyncio.sleep(1)
+
+    mgr.runner.run = AsyncMock(side_effect=checkpoint_then_stall)
+    status = SubagentStatus(
+        task_id="bounded-timeout",
+        label="company-screener",
+        task_description="screen candidates",
+        started_at=time.monotonic(),
+    )
+
+    with patch(
+        "nanobot.agent.subagent._expert_team_member_runtime",
+        return_value={"max_iterations": 24, "timeout_seconds": 0.01, "max_retries": 0},
+    ):
+        await mgr._run_subagent(
+            "bounded-timeout",
+            "screen candidates",
+            "company-screener",
+            {"channel": "websocket", "chat_id": "c1", "session_key": "websocket:c1"},
+            status,
+            expert_team={"id": "supply-chain-bottleneck-team", "members": []},
+            expert_team_run_id="run-1",
+        )
+
+    delivered = mgr._announce_result.await_args.args[3]
+    assert "Partial completed research before timeout" in delivered
+    assert "中际旭创" in delivered
+    assert mgr.runner.run.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_expert_team_member_timeout_degrades_without_retry(tmp_path):
     from nanobot.agent.subagent import SubagentManager, SubagentStatus
     from nanobot.bus.queue import MessageBus

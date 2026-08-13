@@ -14,10 +14,11 @@ from typing import Any, Callable, Coroutine, Literal
 from filelock import FileLock
 from loguru import logger
 
+from nanobot.cron.run_context import CronRunContext, bind_cron_run_context
 from nanobot.cron.session_turns import is_bound_cron_job
 from nanobot.cron.types import (
-    CronJobExecutionResult,
     CronJob,
+    CronJobExecutionResult,
     CronJobState,
     CronPayload,
     CronRunRecord,
@@ -666,10 +667,22 @@ class CronService:
         """Execute a single job."""
         self._executing_jobs += 1
         start_ms = _now_ms()
+        is_bound_run = is_bound_cron_job(job)
+        initial_run_id = (
+            f"{start_ms}:{uuid.uuid4().hex[:8]}"
+            if is_bound_run
+            else f"{job.id}:{start_ms}"
+        )
+        initial_session_key = (
+            f"cron:{job.id}:{initial_run_id}"
+            if is_bound_run
+            else None
+        )
         record = CronRunRecord(
             run_at_ms=start_ms,
             status="running",
-            run_id=f"{job.id}:{start_ms}",
+            run_id=initial_run_id,
+            session_key=initial_session_key,
         )
         job.state.run_history.append(record)
         job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
@@ -685,7 +698,13 @@ class CronService:
             logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
             try:
-                result = await self.on_job(job) if self.on_job else None
+                run_context = CronRunContext(
+                    job_id=job.id,
+                    run_id=initial_run_id,
+                    session_key=initial_session_key,
+                )
+                with bind_cron_run_context(run_context):
+                    result = await self.on_job(job) if self.on_job else None
                 if isinstance(result, CronJobExecutionResult):
                     run_id = result.run_id
                     session_key = result.session_key
@@ -718,7 +737,7 @@ class CronService:
             record.duration_ms = end_ms - start_ms
             record.error = job.state.last_error
             record.run_id = run_id or record.run_id
-            record.session_key = session_key
+            record.session_key = session_key or record.session_key
             job.state.run_history = job.state.run_history[-self._MAX_RUN_HISTORY:]
 
             # Handle one-shot jobs
@@ -975,6 +994,18 @@ class CronService:
         store = self._load_store()
         return next((j for j in store.jobs if j.id == job_id), None)
 
+    def get_run_record(self, job_id: str, run_id: str) -> CronRunRecord | None:
+        """Get one persisted run record by its stable or legacy fallback ID."""
+        store = self._load_store()
+        job = next((j for j in store.jobs if j.id == job_id), None)
+        if job is None:
+            return None
+        for record in job.state.run_history:
+            fallback_id = f"{job.id}:{record.run_at_ms}"
+            if run_id in {record.run_id, fallback_id}:
+                return record
+        return None
+
     def mark_run_viewed(self, job_id: str, run_id: str) -> bool:
         """Mark one cron run as viewed by the GUI."""
         store = self._load_store()
@@ -993,6 +1024,35 @@ class CronService:
                 self._append_action("update", asdict(job))
             return True
         return False
+
+    def delete_run(self, job_id: str, run_id: str) -> Literal["deleted", "not_found", "running"]:
+        """Delete one completed cron run from persistent history."""
+        store = self._load_store()
+        job = next((j for j in store.jobs if j.id == job_id), None)
+        if job is None:
+            return "not_found"
+        for index, record in enumerate(job.state.run_history):
+            fallback_id = f"{job.id}:{record.run_at_ms}"
+            if run_id not in {record.run_id, fallback_id}:
+                continue
+            if record.status == "running":
+                return "running"
+            deleted = job.state.run_history.pop(index)
+            remaining = job.state.run_history
+            job.state.last_run_at_ms = remaining[-1].run_at_ms if remaining else None
+            job.state.last_status = remaining[-1].status if remaining else None
+            job.state.last_error = remaining[-1].error if remaining else None
+            job.updated_at_ms = max(job.updated_at_ms, _now_ms())
+            if self._running:
+                self._save_store()
+            else:
+                self._append_action("update", asdict(job))
+            record_id = deleted.run_id or fallback_id
+            audit_path = self._run_records_dir / f"{self._safe_run_record_name(record_id)}.json"
+            with suppress(OSError):
+                audit_path.unlink(missing_ok=True)
+            return "deleted"
+        return "not_found"
 
     def status(self) -> dict:
         """Get service status."""

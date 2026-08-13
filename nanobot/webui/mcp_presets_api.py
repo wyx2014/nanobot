@@ -411,12 +411,21 @@ def _url_with_param(url: str, key: str, value: str) -> str:
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query = [(k, v) for k, v in query if k != key]
     query.append((key, value))
+    encoded_query = urllib.parse.urlencode(query)
+    # Keep a full ${ENV_VAR} reference visible to resolve_config_env_vars().
+    # urllib would otherwise turn it into %24%7B...%7D and the shared desktop
+    # credential would never be resolved at runtime.
+    if re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", value):
+        encoded_query = encoded_query.replace(
+            urllib.parse.quote_plus(value),
+            value,
+        )
     return urllib.parse.urlunsplit(
         (
             parsed.scheme,
             parsed.netloc,
             parsed.path,
-            urllib.parse.urlencode(query),
+            encoded_query,
             parsed.fragment,
         )
     )
@@ -477,6 +486,22 @@ def _field_configured(field: McpPresetField, cfg: MCPServerConfig | None) -> boo
     return bool(field.env_var and os.environ.get(field.env_var))
 
 
+def _field_credential_source(
+    field: McpPresetField,
+    cfg: MCPServerConfig | None,
+) -> Literal["built_in", "user", "environment", "missing"]:
+    value = _field_value_from_config(field, cfg)
+    env_reference = f"${{{field.env_var}}}" if field.env_var else ""
+    if value:
+        normalized = value
+        if field.value_prefix and normalized.lower().startswith(field.value_prefix.lower()):
+            normalized = normalized[len(field.value_prefix):]
+        return "built_in" if env_reference and normalized == env_reference else "user"
+    if field.env_var and os.environ.get(field.env_var):
+        return "environment"
+    return "missing"
+
+
 def _field_payload(field: McpPresetField, cfg: MCPServerConfig | None) -> dict[str, Any]:
     return {
         "name": field.name,
@@ -484,6 +509,7 @@ def _field_payload(field: McpPresetField, cfg: MCPServerConfig | None) -> dict[s
         "secret": field.secret,
         "required": field.required,
         "configured": _field_configured(field, cfg),
+        "credential_source": _field_credential_source(field, cfg),
         "placeholder": field.placeholder,
         "env_var": field.env_var,
     }

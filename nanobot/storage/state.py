@@ -666,6 +666,17 @@ def _stable_id(prefix: str, value: str) -> str:
     return f"{prefix}_{uuid.uuid5(_ID_NAMESPACE, value).hex}"
 
 
+def _validated_stable_id(prefix: str, value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    expected_prefix = f"{prefix}_"
+    suffix = normalized[len(expected_prefix):] if normalized.startswith(expected_prefix) else ""
+    if len(suffix) != 32 or any(char not in "0123456789abcdef" for char in suffix):
+        return None
+    return f"{expected_prefix}{suffix}"
+
+
 def _canonical_path(value: str | Path) -> str:
     resolved = Path(value).expanduser().resolve(strict=False)
     return os.path.normcase(str(resolved))
@@ -1058,10 +1069,12 @@ class StateStore:
         *,
         name: str | None = None,
         kind: Literal["workspace", "inbox", "legacy_quarantine"] | None = None,
+        preferred_id: str | None = None,
     ) -> ProjectRecord:
         canonical = _canonical_path(root_path)
         resolved_kind = kind or ("inbox" if canonical == self.default_workspace else "workspace")
-        project_id = _stable_id("prj", f"{resolved_kind}:{canonical}")
+        derived_project_id = _stable_id("prj", f"{resolved_kind}:{canonical}")
+        project_id = _validated_stable_id("prj", preferred_id) or derived_project_id
         filesystem_identity = _filesystem_identity(root_path)
         display_name = (name or Path(canonical).name or canonical).strip()
         now = _now_ms()
@@ -1085,13 +1098,19 @@ class StateStore:
                     (project_id,),
                 ).fetchone()
                 if id_owner is not None:
-                    project_id = _stable_id(
-                        "prj",
-                        (
-                            f"{resolved_kind}:{canonical}:collision:"
-                            f"{id_owner['canonical_root_path']}"
-                        ),
-                    )
+                    project_id = derived_project_id
+                    derived_owner = connection.execute(
+                        "SELECT canonical_root_path FROM projects WHERE id = ?",
+                        (project_id,),
+                    ).fetchone()
+                    if derived_owner is not None:
+                        project_id = _stable_id(
+                            "prj",
+                            (
+                                f"{resolved_kind}:{canonical}:collision:"
+                                f"{derived_owner['canonical_root_path']}"
+                            ),
+                        )
                 connection.execute(
                     """
                     INSERT INTO projects(
@@ -1337,7 +1356,20 @@ class StateStore:
         artifact_index_initialized: bool = False,
         allow_draft_rebind: bool = False,
     ) -> tuple[ProjectRecord, SessionRecord]:
-        project = self.ensure_project(root_path, name=project_name)
+        preferred_project_id = (
+            metadata.get("project_id")
+            if isinstance(metadata, dict)
+            else None
+        )
+        project = self.ensure_project(
+            root_path,
+            name=project_name,
+            preferred_id=(
+                preferred_project_id
+                if isinstance(preferred_project_id, str)
+                else None
+            ),
+        )
         session = self.bind_session(
             session_key,
             project.id,
@@ -2691,12 +2723,18 @@ class StateStore:
             connection.commit()
         return len(synced_ids)
 
-    def list_project_sessions(self, project_id: str) -> list[SessionRecord]:
+    def list_project_sessions(
+        self,
+        project_id: str,
+        *,
+        include_archived: bool = False,
+    ) -> list[SessionRecord]:
+        archived_filter = "" if include_archived else "AND status != 'archived'"
         with self._lock, self._connection() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM sessions
-                WHERE project_id = ? AND status != 'archived'
+                WHERE project_id = ? {archived_filter}
                 ORDER BY updated_at DESC
                 """,
                 (project_id,),
@@ -3777,6 +3815,45 @@ class StateStore:
             "error": error,
         }
 
+    def record_projector_error(
+        self,
+        session_key: str,
+        *,
+        event_id: str,
+        event_seq: int,
+        message: str,
+    ) -> None:
+        """Persist an incomplete-replay marker so readers fail consistently."""
+        session = self.get_session(session_key)
+        if session is None:
+            return
+        now = _now_ms()
+        error = _safe_json({
+            "code": "EVENT_RECOVERY_FAILED",
+            "message": message,
+            "event_id": event_id,
+            "event_seq": event_seq,
+        })
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO projector_state(
+                    session_id, event_log_path, last_event_seq,
+                    last_event_id, last_projected_at, error_json
+                ) VALUES (?, ?, 0, NULL, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    last_projected_at = excluded.last_projected_at,
+                    error_json = excluded.error_json
+                """,
+                (session.id, session.event_log_path or "", now, error),
+            )
+            connection.commit()
+
+    def checkpoint(self) -> None:
+        """Flush the WAL at a graceful lifecycle boundary."""
+        with self._lock, self._connection() as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def backfill_projected_event_payloads(
         self,
         session_key: str,
@@ -4145,6 +4222,59 @@ class StateStore:
                 (now, now, session_key),
             )
             connection.commit()
+
+    def prune_unverified_referenced_artifacts(
+        self,
+        session_key: str,
+        allowed_relative_paths: set[str],
+    ) -> int:
+        """Unlink legacy mtime-discovered files that lack session evidence.
+
+        Only unscoped ``referenced`` links are eligible.  Artifacts registered
+        by a live turn/tool call, generated files, edits and attachments are
+        never touched.  The artifact records and user files remain intact; the
+        operation only repairs the incorrect session-to-artifact relationship.
+        """
+
+        session = self.get_session(session_key)
+        if session is None:
+            raise StateStoreError(f"session is not registered: {session_key}")
+        allowed = {
+            Path(path).as_posix().lstrip("/")
+            for path in allowed_relative_paths
+            if isinstance(path, str) and path.strip()
+        }
+        with self._lock, self._connection() as connection:
+            stale_rows = connection.execute(
+                """
+                SELECT l.id, a.relative_path
+                FROM artifact_links AS l
+                JOIN artifacts AS a
+                  ON a.id = l.artifact_id
+                 AND a.project_id = l.project_id
+                WHERE l.session_id = ?
+                  AND l.project_id = ?
+                  AND l.relation_type = 'referenced'
+                  AND l.turn_id IS NULL
+                  AND l.tool_call_id IS NULL
+                """,
+                (session.id, session.project_id),
+            ).fetchall()
+            stale_link_ids = [
+                str(row["id"])
+                for row in stale_rows
+                if str(row["relative_path"]) not in allowed
+            ]
+            if not stale_link_ids:
+                return 0
+            placeholders = ",".join("?" for _ in stale_link_ids)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                f"DELETE FROM artifact_links WHERE id IN ({placeholders})",
+                stale_link_ids,
+            )
+            connection.commit()
+        return len(stale_link_ids)
 
     def register_artifact(
         self,
@@ -4530,11 +4660,78 @@ class StateStore:
         assert failed is not None
         return failed
 
-    def list_session_artifacts(self, session_key: str) -> list[ArtifactRecord]:
+    def assign_referenced_artifact_turn(
+        self,
+        session_key: str,
+        relative_path: str,
+        turn_id: str,
+    ) -> int:
+        """Attach a legacy explicit reference to the turn that emitted it."""
+
+        session = self.get_session(session_key)
+        if session is None:
+            raise StateStoreError(f"session is not registered: {session_key}")
+        normalized_path = Path(relative_path).as_posix().lstrip("/")
+        with self._lock, self._connection() as connection:
+            turn = connection.execute(
+                """
+                SELECT id FROM turns
+                WHERE id = ? AND session_id = ? AND project_id = ?
+                """,
+                (turn_id, session.id, session.project_id),
+            ).fetchone()
+            if turn is None:
+                return 0
+            cursor = connection.execute(
+                """
+                UPDATE artifact_links
+                SET turn_id = ?
+                WHERE session_id = ?
+                  AND project_id = ?
+                  AND relation_type = 'referenced'
+                  AND turn_id IS NULL
+                  AND artifact_id IN (
+                      SELECT id FROM artifacts
+                      WHERE project_id = ? AND relative_path = ?
+                  )
+                """,
+                (
+                    turn_id,
+                    session.id,
+                    session.project_id,
+                    session.project_id,
+                    normalized_path,
+                ),
+            )
+            if cursor.rowcount > 0:
+                now = _now_ms()
+                connection.execute(
+                    """
+                    UPDATE sessions
+                    SET artifact_revision = artifact_revision + 1,
+                        updated_at = MAX(updated_at, ?)
+                    WHERE id = ?
+                    """,
+                    (now, session.id),
+                )
+            connection.commit()
+            return max(0, int(cursor.rowcount))
+
+    def list_session_artifacts(
+        self,
+        session_key: str,
+        *,
+        turn_id: str | None = None,
+    ) -> list[ArtifactRecord]:
         self.reconcile_stale_artifacts(session_key=session_key)
+        turn_filter = ""
+        params: list[Any] = [session_key]
+        if turn_id is not None:
+            turn_filter = "AND l.turn_id = ?"
+            params.append(turn_id)
         with self._lock, self._connection() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     a.*, l.session_id, l.relation_type, s.session_key
                 FROM sessions s
@@ -4545,6 +4742,7 @@ class StateStore:
                   ON a.id = l.artifact_id
                  AND a.project_id = l.project_id
                 WHERE s.session_key = ?
+                  {turn_filter}
                 ORDER BY
                     COALESCE(a.ready_at, a.updated_at) DESC,
                     CASE l.relation_type
@@ -4557,7 +4755,7 @@ class StateStore:
                     END,
                     a.id
                 """,
-                (session_key,),
+                params,
             ).fetchall()
         # A failed edit attempt doesn't invalidate the last materialized file
         # at the same path. Pick the newest non-failed revision when one
@@ -4733,13 +4931,18 @@ class StateStore:
             )
             connection.commit()
 
-    def archive_session(self, session_key: str) -> None:
+    def archive_session(self, session_key: str) -> SessionRecord:
         with self._lock, self._connection() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE sessions SET status = 'archived', updated_at = ? WHERE session_key = ?",
                 (_now_ms(), session_key),
             )
             connection.commit()
+        if cursor.rowcount <= 0:
+            raise StateStoreError("session not found")
+        archived = self.get_session(session_key)
+        assert archived is not None
+        return archived
 
     def restore_session(self, session_key: str) -> SessionRecord:
         now = _now_ms()
@@ -4747,7 +4950,7 @@ class StateStore:
             cursor = connection.execute(
                 """
                 UPDATE sessions SET status = 'active', updated_at = ?, completed_at = NULL
-                WHERE session_key = ? AND status = 'archived'
+                WHERE session_key = ?
                 """,
                 (now, session_key),
             )
@@ -4757,6 +4960,183 @@ class StateStore:
         restored = self.get_session(session_key)
         assert restored is not None
         return restored
+
+    def purge_session(self, session_key: str) -> dict[str, Any]:
+        """Delete one archived session projection while preserving user files.
+
+        Conversation/session journals are deleted by the gateway composition
+        layer.  This transaction removes every relational projection owned by
+        the session and detaches shared artifacts before deleting the session
+        identity itself.
+        """
+        session = self.get_session(session_key)
+        if session is None:
+            return {"purged": False, "session_key": session_key}
+        if session.status != "archived":
+            raise StateStoreError("session must be archived before permanent deletion")
+
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT active_turn_id, event_log_path FROM sessions WHERE id = ?",
+                (session.id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return {"purged": False, "session_key": session_key}
+            if row["active_turn_id"] is not None:
+                connection.rollback()
+                raise StateStoreError("session has an active turn; stop it before deletion")
+
+            created_artifact_rows = connection.execute(
+                "SELECT id FROM artifacts WHERE created_by_session_id = ?",
+                (session.id,),
+            ).fetchall()
+            created_artifact_ids = [str(item["id"]) for item in created_artifact_rows]
+
+            connection.execute(
+                "UPDATE schedules SET created_session_id = NULL WHERE created_session_id = ?",
+                (session.id,),
+            )
+            connection.execute(
+                "UPDATE schedules SET last_run_session_id = NULL WHERE last_run_session_id = ?",
+                (session.id,),
+            )
+            connection.execute(
+                "DELETE FROM agent_edges WHERE parent_session_id = ? OR child_session_id = ?",
+                (session.id, session.id),
+            )
+            connection.execute(
+                "DELETE FROM project_memory_sources WHERE source_session_id = ?",
+                (session.id,),
+            )
+            connection.execute(
+                "DELETE FROM project_memories WHERE source_session_id = ?",
+                (session.id,),
+            )
+            connection.execute(
+                "DELETE FROM project_memory_stage1 WHERE source_session_id = ?",
+                (session.id,),
+            )
+            connection.execute(
+                "DELETE FROM artifact_links WHERE session_id = ?",
+                (session.id,),
+            )
+
+            deleted_artifact_ids: list[str] = []
+            retained_artifact_ids: list[str] = []
+            for artifact_id in created_artifact_ids:
+                shared = connection.execute(
+                    "SELECT 1 FROM artifact_links WHERE artifact_id = ? LIMIT 1",
+                    (artifact_id,),
+                ).fetchone()
+                if shared is None:
+                    deleted_artifact_ids.append(artifact_id)
+                else:
+                    retained_artifact_ids.append(artifact_id)
+
+            if retained_artifact_ids:
+                placeholders = ",".join("?" for _ in retained_artifact_ids)
+                connection.execute(
+                    f"""
+                    UPDATE artifacts
+                    SET created_by_session_id = NULL,
+                        created_by_turn_id = NULL,
+                        created_by_tool_call_id = NULL,
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (_now_ms(), *retained_artifact_ids),
+                )
+            if deleted_artifact_ids:
+                placeholders = ",".join("?" for _ in deleted_artifact_ids)
+                document_rows = connection.execute(
+                    f"SELECT id FROM project_documents WHERE source_artifact_id IN ({placeholders})",
+                    deleted_artifact_ids,
+                ).fetchall()
+                document_ids = [str(item["id"]) for item in document_rows]
+                if document_ids:
+                    document_placeholders = ",".join("?" for _ in document_ids)
+                    connection.execute(
+                        f"DELETE FROM project_chunks WHERE document_id IN ({document_placeholders})",
+                        document_ids,
+                    )
+                    connection.execute(
+                        f"DELETE FROM project_documents WHERE id IN ({document_placeholders})",
+                        document_ids,
+                    )
+                connection.execute(
+                    f"UPDATE artifacts SET supersedes_artifact_id = NULL WHERE supersedes_artifact_id IN ({placeholders})",
+                    deleted_artifact_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM artifacts WHERE id IN ({placeholders})",
+                    deleted_artifact_ids,
+                )
+
+            connection.execute(
+                "DELETE FROM expert_team_checkpoints WHERE session_id = ?",
+                (session.id,),
+            )
+            connection.execute(
+                "DELETE FROM expert_team_runs WHERE session_id = ?",
+                (session.id,),
+            )
+            connection.execute("DELETE FROM turn_progress WHERE session_id = ?", (session.id,))
+            connection.execute("DELETE FROM turn_steps WHERE session_id = ?", (session.id,))
+            connection.execute("DELETE FROM messages WHERE session_id = ?", (session.id,))
+            connection.execute("DELETE FROM tool_calls WHERE session_id = ?", (session.id,))
+            connection.execute("DELETE FROM projected_events WHERE session_id = ?", (session.id,))
+            connection.execute("DELETE FROM projector_state WHERE session_id = ?", (session.id,))
+            connection.execute("DELETE FROM turns WHERE session_id = ?", (session.id,))
+            connection.execute("DELETE FROM sessions WHERE id = ?", (session.id,))
+            connection.commit()
+
+        return {
+            "purged": True,
+            "session_key": session_key,
+            "session_id": session.id,
+            "project_id": session.project_id,
+            "event_log_path": row["event_log_path"],
+            "deleted_artifact_records": len(deleted_artifact_ids),
+            "retained_shared_artifacts": len(retained_artifact_ids),
+        }
+
+    def purge_project(self, project_id: str) -> dict[str, Any]:
+        """Permanently remove an archived project registration, never its folder."""
+        project = self.get_project(project_id)
+        if project is None:
+            return {"purged": False, "project_id": project_id}
+        if project.kind == "inbox":
+            raise StateStoreError("the Inbox project cannot be permanently deleted")
+        if project.status != "archived":
+            raise StateStoreError("project must be archived before permanent deletion")
+        with self._lock, self._connection() as connection:
+            remaining = connection.execute(
+                "SELECT 1 FROM sessions WHERE project_id = ? LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if remaining is not None:
+                raise StateStoreError("project still has sessions")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM project_memory_sources WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM project_memories WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM project_memory_stage1 WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM project_memory_jobs WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM project_chunks WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM project_documents WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM project_cache WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM schedules WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM artifact_links WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM artifacts WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM agent_edges WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            connection.commit()
+        return {
+            "purged": True,
+            "project_id": project.id,
+            "root_path": project.root_path,
+        }
 
     def complete_session(
         self,

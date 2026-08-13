@@ -792,6 +792,33 @@ def test_run_installed_cli_uses_argv_without_shell(
     assert "['--json', 'project', 'list']" in result
 
 
+def test_run_installed_cli_filters_desktop_shared_mcp_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    _seed_catalog(manager)
+    resolved = str(tmp_path / "bin" / "cli-anything-gimp")
+    monkeypatch.setenv("JUYUAN_MCP_TOKEN", "desktop-shared-secret")
+    monkeypatch.setenv("UNRELATED_RUNTIME_VALUE", "keep-me")
+    monkeypatch.setattr(
+        "nanobot.apps.cli.service.shutil.which",
+        lambda entry: resolved if entry == "cli-anything-gimp" else None,
+    )
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        assert "JUYUAN_MCP_TOKEN" not in env
+        assert env["UNRELATED_RUNTIME_VALUE"] == "keep-me"
+        return subprocess.CompletedProcess(argv, 0, stdout="done", stderr="")
+
+    monkeypatch.setattr("nanobot.apps.cli.service.subprocess.run", fake_run)
+    manager._save_installed({"gimp": {"entry_point": "cli-anything-gimp"}})
+
+    manager.run("gimp")
+
+
 def test_run_reports_created_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

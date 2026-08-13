@@ -131,6 +131,13 @@ def _is_transient(exc: BaseException) -> bool:
 
 def _is_session_terminated(exc: BaseException) -> bool:
     """Return True when the MCP SDK reports a dead client session."""
+    # Transport-level failures mean the wrapper's ClientSession is no longer
+    # safe to reuse even when the exception has no message.  anyio commonly
+    # raises a message-less ClosedResourceError / EndOfStream after an idle
+    # streamable-HTTP connection is closed, so string matching alone misses
+    # the exact failures that most need a fresh MCP session.
+    if _is_transient(exc):
+        return True
     messages = [str(exc)]
     error = getattr(exc, "error", None)
     if error is not None:
@@ -446,11 +453,16 @@ class _MCPWrapperBase(Tool):
     async def _refresh_session_after_termination(
         self,
         exc: BaseException,
-        already_refreshed: bool,
+        reconnect_attempted: bool,
         capability_kind: str,
-    ) -> bool:
-        if already_refreshed or not _is_session_terminated(exc) or self._reconnect is None:
-            return False
+    ) -> tuple[bool, bool]:
+        """Return (attempted, succeeded) for one bounded reconnect."""
+        if (
+            reconnect_attempted
+            or not _is_session_terminated(exc)
+            or self._reconnect is None
+        ):
+            return False, False
         logger.warning(
             "MCP {} '{}' session terminated; reconnecting server '{}' before retry",
             capability_kind,
@@ -466,9 +478,9 @@ class _MCPWrapperBase(Tool):
                 self._name,
                 self._server_name,
             )
-            return False
+            return True, False
         self._session = refreshed_session
-        return True
+        return True, True
 
 
 class MCPToolWrapper(_MCPWrapperBase):
@@ -528,7 +540,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                 return blocked
 
         retried_transient = False
-        refreshed_session = False
+        reconnect_attempted = False
         artifact_snapshot = _artifact_snapshot(self._server_cwd)
         while True:
             try:
@@ -550,13 +562,19 @@ class MCPToolWrapper(_MCPWrapperBase):
                 logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
                 return "(MCP tool call was cancelled)"
             except Exception as exc:
-                if await self._refresh_session_after_termination(
+                attempted, reconnected = await self._refresh_session_after_termination(
                     exc,
-                    refreshed_session,
+                    reconnect_attempted,
                     "tool",
-                ):
-                    refreshed_session = True
+                )
+                reconnect_attempted = reconnect_attempted or attempted
+                if reconnected:
                     continue
+                if attempted:
+                    return (
+                        "(MCP tool call failed: reconnect unsuccessful after "
+                        f"{type(exc).__name__})"
+                    )
                 if _is_transient(exc):
                     if not retried_transient:
                         retried_transient = True
@@ -568,7 +586,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                         await asyncio.sleep(1)  # Brief backoff before retry
                         continue
                     # Second transient failure — give up with retry-specific message
-                    logger.exception(
+                    logger.warning(
                         "MCP tool '{}' failed after retry: {}",
                         self._name,
                         type(exc).__name__,
@@ -650,7 +668,7 @@ class MCPResourceWrapper(_MCPWrapperBase):
         from mcp import types
 
         retried_transient = False
-        refreshed_session = False
+        reconnect_attempted = False
         while True:
             try:
                 result = await asyncio.wait_for(
@@ -669,13 +687,19 @@ class MCPResourceWrapper(_MCPWrapperBase):
                 logger.warning("MCP resource '{}' was cancelled by server/SDK", self._name)
                 return "(MCP resource read was cancelled)"
             except Exception as exc:
-                if await self._refresh_session_after_termination(
+                attempted, reconnected = await self._refresh_session_after_termination(
                     exc,
-                    refreshed_session,
+                    reconnect_attempted,
                     "resource",
-                ):
-                    refreshed_session = True
+                )
+                reconnect_attempted = reconnect_attempted or attempted
+                if reconnected:
                     continue
+                if attempted:
+                    return (
+                        "(MCP resource read failed: reconnect unsuccessful after "
+                        f"{type(exc).__name__})"
+                    )
                 if _is_transient(exc):
                     if not retried_transient:
                         retried_transient = True
@@ -686,7 +710,7 @@ class MCPResourceWrapper(_MCPWrapperBase):
                         )
                         await asyncio.sleep(1)
                         continue
-                    logger.exception(
+                    logger.warning(
                         "MCP resource '{}' failed after retry: {}",
                         self._name,
                         type(exc).__name__,
@@ -766,7 +790,7 @@ class MCPPromptWrapper(_MCPWrapperBase):
         from mcp.shared.exceptions import McpError
 
         retried_transient = False
-        refreshed_session = False
+        reconnect_attempted = False
         while True:
             try:
                 result = await asyncio.wait_for(
@@ -785,13 +809,19 @@ class MCPPromptWrapper(_MCPWrapperBase):
                 logger.warning("MCP prompt '{}' was cancelled by server/SDK", self._name)
                 return "(MCP prompt call was cancelled)"
             except McpError as exc:
-                if await self._refresh_session_after_termination(
+                attempted, reconnected = await self._refresh_session_after_termination(
                     exc,
-                    refreshed_session,
+                    reconnect_attempted,
                     "prompt",
-                ):
-                    refreshed_session = True
+                )
+                reconnect_attempted = reconnect_attempted or attempted
+                if reconnected:
                     continue
+                if attempted:
+                    return (
+                        "(MCP prompt call failed: reconnect unsuccessful after "
+                        f"{type(exc).__name__})"
+                    )
                 logger.exception(
                     "MCP prompt '{}' failed: code={} message={}",
                     self._name,
@@ -800,13 +830,19 @@ class MCPPromptWrapper(_MCPWrapperBase):
                 )
                 return f"(MCP prompt call failed: {exc.error.message} [code {exc.error.code}])"
             except Exception as exc:
-                if await self._refresh_session_after_termination(
+                attempted, reconnected = await self._refresh_session_after_termination(
                     exc,
-                    refreshed_session,
+                    reconnect_attempted,
                     "prompt",
-                ):
-                    refreshed_session = True
+                )
+                reconnect_attempted = reconnect_attempted or attempted
+                if reconnected:
                     continue
+                if attempted:
+                    return (
+                        "(MCP prompt call failed: reconnect unsuccessful after "
+                        f"{type(exc).__name__})"
+                    )
                 if _is_transient(exc):
                     if not retried_transient:
                         retried_transient = True
@@ -817,7 +853,7 @@ class MCPPromptWrapper(_MCPWrapperBase):
                         )
                         await asyncio.sleep(1)
                         continue
-                    logger.exception(
+                    logger.warning(
                         "MCP prompt '{}' failed after retry: {}",
                         self._name,
                         type(exc).__name__,

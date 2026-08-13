@@ -74,6 +74,19 @@ def test_webui_session_list_drops_deleted_index_rows(tmp_path: Path) -> None:
     assert list_webui_sessions(manager) == []
 
 
+def test_webui_session_list_replaces_invalid_generated_title_with_preview(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:reasoning-title")
+    session.metadata["title"] = "被截断的自动标题…"
+    session.add_message("user", "分析青岛啤酒")
+    manager.save(session)
+
+    [row] = list_webui_sessions(manager)
+
+    assert row["title"] == "分析青岛啤酒"
+    assert row["preview"] == "分析青岛啤酒"
+
+
 def test_webui_session_list_skips_cron_internal_user_preview(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     session = manager.get_or_create("websocket:cron-preview")
@@ -86,6 +99,39 @@ def test_webui_session_list_skips_cron_internal_user_preview(tmp_path: Path) -> 
     manager.save(session)
 
     assert list_webui_sessions(manager)[0]["preview"] == "提醒已经到期。"
+
+
+def test_webui_session_list_hides_runtime_owned_continuations(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    internal_messages = [
+        "[Subagent 'financial-analyst' completed successfully]\n\nTask: analyze",
+        "[Expert-team completion guard] Continue the team synthesis.",
+        "[Active-turn user correction] Keep the active objective.",
+    ]
+    for index, message in enumerate(internal_messages):
+        session = manager.get_or_create(f"websocket:internal-{index}")
+        session.add_message("user", message)
+        session.add_message("assistant", "internal continuation")
+        manager.save(session)
+    cron_wrapper = manager.get_or_create("websocket:cron:job:run")
+    manager.save(cron_wrapper)
+
+    assert list_webui_sessions(manager) == []
+
+
+def test_webui_session_list_keeps_parent_with_later_subagent_result(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:parent")
+    session.add_message("user", "研究 AI 硬件供应链")
+    session.add_message(
+        "user",
+        "[Subagent 'industry-researcher' completed successfully]\n\nResult: done",
+    )
+    manager.save(session)
+
+    [row] = list_webui_sessions(manager)
+    assert row["key"] == "websocket:parent"
+    assert row["preview"] == "研究 AI 硬件供应链"
 
 
 def test_webui_session_list_uses_webui_transcript_activity_for_sort(
@@ -207,4 +253,3 @@ def test_session_manager_list_sessions_fallback_time_when_missing(tmp_path: Path
     assert sessions[0]["updated_at"] is not None
     datetime.fromisoformat(sessions[0]["created_at"])
     datetime.fromisoformat(sessions[0]["updated_at"])
-

@@ -19,9 +19,6 @@ if TYPE_CHECKING:
 
 MAX_SESSION_ARTIFACTS = 100
 MAX_ARTIFACT_CONTENT_BYTES = 64 * 1024 * 1024
-MAX_SCANNED_ARTIFACT_FILES = 20_000
-MAX_SCANNED_ARTIFACT_DIRS = 4_000
-_SESSION_CLOCK_TOLERANCE_S = 2.0
 _EXCLUDED_DIR_NAMES = frozenset({
     ".git",
     ".hg",
@@ -96,66 +93,40 @@ def discover_session_artifacts(
     scope: WorkspaceScope,
     max_items: int = MAX_SESSION_ARTIFACTS,
 ) -> dict[str, Any]:
-    """Return files created/changed during a session plus explicit output paths.
+    """Return only files durably referenced by this session.
 
-    The scan is intentionally session-scoped rather than a workspace browser:
-    old files are omitted unless a durable tool/file-edit record explicitly
-    references them. Internal/build/vendor directories are always pruned.
+    A project directory is shared by many conversations, so filesystem mtime
+    is not evidence that a file belongs to one particular session.  Legacy
+    discovery therefore uses explicit tool outputs, file-edit events and
+    attached media only.  Current runs register artifacts directly in SQLite.
     """
 
     root = scope.project_path.expanduser().resolve(strict=False)
     if not root.is_dir():
         return {"artifacts": [], "truncated": False}
 
-    threshold = _session_started_timestamp(session_data)
     explicit = _explicit_session_paths(session_key, session_data, root)
     candidates: dict[str, tuple[Path, os.stat_result]] = {}
-    scanned_files = 0
-    scanned_dirs = 0
-    scan_truncated = False
+    turn_by_path: dict[str, str] = {}
 
-    for candidate in explicit:
-        _add_candidate(candidates, candidate, root)
-
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        scanned_dirs += 1
-        if scanned_dirs > MAX_SCANNED_ARTIFACT_DIRS:
-            scan_truncated = True
-            break
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if not _excluded_name(name)
-        ]
-        parent = Path(dirpath)
-        for filename in filenames:
-            scanned_files += 1
-            if scanned_files > MAX_SCANNED_ARTIFACT_FILES:
-                scan_truncated = True
-                break
-            if _excluded_name(filename):
-                continue
-            candidate = parent / filename
-            try:
-                stat = candidate.stat()
-            except OSError:
-                continue
-            if stat.st_mtime + _SESSION_CLOCK_TOLERANCE_S < threshold:
-                continue
-            _add_candidate(candidates, candidate, root, stat=stat)
-        if scan_truncated:
-            break
+    for candidate, turn_id in explicit.items():
+        relative = _add_candidate(candidates, candidate, root)
+        if relative is not None and turn_id is not None:
+            turn_by_path[relative] = turn_id
 
     ordered = sorted(
         candidates.values(),
         key=lambda item: (item[1].st_mtime, item[0].as_posix()),
         reverse=True,
     )
-    truncated = scan_truncated or len(ordered) > max_items
-    rows = [
-        artifact_row(path, stat, root=root, session_key=session_key)
-        for path, stat in ordered[:max_items]
-    ]
+    truncated = len(ordered) > max_items
+    rows = []
+    for path, stat in ordered[:max_items]:
+        row = artifact_row(path, stat, root=root, session_key=session_key)
+        turn_id = turn_by_path.get(row["path"])
+        if turn_id is not None:
+            row["_turn_id"] = turn_id
+        rows.append(row)
     return {"artifacts": rows, "truncated": truncated}
 
 
@@ -355,38 +326,12 @@ def artifact_content_type(path: Path) -> str:
     return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
-def _session_started_timestamp(session_data: dict[str, Any]) -> float:
-    raw = session_data.get("created_at")
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.astimezone()
-            return parsed.timestamp()
-        except ValueError:
-            pass
-    messages = session_data.get("messages")
-    if isinstance(messages, list):
-        for message in messages:
-            raw_timestamp = message.get("timestamp") if isinstance(message, dict) else None
-            if not isinstance(raw_timestamp, str):
-                continue
-            try:
-                parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
-                if parsed.tzinfo is None:
-                    parsed = parsed.astimezone()
-                return parsed.timestamp()
-            except ValueError:
-                continue
-    return float("inf")
-
-
 def _explicit_session_paths(
     session_key: str,
     session_data: dict[str, Any],
     root: Path,
-) -> set[Path]:
-    paths: set[Path] = set()
+) -> dict[Path, str | None]:
+    paths: dict[Path, str | None] = {}
     messages = session_data.get("messages")
     if isinstance(messages, list):
         for message in messages:
@@ -401,15 +346,17 @@ def _explicit_session_paths(
                 continue
             if not isinstance(payload, dict):
                 continue
+            turn_id = _normalized_turn_id(message.get("turn_id"))
             for key in ("files", "artifacts"):
                 entries = payload.get(key)
                 if not isinstance(entries, list):
                     continue
                 for entry in entries:
                     raw_path = entry.get("path") if isinstance(entry, dict) else None
-                    _collect_explicit_path(paths, raw_path, root)
+                    _collect_explicit_path(paths, raw_path, root, turn_id=turn_id)
 
     for record in read_transcript_lines(session_key):
+        turn_id = _normalized_turn_id(record.get("turn_id"))
         if record.get("event") == "file_edit":
             edits = record.get("edits")
             if isinstance(edits, list):
@@ -420,22 +367,37 @@ def _explicit_session_paths(
                         paths,
                         edit.get("absolute_path") or edit.get("path"),
                         root,
+                        turn_id=turn_id,
                     )
         if record.get("event") == "message":
             media = record.get("media")
             if isinstance(media, list):
                 for raw_path in media:
-                    _collect_explicit_path(paths, raw_path, root)
+                    _collect_explicit_path(paths, raw_path, root, turn_id=turn_id)
     return paths
 
 
-def _collect_explicit_path(paths: set[Path], value: Any, root: Path) -> None:
+def _normalized_turn_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _collect_explicit_path(
+    paths: dict[Path, str | None],
+    value: Any,
+    root: Path,
+    *,
+    turn_id: str | None,
+) -> None:
     if not isinstance(value, str) or not value.strip():
         return
     candidate = Path(value.strip()).expanduser()
     if not candidate.is_absolute():
         candidate = root / candidate
-    paths.add(candidate)
+    if candidate not in paths or turn_id is not None:
+        paths[candidate] = turn_id
 
 
 def _add_candidate(
@@ -444,16 +406,18 @@ def _add_candidate(
     root: Path,
     *,
     stat: os.stat_result | None = None,
-) -> None:
+) -> str | None:
     try:
         resolved = candidate.resolve(strict=True)
         relative = resolved.relative_to(root)
         resolved_stat = stat if stat is not None and resolved == candidate else resolved.stat()
     except (FileNotFoundError, OSError, ValueError):
-        return
+        return None
     if not resolved.is_file() or _path_is_excluded(resolved, root):
-        return
-    candidates[relative.as_posix()] = (resolved, resolved_stat)
+        return None
+    relative_path = relative.as_posix()
+    candidates[relative_path] = (resolved, resolved_stat)
+    return relative_path
 
 
 def _excluded_name(name: str) -> bool:

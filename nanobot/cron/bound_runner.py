@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.cron.run_context import current_cron_run_context
 from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronJobExecutionResult
@@ -77,8 +78,17 @@ async def run_bound_cron_job(
         message=job.payload.message,
     )
     prompt_ref = _cron_prompt_ref(prompt)
-    run_id = f"{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
-    run_session_key = f"cron:{job.id}:{run_id}"
+    run_context = current_cron_run_context()
+    if (
+        run_context is not None
+        and run_context.job_id == job.id
+        and run_context.session_key
+    ):
+        run_id = run_context.run_id
+        run_session_key = run_context.session_key
+    else:
+        run_id = f"{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+        run_session_key = f"cron:{job.id}:{run_id}"
     channel, chat_id, metadata = _bound_session_delivery_context(
         job,
         turn_seed=run_session_key,
@@ -137,12 +147,13 @@ async def run_bound_cron_job(
     cron_token = None
     if isinstance(cron_tool, CronTool):
         cron_token = cron_tool.set_cron_context(True)
+    delivery_chat_id = run_session_key if channel == "websocket" else chat_id
     try:
         resp = await agent.submit_cron_turn(
             InboundMessage(
                 channel=channel,
                 sender_id="cron",
-                chat_id=chat_id,
+                chat_id=delivery_chat_id,
                 content=prompt,
                 metadata=metadata,
                 session_key_override=run_session_key,

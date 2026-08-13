@@ -104,7 +104,14 @@ def _metadata_title(metadata: Any) -> str:
         return ""
     if metadata.get("title_user_edited") is True:
         return title
-    return strip_think(title)
+    title = strip_think(title).strip()
+    return title if _is_valid_generated_title(title) else ""
+
+
+def _is_valid_generated_title(title: str | None) -> bool:
+    """Reject empty or previously truncated automatic titles."""
+    text = (title or "").strip()
+    return bool(text) and not text.endswith("…")
 
 
 @dataclass

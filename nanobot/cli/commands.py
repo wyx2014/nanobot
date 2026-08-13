@@ -867,15 +867,8 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
     set_config_path(config_path)
     first_launch = not config_path.exists()
     changed = False
-    if not first_launch:
-        try:
-            loaded = resolve_config_env_vars(load_config(config_path))
-        except ValueError as e:
-            console.print(f"[red]Error: {e}[/red]")
-            raise typer.Exit(1)
-    else:
-        loaded = NanobotConfig()
-        changed = True
+    loaded = load_config(config_path) if not first_launch else NanobotConfig()
+    changed = first_launch
 
     from nanobot.webui.mcp_presets_api import (
         install_desktop_default_mcp_servers,
@@ -914,7 +907,14 @@ def _load_or_create_desktop_config(config: str | None, workspace: str | None) ->
     if changed:
         save_config(loaded, config_path)
 
-    runtime_config = loaded.model_copy(deep=True)
+    # Persist the raw ${ENV_VAR} references, then resolve only a runtime copy.
+    # Settings APIs load the raw file independently, so later saves keep the
+    # references while providers and MCP connections receive real values.
+    try:
+        runtime_config = resolve_config_env_vars(loaded.model_copy(deep=True))
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
     if _desktop_provider_needs_bootstrap(runtime_config):
         _apply_desktop_runtime_bootstrap(runtime_config)
     return runtime_config
@@ -1012,6 +1012,7 @@ def desktop_gateway(
             "can_export_diagnostics": True,
         },
         health_server_enabled=False,
+        provider_prewarm_enabled=True,
     )
 
 
@@ -1024,6 +1025,7 @@ def _run_gateway(
     webui_runtime_surface: str = "browser",
     webui_runtime_capabilities: dict[str, Any] | None = None,
     health_server_enabled: bool = True,
+    provider_prewarm_enabled: bool = False,
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
     from nanobot.agent.tools.message import MessageTool
@@ -1036,6 +1038,7 @@ def _run_gateway(
     from nanobot.cron.types import CronJob, CronJobExecutionResult
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
     from nanobot.providers.image_generation import image_gen_provider_configs
+    from nanobot.providers.prewarm import prewarm_provider
     from nanobot.session.manager import SessionManager
     from nanobot.session.webui_turns import WebuiTurnCoordinator
     from nanobot.storage.logs import StructuredLogStore
@@ -1438,6 +1441,11 @@ def _run_gateway(
                     name="nanobot-channel-manager",
                 ),
             ])
+            if provider_prewarm_enabled:
+                transient_tasks.append(asyncio.create_task(
+                    prewarm_provider(agent.provider, agent.model),
+                    name="nanobot-provider-prewarm",
+                ))
             if health_server_enabled:
                 service_tasks.append(asyncio.create_task(
                     _health_server(config.gateway.host, port),

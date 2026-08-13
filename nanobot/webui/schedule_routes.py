@@ -11,7 +11,7 @@ from websockets.http11 import Response
 
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronRunRecord, CronSchedule
-from nanobot.storage.state import StateStore
+from nanobot.storage.state import StateStore, StateStoreError
 
 QueryParams = dict[str, list[str]]
 
@@ -46,6 +46,7 @@ def _schedule_from_query(query: QueryParams) -> tuple[CronSchedule, bool, dict[s
     hour = max(0, min(23, _int(query, "hour", 9)))
     minute = max(0, min(59, _int(query, "minute", 0)))
     day = max(0, min(6, _int(query, "day_of_week", 1)))
+    month_day = max(1, min(31, _int(query, "day_of_month", 1)))
     tz = _first(query, "timezone", "") or None
 
     meta_schedule: dict[str, Any] = {"frequency": frequency}
@@ -58,6 +59,10 @@ def _schedule_from_query(query: QueryParams) -> tuple[CronSchedule, bool, dict[s
         expr = f"{minute} {hour} * * {day}"
         meta_schedule["time"] = {"hour": hour, "minute": minute}
         meta_schedule["dayOfWeek"] = day
+    elif frequency == "monthly":
+        expr = f"{minute} {hour} {month_day} * *"
+        meta_schedule["time"] = {"hour": hour, "minute": minute}
+        meta_schedule["dayOfMonth"] = month_day
     elif frequency == "weekdays":
         expr = f"{minute} {hour} * * 1-5"
         meta_schedule["time"] = {"hour": hour, "minute": minute}
@@ -149,6 +154,7 @@ class WebUIScheduleRouter:
         error_response: Callable[[int, str | None], Response],
         logger: Any,
         state_store: StateStore | None = None,
+        purge_session: Callable[[str], dict[str, Any]] | None = None,
     ) -> None:
         self.cron = cron_service
         self._check_api_token = check_api_token
@@ -157,6 +163,7 @@ class WebUIScheduleRouter:
         self._error_response = error_response
         self.logger = logger
         self.state = state_store
+        self._purge_session = purge_session
 
     async def dispatch(self, request: WsRequest, path: str) -> Response | None:
         if not path.startswith("/api/schedule/"):
@@ -183,6 +190,8 @@ class WebUIScheduleRouter:
             return await self._run(request)
         if path == "/api/schedule/runs/viewed":
             return self._mark_run_viewed(request)
+        if path == "/api/schedule/runs/delete":
+            return self._delete_run(request)
         return self._error_response(404, "schedule route not found")
 
     def _query(self, request: WsRequest) -> QueryParams:
@@ -320,4 +329,51 @@ class WebUIScheduleRouter:
             return self._error_response(400, "task_id and run_id are required")
         if not self.cron.mark_run_viewed(job_id, run_id):
             return self._error_response(404, "run not found")
+        return self._json_response(_payload(self.cron))
+
+    def _delete_run(self, request: WsRequest) -> Response:
+        query = self._query(request)
+        job_id = _first(query, "task_id").strip() or _first(query, "id").strip()
+        run_id = _first(query, "run_id").strip()
+        if not job_id or not run_id:
+            return self._error_response(400, "task_id and run_id are required")
+        record = self.cron.get_run_record(job_id, run_id)
+        if record is None:
+            return self._error_response(404, "run not found")
+        if record.status == "running":
+            return self._error_response(409, "running record cannot be deleted")
+
+        # Modern cron runs own a dedicated conversation. Permanently purge it
+        # before removing the history pointer so a failed cleanup remains
+        # visible and retryable. Legacy records without an explicit session
+        # key are intentionally not mapped to the old shared cron session.
+        session_key = (record.session_key or "").strip()
+        if session_key and self._purge_session is not None:
+            try:
+                cleanup = self._purge_session(session_key)
+            except StateStoreError as exc:
+                return self._error_response(409, str(exc))
+            except Exception as exc:
+                self.logger.opt(exception=exc).error(
+                    "schedule run conversation purge failed job={} run={}",
+                    job_id,
+                    run_id,
+                )
+                return self._error_response(
+                    500,
+                    "run conversation could not be permanently deleted",
+                )
+            if cleanup.get("cleanup_pending"):
+                self.logger.warning(
+                    "schedule run conversation cleanup pending job={} run={} errors={}",
+                    job_id,
+                    run_id,
+                    cleanup.get("cleanup_errors", []),
+                )
+
+        result = self.cron.delete_run(job_id, run_id)
+        if result == "not_found":
+            return self._error_response(404, "run not found")
+        if result == "running":
+            return self._error_response(409, "running record cannot be deleted")
         return self._json_response(_payload(self.cron))

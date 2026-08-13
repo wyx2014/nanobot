@@ -48,6 +48,37 @@ async def test_model_router_treats_bare_stock_name_as_asset_research() -> None:
     assert '"current_user_message": "比亚迪"' in request["messages"][1]["content"]
 
 
+@pytest.mark.asyncio
+async def test_model_router_routes_supply_chain_theme_to_bottleneck_team() -> None:
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content=(
+            '{"action":"run","target":"AI基础设施供应链",'
+            '"reason":"bounded physical supply-chain theme"}'
+        ),
+        usage={"prompt_tokens": 130, "completion_tokens": 22},
+    ))
+
+    decision = await expert_teams.classify_expert_team_turn_with_model(
+        provider=provider,
+        model="test-model",
+        history=[],
+        user_message="帮我找 AI 基础设施供应链里的二三层瓶颈",
+        team_id="supply-chain-bottleneck-team",
+    )
+
+    assert decision == {
+        "action": "run",
+        "reason": "bounded physical supply-chain theme",
+        "target": "AI基础设施供应链",
+        "team_id": "supply-chain-bottleneck-team",
+    }
+    request = provider.chat_with_retry.await_args.kwargs
+    assert "Supply Chain Bottleneck Hunter" in request["messages"][0]["content"]
+    assert "普通 single-stock" not in request["messages"][0]["content"]
+    assert "AI 基础设施" in request["messages"][1]["content"]
+
+
 def test_model_router_output_is_validated_before_team_start() -> None:
     assert expert_teams.normalize_expert_team_model_decision({
         "route": "normal_agent",
@@ -74,6 +105,13 @@ def test_asset_team_fallback_never_guesses_semantic_intent() -> None:
     assert expert_teams.fallback_expert_team_turn_decision(
         {"id": "asset-research-team"},
         "比亚迪",
+    ) == {
+        "action": "bypass",
+        "reason": "model_route_unavailable",
+    }
+    assert expert_teams.fallback_expert_team_turn_decision(
+        {"id": "supply-chain-bottleneck-team"},
+        "AI 基础设施",
     ) == {
         "action": "bypass",
         "reason": "model_route_unavailable",
@@ -114,6 +152,13 @@ entry_workflow: investment-team
 runtime:
   requested_concurrency: 4
   adapter: adapter.md
+  member_runtime:
+    max_iterations: 24
+    timeout_seconds: 360
+    max_retries: 0
+    members:
+      business-analyst:
+        max_iterations: 16
   completion:
     required_tools: [write_file, create_docx, create_pdf]
     required_artifacts: [html, docx, pdf]
@@ -181,6 +226,12 @@ def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> 
         "required_tools": ["write_file", "create_docx", "create_pdf"],
         "required_artifacts": ["html", "docx", "pdf"],
         "instruction": "finish the audited report",
+    }
+    assert binding["member_runtime"] == {
+        "max_iterations": 24,
+        "timeout_seconds": 360,
+        "max_retries": 0,
+        "members": {"business-analyst": {"max_iterations": 16}},
     }
     detail = expert_teams.expert_team_detail_payload("asset-research-team")
     assert detail["data_sources"][0]["priority"] == "primary"

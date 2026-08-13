@@ -84,6 +84,14 @@ def test_is_session_terminated_recognizes_connection_closed_mcp_error():
     assert _is_session_terminated(_connection_closed_error())
 
 
+def test_is_session_terminated_recognizes_message_less_closed_resource():
+    assert _is_session_terminated(_FakeClosedResourceError())
+
+
+def test_is_session_terminated_recognizes_end_of_stream():
+    assert _is_session_terminated(_FakeEndOfStreamError())
+
+
 # ---------------------------------------------------------------------------
 # MCPToolWrapper retry behaviour
 # ---------------------------------------------------------------------------
@@ -237,12 +245,10 @@ async def test_tool_retry_on_end_of_stream():
 
 
 @pytest.mark.asyncio
-async def test_tool_reconnects_when_transient_retry_reveals_terminated_session():
-    """Tool should reconnect if a stale session reports termination after transient retry."""
+async def test_tool_reconnects_immediately_on_closed_resource():
+    """A closed transport should reconnect instead of retrying the stale session."""
     old_session = AsyncMock()
-    old_session.call_tool = AsyncMock(
-        side_effect=[_FakeClosedResourceError("closed"), _session_terminated_error()]
-    )
+    old_session.call_tool = AsyncMock(side_effect=_FakeClosedResourceError())
     new_session = AsyncMock()
     new_session.call_tool = AsyncMock(return_value=_make_tool_result("fresh"))
 
@@ -257,12 +263,38 @@ async def test_tool_reconnects_when_transient_retry_reveals_terminated_session()
 
     wrapper.set_reconnect_handler(reconnect)
 
-    with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+    with patch(
+        "nanobot.agent.tools.mcp.asyncio.sleep",
+        new_callable=AsyncMock,
+    ) as mock_sleep:
         output = await wrapper.execute(foo="bar")
 
     assert output == "fresh"
-    assert old_session.call_tool.call_count == 2
+    assert old_session.call_tool.call_count == 1
     assert new_session.call_tool.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tool_limits_retry_when_closed_resource_reconnect_fails():
+    """A failed reconnect must stop instead of retrying the closed session."""
+    old_session = AsyncMock()
+    old_session.call_tool = AsyncMock(side_effect=_FakeClosedResourceError())
+    reconnect = AsyncMock(return_value=None)
+
+    wrapper = MCPToolWrapper(old_session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper.set_reconnect_handler(reconnect)
+
+    with patch(
+        "nanobot.agent.tools.mcp.asyncio.sleep",
+        new_callable=AsyncMock,
+    ) as mock_sleep:
+        output = await wrapper.execute()
+
+    assert "reconnect unsuccessful" in output
+    assert old_session.call_tool.call_count == 1
+    reconnect.assert_awaited_once()
+    mock_sleep.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

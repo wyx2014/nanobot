@@ -18,6 +18,7 @@ from loguru import logger
 
 from nanobot.config.paths import get_webui_dir
 from nanobot.cron.session_turns import CRON_HISTORY_META
+from nanobot.session.keys import webui_session_key_for_chat_id
 from nanobot.session.manager import SessionManager
 from nanobot.webui.interactive_prompt import (
     INBOUND_META_INTERACTIVE_PROMPT_ANSWER,
@@ -686,7 +687,7 @@ class WebUITranscriptRecorder:
         override = (metadata or {}).get("_webui_transcript_session_key")
         if isinstance(override, str) and override.strip():
             return override.strip()
-        return f"websocket:{chat_id}"
+        return webui_session_key_for_chat_id(chat_id)
 
     def prepare_and_append(
         self,
@@ -2305,6 +2306,28 @@ def replay_transcript_to_ui_messages(
             active_activity_segment_id = None
             active_file_edit_segment_id = None
             turn_id = rec.get("turn_id")
+            turn = rec.get("turn")
+            terminal_status = (
+                str(turn.get("status") or "")
+                if isinstance(turn, dict)
+                else ""
+            )
+            interrupted = (
+                terminal_status == "interrupted"
+                or rec.get("finish_reason") == "cancelled"
+            )
+            terminal_at = (
+                turn.get("completed_at")
+                if isinstance(turn, dict)
+                else rec.get("recorded_at")
+            )
+            if not isinstance(terminal_at, (int, float)):
+                terminal_at = rec.get("recorded_at")
+            terminal_at_ms: int | None = None
+            if isinstance(terminal_at, (int, float)) and terminal_at >= 0:
+                terminal_at_ms = int(terminal_at)
+                if terminal_at_ms < 1_000_000_000_000:
+                    terminal_at_ms *= 1000
             if isinstance(turn_id, str) and turn_id:
                 if turn_id in replay_turn_aliases:
                     replay_turn_aliases.pop(turn_id, None)
@@ -2324,12 +2347,6 @@ def replay_transcript_to_ui_messages(
                         or m.get("turnId") in {None, turn_id}
                     )
                 ):
-                    turn = rec.get("turn")
-                    terminal_status = (
-                        str(turn.get("status") or "")
-                        if isinstance(turn, dict)
-                        else ""
-                    )
                     steps = agent_ui.get("steps")
                     if isinstance(steps, list):
                         finalized_steps = [
@@ -2366,12 +2383,65 @@ def replay_transcript_to_ui_messages(
                             **messages[i],
                             "agentUI": {
                                 **agent_ui,
+                                "status": terminal_status or agent_ui.get("status"),
                                 "steps": finalized_steps,
+                                "active_step_ids": [],
                                 "current_step_id": None,
                             },
                         }
+                if interrupted and (
+                    not isinstance(turn_id, str)
+                    or not turn_id
+                    or m.get("turnId") in {None, turn_id}
+                ):
+                    tool_events = m.get("toolEvents")
+                    file_edits = m.get("fileEdits")
+                    updates: dict[str, Any] = {}
+                    if isinstance(tool_events, list) and any(
+                        isinstance(event, dict) and event.get("phase") == "start"
+                        for event in tool_events
+                    ):
+                        updates["toolEvents"] = [
+                            {
+                                **event,
+                                "phase": "error",
+                                "error": event.get("error") or "Task interrupted by user.",
+                                **(
+                                    {"occurred_at": terminal_at_ms}
+                                    if terminal_at_ms is not None
+                                    else {}
+                                ),
+                            }
+                            if isinstance(event, dict) and event.get("phase") == "start"
+                            else event
+                            for event in tool_events
+                        ]
+                    if isinstance(file_edits, list) and any(
+                        isinstance(edit, dict)
+                        and (
+                            edit.get("phase") == "start"
+                            or edit.get("status") == "editing"
+                        )
+                        for edit in file_edits
+                    ):
+                        updates["fileEdits"] = [
+                            {
+                                **edit,
+                                "phase": "error",
+                                "status": "error",
+                                "error": edit.get("error") or "Task interrupted by user.",
+                            }
+                            if isinstance(edit, dict)
+                            and (
+                                edit.get("phase") == "start"
+                                or edit.get("status") == "editing"
+                            )
+                            else edit
+                            for edit in file_edits
+                        ]
+                    if updates:
+                        messages[i] = {**messages[i], **updates}
             prune_reasoning_only()
-            turn = rec.get("turn")
             lat = rec.get("latency_ms")
             if (
                 not isinstance(lat, (int, float))
@@ -2380,18 +2450,8 @@ def replay_transcript_to_ui_messages(
                 lat = turn.get("duration_ms")
             if isinstance(lat, (int, float)) and lat >= 0:
                 stamp_latency(int(lat))
-            completed_at = (
-                turn.get("completed_at")
-                if isinstance(turn, dict)
-                else rec.get("recorded_at")
-            )
-            if not isinstance(completed_at, (int, float)):
-                completed_at = rec.get("recorded_at")
-            if isinstance(completed_at, (int, float)) and completed_at >= 0:
-                completed_at_ms = int(completed_at)
-                if completed_at_ms < 1_000_000_000_000:
-                    completed_at_ms *= 1000
-                stamp_completed_at(completed_at_ms)
+            if terminal_at_ms is not None:
+                stamp_completed_at(terminal_at_ms)
             terminal_usage = rec.get("usage")
             if not isinstance(terminal_usage, dict) and isinstance(turn, dict):
                 terminal_usage = turn.get("usage")

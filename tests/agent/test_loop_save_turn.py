@@ -20,6 +20,7 @@ from nanobot.session.turn_continuation import (
 from nanobot.session.webui_turns import (
     TITLE_GENERATION_MAX_TOKENS,
     TITLE_GENERATION_REASONING_EFFORT,
+    TITLE_MAX_CHARS,
     WEBUI_SESSION_METADATA_KEY,
     WEBUI_TITLE_METADATA_KEY,
     WebuiTurnCoordinator,
@@ -134,6 +135,80 @@ async def test_generate_webui_title_only_for_marked_webui_sessions(tmp_path: Pat
         loop.provider.chat_with_retry.await_args.kwargs["reasoning_effort"]
         == TITLE_GENERATION_REASONING_EFFORT
     )
+
+
+@pytest.mark.asyncio
+async def test_generate_webui_title_rejects_output_over_contract_limit(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="x" * (TITLE_MAX_CHARS + 1), finish_reason="stop")
+    )
+    session = loop.sessions.get_or_create("websocket:chat-reasoning-title")
+    session.metadata[WEBUI_SESSION_METADATA_KEY] = True
+    session.add_message("user", "分析青岛啤酒")
+    loop.sessions.save(session)
+
+    generated = await maybe_generate_webui_title(
+        sessions=loop.sessions,
+        session_key=session.key,
+        provider=loop.provider,
+        model=loop.model,
+    )
+
+    assert generated is False
+    assert WEBUI_TITLE_METADATA_KEY not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_generate_webui_title_rejects_truncated_completion(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="青岛啤酒分析", finish_reason="length")
+    )
+    session = loop.sessions.get_or_create("websocket:chat-truncated-title")
+    session.metadata[WEBUI_SESSION_METADATA_KEY] = True
+    session.add_message("user", "分析青岛啤酒")
+    loop.sessions.save(session)
+
+    generated = await maybe_generate_webui_title(
+        sessions=loop.sessions,
+        session_key=session.key,
+        provider=loop.provider,
+        model=loop.model,
+    )
+
+    assert generated is False
+    assert WEBUI_TITLE_METADATA_KEY not in session.metadata
+
+
+@pytest.mark.asyncio
+async def test_generate_webui_title_rejects_reasoning_promoted_to_content(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(
+            content="先分析用户意图再生成标题",
+            reasoning_content="先分析用户意图再生成标题",
+            finish_reason="stop",
+        )
+    )
+    session = loop.sessions.get_or_create("websocket:chat-reasoning-only-title")
+    session.metadata[WEBUI_SESSION_METADATA_KEY] = True
+    session.add_message("user", "分析青岛啤酒")
+    loop.sessions.save(session)
+
+    generated = await maybe_generate_webui_title(
+        sessions=loop.sessions,
+        session_key=session.key,
+        provider=loop.provider,
+        model=loop.model,
+    )
+
+    assert generated is False
+    assert WEBUI_TITLE_METADATA_KEY not in session.metadata
 
 
 @pytest.mark.asyncio

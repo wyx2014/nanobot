@@ -102,6 +102,40 @@ def test_project_and_session_ids_are_stable_and_session_project_is_immutable(
             )
 
 
+def test_rebuild_preserves_durable_preferred_project_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    project_path = tmp_path / "migrated-project"
+    project_path.mkdir()
+    preferred_id = "prj_0123456789abcdef0123456789abcdef"
+
+    project, session = store.ensure_session_for_project(
+        "websocket:recovered",
+        project_path,
+        metadata={
+            "project_id": preferred_id,
+            "workspace_scope": {"project_path": str(project_path)},
+        },
+    )
+
+    assert project.id == preferred_id
+    assert session.project_id == preferred_id
+
+
+def test_preferred_project_id_cannot_alias_another_root(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    first_path.mkdir()
+    second_path.mkdir()
+    preferred_id = "prj_0123456789abcdef0123456789abcdef"
+    first = store.ensure_project(first_path, preferred_id=preferred_id)
+    second = store.ensure_project(second_path, preferred_id=preferred_id)
+
+    assert first.id == preferred_id
+    assert second.id != preferred_id
+    assert second.canonical_root_path == str(second_path.resolve())
+
+
 def test_default_workspace_rename_preserves_inbox_project_and_sessions(
     tmp_path: Path,
 ) -> None:
@@ -184,6 +218,123 @@ def test_artifacts_are_explicitly_linked_and_project_scoped(tmp_path: Path) -> N
 
     with pytest.raises(StateStoreError, match="outside"):
         store.register_artifact(session_a.session_key, report_b)
+
+
+def test_prune_unverified_referenced_artifacts_repairs_only_legacy_links(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    project = store.ensure_project(project_path)
+    session = store.bind_session("websocket:chat", project.id)
+    explicit = project_path / "explicit.md"
+    unrelated = project_path / "unrelated.md"
+    generated = project_path / "generated.md"
+    explicit.write_text("explicit", encoding="utf-8")
+    unrelated.write_text("another conversation", encoding="utf-8")
+    generated.write_text("generated here", encoding="utf-8")
+    store.register_artifact(session.session_key, explicit, relation_type="referenced")
+    store.register_artifact(session.session_key, unrelated, relation_type="referenced")
+    store.register_artifact(session.session_key, generated, relation_type="generated")
+    revision_before = store.session_artifact_revision(session.session_key)
+
+    pruned = store.prune_unverified_referenced_artifacts(
+        session.session_key,
+        {"explicit.md"},
+    )
+
+    assert pruned == 1
+    assert {
+        artifact.relative_path
+        for artifact in store.list_session_artifacts(session.session_key)
+    } == {"explicit.md", "generated.md"}
+    assert unrelated.is_file()
+    assert store.session_artifact_revision(session.session_key) > revision_before
+
+
+def test_session_artifacts_can_be_scoped_to_the_latest_turn(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    project = store.ensure_project(project_path)
+    session = store.bind_session("websocket:chat", project.id)
+    for event_seq, turn_id in ((1, "turn-one"), (2, "turn-two")):
+        store.project_event(session.session_key, {
+            "schema_version": 3,
+            "event": "user",
+            "event_id": f"evt-{event_seq}",
+            "event_seq": event_seq,
+            "recorded_at": event_seq * 1_000,
+            "project_id": project.id,
+            "session_id": session.id,
+            "turn_id": turn_id,
+            "text": f"task {event_seq}",
+        })
+    first = project_path / "first.md"
+    second = project_path / "second.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    store.register_artifact(
+        session.session_key,
+        first,
+        relation_type="final",
+        turn_id="turn-one",
+    )
+    store.register_artifact(
+        session.session_key,
+        second,
+        relation_type="final",
+        turn_id="turn-two",
+    )
+
+    assert [
+        artifact.relative_path
+        for artifact in store.list_session_artifacts(
+            session.session_key,
+            turn_id="turn-two",
+        )
+    ] == ["second.md"]
+    assert {
+        artifact.relative_path
+        for artifact in store.list_session_artifacts(session.session_key)
+    } == {"first.md", "second.md"}
+
+
+def test_legacy_reference_turn_can_be_backfilled_without_rehashing(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    project = store.ensure_project(project_path)
+    session = store.bind_session("websocket:chat", project.id)
+    store.project_event(session.session_key, {
+        "schema_version": 3,
+        "event": "user",
+        "event_id": "evt-user",
+        "event_seq": 1,
+        "recorded_at": 1_000,
+        "project_id": project.id,
+        "session_id": session.id,
+        "turn_id": "turn-one",
+        "text": "create report",
+    })
+    report = project_path / "report.md"
+    report.write_text("report", encoding="utf-8")
+    store.register_artifact(session.session_key, report, relation_type="referenced")
+
+    assert store.list_session_artifacts(session.session_key, turn_id="turn-one") == []
+    assert store.assign_referenced_artifact_turn(
+        session.session_key,
+        "report.md",
+        "turn-one",
+    ) == 1
+    assert [
+        artifact.relative_path
+        for artifact in store.list_session_artifacts(
+            session.session_key,
+            turn_id="turn-one",
+        )
+    ] == ["report.md"]
 
 
 def test_composite_foreign_keys_reject_cross_project_artifact_links(tmp_path: Path) -> None:
@@ -1030,6 +1181,78 @@ def test_event_projection_rejects_sequence_gaps(tmp_path: Path) -> None:
                 "text": "missing event one",
             },
         )
+
+
+def test_permanent_session_and_project_purge_leave_foreign_keys_consistent(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    project_path = tmp_path / "purge-project"
+    project_path.mkdir()
+    project = store.ensure_project(project_path)
+    session = store.bind_session("websocket:purge-me", project.id, title="Purge me")
+    common = {
+        "schema_version": 3,
+        "project_id": project.id,
+        "session_id": session.id,
+        "session_key": session.session_key,
+        "turn_id": "turn-purge",
+    }
+    assert store.project_event(session.session_key, {
+        **common,
+        "event": "turn_started",
+        "event_id": "purge-start",
+        "event_seq": 1,
+        "recorded_at": 1_000,
+        "turn": {"id": "turn-purge", "started_at": 1_000},
+    })
+    assert store.project_event(session.session_key, {
+        **common,
+        "event": "message",
+        "event_id": "purge-progress",
+        "event_seq": 2,
+        "recorded_at": 1_100,
+        "kind": "progress",
+        "text": "working",
+        "tool_events": [{
+            "id": "tool-purge",
+            "name": "read_file",
+            "status": "succeeded",
+            "result": "ok",
+        }],
+        "agent_ui": {
+            "kind": "task_progress",
+            "plan_id": "plan-purge",
+            "steps": [{"id": "one", "title": "One", "status": "completed"}],
+        },
+    })
+    assert store.project_event(session.session_key, {
+        **common,
+        "event": "turn_completed",
+        "event_id": "purge-completed",
+        "event_seq": 3,
+        "recorded_at": 1_200,
+        "turn": {
+            "id": "turn-purge",
+            "status": "completed",
+            "started_at": 1_000,
+            "completed_at": 1_200,
+        },
+    })
+
+    store.archive_session(session.session_key)
+    result = store.purge_session(session.session_key)
+
+    assert result["purged"] is True
+    assert store.get_session(session.session_key) is None
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    store.archive_project(project.id)
+    project_result = store.purge_project(project.id)
+    assert project_result["purged"] is True
+    assert store.get_project(project.id) is None
+    assert project_path.is_dir()
 
 
 def test_project_rag_and_cache_never_cross_project_boundaries(tmp_path: Path) -> None:

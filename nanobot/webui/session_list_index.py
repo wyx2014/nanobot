@@ -26,10 +26,15 @@ from nanobot.session.manager import (
     _metadata_title,
 )
 
-_INDEX_VERSION = 1
+_INDEX_VERSION = 2
 _INDEX_FILENAME = ".webui_session_index.json"
 _WEBUI_ACTIVITY_MTIME_NS = "webui_activity_mtime_ns"
 _WEBUI_ACTIVITY_SIZE = "webui_activity_size"
+_INTERNAL_CONTINUATION_PREFIXES = (
+    "[Subagent ",
+    "[Expert-team completion guard]",
+    "[Active-turn user correction]",
+)
 
 
 def list_webui_sessions(session_manager: SessionManager) -> list[dict[str, Any]]:
@@ -40,8 +45,46 @@ def list_webui_sessions(session_manager: SessionManager) -> list[dict[str, Any]]
             _write_index_rows(session_manager.sessions_dir, rows)
         except Exception as e:
             logger.debug("Failed to write WebUI session list index: {}", e)
-    sessions = [_public_row(session_manager.sessions_dir, row) for row in rows]
+    sessions = [
+        _public_row(session_manager.sessions_dir, row)
+        for row in rows
+        if _is_sidebar_session(row)
+    ]
     return sorted(sessions, key=lambda row: row.get("updated_at", ""), reverse=True)
+
+
+def _is_sidebar_session(row: dict[str, Any]) -> bool:
+    """Keep runtime-owned continuation records out of the user conversation list.
+
+    Older gateways occasionally persisted an injected subagent result or
+    completion guard under a fresh ``websocket:`` key.  Those records can hold
+    useful recovery history, so they remain on disk, but they are not
+    independent user conversations and must not be projected into the sidebar.
+    """
+
+    key = row.get("key")
+    if isinstance(key, str) and key.startswith("websocket:cron:"):
+        return False
+    preview = row.get("preview")
+    if not isinstance(preview, str):
+        return True
+    normalized = preview.lstrip()
+    return not normalized.startswith(_INTERNAL_CONTINUATION_PREFIXES)
+
+
+def is_webui_sidebar_session_data(session_data: dict[str, Any]) -> bool:
+    """Apply the same visibility rule to a fully loaded fallback session."""
+
+    key = session_data.get("key")
+    if isinstance(key, str) and key.startswith("websocket:cron:"):
+        return False
+    messages = session_data.get("messages")
+    if not isinstance(messages, list):
+        return True
+    preview = _preview_from_messages([
+        message for message in messages if isinstance(message, dict)
+    ])
+    return not preview.lstrip().startswith(_INTERNAL_CONTINUATION_PREFIXES)
 
 
 def _reconcile_index(session_manager: SessionManager) -> tuple[list[dict[str, Any]], bool]:
@@ -165,6 +208,18 @@ def _preview_from_messages(messages: list[dict[str, Any]]) -> str:
     return fallback_preview
 
 
+def _indexed_title(metadata: Any, preview: str) -> str:
+    title = _metadata_title(metadata)
+    if title:
+        return title
+    if not isinstance(metadata, dict) or metadata.get("title_user_edited") is True:
+        return ""
+    raw_title = metadata.get("title")
+    if isinstance(raw_title, str) and raw_title.strip():
+        return preview
+    return ""
+
+
 def _webui_activity_paths(session_key: str) -> list[Path]:
     stem = SessionManager.safe_key(session_key)
     webui_dir = get_webui_dir()
@@ -218,12 +273,13 @@ def _indexed_row_for_session(session: Session, path: Path) -> dict[str, Any]:
     signature = _file_signature(path)
     activity_signature = _webui_activity_signature(session.key)
     activity_updated_at = _webui_activity_updated_at(activity_signature)
+    preview = _preview_from_messages(session.messages)
     return {
         "key": session.key,
         "created_at": session.created_at.isoformat(),
         "updated_at": _latest_updated_at(session.updated_at.isoformat(), activity_updated_at),
-        "title": _metadata_title(session.metadata),
-        "preview": _preview_from_messages(session.messages),
+        "title": _indexed_title(session.metadata, preview),
+        "preview": preview,
         "file": path.name,
         "mtime_ns": signature["mtime_ns"],
         "size": signature["size"],
@@ -278,12 +334,14 @@ def _scan_session_row(session_manager: SessionManager, path: Path) -> dict[str, 
             key = data.get("key") or fallback_key
             activity_signature = _webui_activity_signature(key)
             activity_updated_at = _webui_activity_updated_at(activity_signature)
+            preview = preview or fallback_preview
+            metadata = data.get("metadata", {})
             return {
                 "key": key,
                 "created_at": created_at_s,
                 "updated_at": _latest_updated_at(updated_at_s, activity_updated_at),
-                "title": _metadata_title(data.get("metadata", {})),
-                "preview": preview or fallback_preview,
+                "title": _indexed_title(metadata, preview),
+                "preview": preview,
                 "file": path.name,
                 "mtime_ns": signature["mtime_ns"],
                 "size": signature["size"],

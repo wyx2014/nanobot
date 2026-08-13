@@ -50,6 +50,7 @@ def test_mcp_presets_payload_lists_supported_cards(tmp_path, monkeypatch: pytest
     assert juyuan["installed"] is False
     assert juyuan["install_supported"] is True
     assert juyuan["required_fields"][0]["configured"] is False
+    assert juyuan["required_fields"][0]["credential_source"] == "missing"
     assert "token" not in juyuan["connection_summary"]
     manifest = juyuan["manifest"]
     assert manifest["schema"] == "agent-app.v1"
@@ -123,8 +124,39 @@ def test_desktop_defaults_use_juyuan_token_from_environment(
     install_desktop_default_mcp_servers(config)
 
     assert config.tools.mcp_servers["juyuan"].url.endswith(
-        "?token=%24%7BJUYUAN_MCP_TOKEN%7D"
+        "?token=${JUYUAN_MCP_TOKEN}"
     )
+
+
+def test_payload_identifies_built_in_key_and_user_can_override_it(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANYSEARCH_API_KEY", "shared-secret")
+    config = Config()
+    install_desktop_default_mcp_servers(config)
+    from nanobot.config.loader import save_config
+
+    save_config(config)
+    payload = mcp_presets_payload()
+    row = next(item for item in payload["presets"] if item["name"] == "anysearch")
+    field = row["required_fields"][0]
+    assert field["credential_source"] == "built_in"
+    assert "shared-secret" not in str(payload)
+
+    updated = mcp_presets_action(
+        "update",
+        {"name": ["anysearch"], "anysearch_api_key": ["personal-secret"]},
+    )
+
+    row = next(item for item in updated["presets"] if item["name"] == "anysearch")
+    assert row["required_fields"][0]["credential_source"] == "user"
+    assert load_config().tools.mcp_servers["anysearch"].headers == {
+        "Authorization": "Bearer personal-secret",
+    }
+    assert "shared-secret" not in str(updated)
+    assert "personal-secret" not in str(updated)
 
 
 def test_desktop_defaults_format_anysearch_environment_key_as_bearer(

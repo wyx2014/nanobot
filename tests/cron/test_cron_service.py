@@ -5,7 +5,13 @@ import time
 import pytest
 
 from nanobot.cron.service import CronJobSkippedError, CronService
-from nanobot.cron.types import CronJob, CronJobExecutionResult, CronPayload, CronRunRecord, CronSchedule
+from nanobot.cron.types import (
+    CronJob,
+    CronJobExecutionResult,
+    CronPayload,
+    CronRunRecord,
+    CronSchedule,
+)
 
 
 async def _wait_until(predicate, *, timeout: float = 1.0, interval: float = 0.01) -> None:
@@ -368,7 +374,10 @@ async def test_execute_job_persists_running_record_before_completion(tmp_path) -
     running_job = CronService(store_path).get_job(job.id)
     assert running_job is not None
     assert len(running_job.state.run_history) == 1
-    assert running_job.state.run_history[0].status == "running"
+    running_record = running_job.state.run_history[0]
+    assert running_record.status == "running"
+    assert running_record.run_id
+    assert running_record.session_key == f"cron:{job.id}:{running_record.run_id}"
     assert service.list_jobs(include_disabled=True)[0].state.run_history[0].status == "running"
 
     release.set()
@@ -645,6 +654,67 @@ def test_mark_run_viewed_persists_to_disk(tmp_path) -> None:
 
     loaded = CronService(store_path).get_job(job.id)
     assert loaded.state.run_history[0].viewed_at_ms is not None
+
+
+def test_delete_run_persists_and_updates_latest_state(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    created = service.add_job(
+        name="delete history",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        **_bound_chat(),
+    )
+    service._running = True
+    store = service._load_store()
+    job = next(j for j in store.jobs if j.id == created.id)
+    job.state.run_history.extend(
+        [
+            CronRunRecord(run_at_ms=100, status="ok", run_id="run-1"),
+            CronRunRecord(run_at_ms=200, status="error", error="boom", run_id="run-2"),
+        ]
+    )
+    job.state.last_run_at_ms = 200
+    job.state.last_status = "error"
+    job.state.last_error = "boom"
+    service._save_store()
+
+    assert service.get_run_record(job.id, "run-2") is not None
+    assert service.get_run_record(job.id, f"{job.id}:200") is not None
+    assert service.get_run_record(job.id, "missing") is None
+
+    assert service.delete_run(job.id, "run-2") == "deleted"
+
+    loaded = CronService(store_path).get_job(job.id)
+    assert [record.run_id for record in loaded.state.run_history] == ["run-1"]
+    assert loaded.state.last_run_at_ms == 100
+    assert loaded.state.last_status == "ok"
+    assert loaded.state.last_error is None
+
+
+def test_delete_run_rejects_running_record(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    created = service.add_job(
+        name="running history",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="hello",
+        **_bound_chat(),
+    )
+    service._running = True
+    store = service._load_store()
+    job = next(j for j in store.jobs if j.id == created.id)
+    job.state.run_history.append(
+        CronRunRecord(
+            run_at_ms=int(time.time() * 1000),
+            status="running",
+            run_id="run-live",
+        )
+    )
+    service._save_store()
+
+    assert service.delete_run(job.id, "run-live") == "running"
+    assert CronService(store_path).get_job(job.id).state.run_history
 
 
 @pytest.mark.asyncio

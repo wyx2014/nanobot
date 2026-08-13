@@ -36,12 +36,26 @@ from nanobot.graph.workflows.asset_research import (
     advance_asset_research_graph,
     new_asset_research_state,
 )
+from nanobot.graph.workflows.supply_chain_bottleneck import (
+    MEMBER_NODES as BOTTLENECK_MEMBER_NODES,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck import (
+    REPORT_AUDIT as BOTTLENECK_REPORT_AUDIT,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck import (
+    SCOPE_BRIEF,
+    new_supply_chain_bottleneck_state,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck import (
+    TEAM_LEAD as BOTTLENECK_TEAM_LEAD,
+)
 from nanobot.security.project_context import PROJECT_CONTEXT_METADATA_KEY
 from nanobot.security.workspace_access import (
     WORKSPACE_SCOPE_METADATA_KEY,
     WorkspaceScopeError,
 )
 from nanobot.session.goal_state import goal_state_ws_blob
+from nanobot.session.keys import webui_session_key_for_chat_id
 from nanobot.session.webui_turns import websocket_turn_wall_started_at
 from nanobot.utils.media_decode import (
     FileSizeExceeded,
@@ -56,6 +70,8 @@ from nanobot.webui.expert_teams import (
     EXPERT_TEAM_TURN_ROUTE_KEY,
     EXPERT_TEAM_TURN_ROUTE_SOURCE_KEY,
     EXPERT_TEAM_TURN_SUPPRESSED_KEY,
+    MODEL_ROUTED_EXPERT_TEAM_IDS,
+    SUPPLY_CHAIN_BOTTLENECK_TEAM_ID,
     ExpertTeamError,
     expert_team_mcp_attachments,
     fallback_expert_team_turn_decision,
@@ -470,7 +486,9 @@ class WebSocketChannel(BaseChannel):
         """
         if self.gateway.session_manager is None:
             return
-        row = self.gateway.session_manager.read_session_file(f"websocket:{chat_id}")
+        row = self.gateway.session_manager.read_session_file(
+            webui_session_key_for_chat_id(chat_id)
+        )
         meta = row.get("metadata", {}) if isinstance(row, dict) else {}
         if not isinstance(meta, dict):
             meta = {}
@@ -497,7 +515,9 @@ class WebSocketChannel(BaseChannel):
     def _session_expert_team(self, chat_id: str) -> dict[str, Any] | None:
         if self.gateway.session_manager is None:
             return None
-        row = self.gateway.session_manager.read_session_file(f"websocket:{chat_id}")
+        row = self.gateway.session_manager.read_session_file(
+            webui_session_key_for_chat_id(chat_id)
+        )
         metadata = row.get("metadata") if isinstance(row, dict) else None
         if not isinstance(metadata, dict):
             return None
@@ -512,7 +532,9 @@ class WebSocketChannel(BaseChannel):
         requested = normalize_expert_team_binding(raw) if raw is not None else None
         if self.gateway.session_manager is None:
             return requested
-        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        session = self.gateway.session_manager.get_or_create(
+            webui_session_key_for_chat_id(chat_id)
+        )
         existing = session.metadata.get(EXPERT_TEAM_SESSION_KEY)
         existing_id = existing.get("id") if isinstance(existing, dict) else None
         if requested is not None and existing_id not in (None, requested["id"]):
@@ -534,7 +556,9 @@ class WebSocketChannel(BaseChannel):
         binding = normalize_expert_team_binding(raw) if raw is not None else None
         if self.gateway.session_manager is None:
             return binding
-        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        session = self.gateway.session_manager.get_or_create(
+            webui_session_key_for_chat_id(chat_id)
+        )
         existing = session.metadata.get(EXPERT_TEAM_SESSION_KEY)
         if binding is None:
             if (
@@ -558,7 +582,9 @@ class WebSocketChannel(BaseChannel):
     ) -> bool:
         if self.gateway.session_manager is None or not isinstance(binding, Mapping):
             return False
-        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        session = self.gateway.session_manager.get_or_create(
+            webui_session_key_for_chat_id(chat_id)
+        )
         return session.metadata.get(EXPERT_TEAM_PENDING_TARGET_KEY) == binding.get("id")
 
     def _set_expert_team_awaiting_target(
@@ -570,7 +596,9 @@ class WebSocketChannel(BaseChannel):
     ) -> None:
         if self.gateway.session_manager is None:
             return
-        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        session = self.gateway.session_manager.get_or_create(
+            webui_session_key_for_chat_id(chat_id)
+        )
         value = str(binding.get("id") or "") if awaiting and isinstance(binding, Mapping) else ""
         existing = session.metadata.get(EXPERT_TEAM_PENDING_TARGET_KEY)
         if value:
@@ -586,7 +614,9 @@ class WebSocketChannel(BaseChannel):
     def _expert_team_route_history(self, chat_id: str) -> list[dict[str, Any]]:
         if self.gateway.session_manager is None:
             return []
-        session = self.gateway.session_manager.get_or_create(f"websocket:{chat_id}")
+        session = self.gateway.session_manager.get_or_create(
+            webui_session_key_for_chat_id(chat_id)
+        )
         return session.get_history(max_messages=8, max_tokens=3_000)
 
     async def _route_expert_team_turn(
@@ -607,34 +637,40 @@ class WebSocketChannel(BaseChannel):
         team_id = str(binding.get("id") or "") if isinstance(binding, Mapping) else ""
         router = self.gateway.expert_team_turn_router
         if (
-            team_id != ASSET_RESEARCH_TEAM_ID
+            team_id not in MODEL_ROUTED_EXPERT_TEAM_IDS
             or content.strip().startswith("/")
             or router is None
         ):
             return fallback, "fallback"
         try:
-            raw = await router(
-                history=self._expert_team_route_history(chat_id),
-                user_message=content,
-                awaiting_target=awaiting_target,
-                has_media=has_media,
-            )
+            route_kwargs = {
+                "history": self._expert_team_route_history(chat_id),
+                "user_message": content,
+                "awaiting_target": awaiting_target,
+                "has_media": has_media,
+            }
+            if team_id == SUPPLY_CHAIN_BOTTLENECK_TEAM_ID:
+                route_kwargs["team_id"] = team_id
+            raw = await router(**route_kwargs)
         except Exception:
             self.logger.exception(
-                "asset-research model route failed for chat {}; using safe fallback",
+                "expert-team model route failed for chat {} team={}; using safe fallback",
                 chat_id,
+                team_id,
             )
             return fallback, "fallback"
-        decision = normalize_expert_team_model_decision(raw)
+        decision = normalize_expert_team_model_decision(raw, team_id=team_id)
         if decision is None:
             self.logger.warning(
-                "asset-research model returned an invalid route for chat {}; using safe fallback",
+                "expert-team model returned an invalid route for chat {} team={}; using safe fallback",
                 chat_id,
+                team_id,
             )
             return fallback, "fallback"
         self.logger.info(
-            "asset-research model route chat={} action={} target={}",
+            "expert-team model route chat={} team={} action={} target={}",
             chat_id,
+            team_id,
             decision.get("action"),
             decision.get("target") or "-",
         )
@@ -650,6 +686,7 @@ class WebSocketChannel(BaseChannel):
         members: list[dict[str, Any]],
         resume_state: dict[str, Any] | None = None,
         supplemental_artifacts: list[str] | None = None,
+        target: str | None = None,
     ) -> None:
         staged_members = [member for member in members if member.get("phase")]
         first_phase = staged_members[0].get("phase") if staged_members else None
@@ -658,7 +695,10 @@ class WebSocketChannel(BaseChannel):
             if first_phase
             else len(members)
         )
-        has_data_package = team_id == "asset-research-team"
+        is_asset_graph = team_id == ASSET_RESEARCH_TEAM_ID
+        is_bottleneck_graph = team_id == SUPPLY_CHAIN_BOTTLENECK_TEAM_ID
+        has_data_package = is_asset_graph
+        has_fixed_preparation = is_asset_graph or is_bottleneck_graph
         normalized_members: list[dict[str, Any]] = []
         for member in members:
             member_id = str(member.get("id") or "").strip()
@@ -666,7 +706,7 @@ class WebSocketChannel(BaseChannel):
                 continue
             running = (
                 resume_state is None
-                and not has_data_package
+                and not has_fixed_preparation
                 and (first_phase is None or member.get("phase") == first_phase)
             )
             normalized_members.append({
@@ -687,16 +727,25 @@ class WebSocketChannel(BaseChannel):
             for member in normalized_members
             if str(member.get("id") or "").strip()
         ]
-        graph_state = (
-            new_asset_research_state(
+        graph_state: dict[str, Any] | None = None
+        if is_asset_graph and set(graph_member_ids) == set(MEMBER_NODES):
+            graph_state = new_asset_research_state(
                 run_id=run_id,
                 member_ids=graph_member_ids,
                 resume_from=resume_state,
                 supplemental_artifacts=supplemental_artifacts or [],
             )
-            if has_data_package and set(graph_member_ids) == set(MEMBER_NODES)
-            else None
-        )
+        elif is_bottleneck_graph and set(graph_member_ids) == set(BOTTLENECK_MEMBER_NODES):
+            graph_state = new_supply_chain_bottleneck_state(
+                run_id=run_id,
+                member_ids=graph_member_ids,
+                resume_from=resume_state,
+                supplemental_artifacts=supplemental_artifacts or [],
+            )
+        if graph_state is not None:
+            resolved_target = str(target or graph_state.get("target") or "").strip()
+            if resolved_target:
+                graph_state["target"] = resolved_target
         if graph_state is not None and resume_state is not None:
             prior_members = graph_state.get("members")
             if isinstance(prior_members, dict):
@@ -712,24 +761,40 @@ class WebSocketChannel(BaseChannel):
         initial_stage = (
             str(graph_state.get("node"))
             if isinstance(graph_state, dict)
-            else PREPARATION if has_data_package else MEMBERS
+            else PREPARATION if has_fixed_preparation else MEMBERS
+        )
+        preparation_node = (
+            DATA_PACKAGE if is_asset_graph
+            else SCOPE_BRIEF if is_bottleneck_graph
+            else None
+        )
+        preparation_stage = (
+            PREPARATION if is_asset_graph
+            else "scoping" if is_bottleneck_graph
+            else None
         )
         self._team_runs[(chat_id, run_id)] = {
             "team_id": team_id,
             "team_name": team_name,
             "members": normalized_members,
             "has_data_package": has_data_package,
+            "preparation_node": preparation_node,
+            "preparation_stage": preparation_stage,
             "graph_state": graph_state,
             "graph_event": "resume_started" if resume_state is not None else "run_started",
             "revision": 0,
-            "turn_id": self.gateway.state.active_turn_id(f"websocket:{chat_id}"),
+            "turn_id": self.gateway.state.active_turn_id(
+                webui_session_key_for_chat_id(chat_id)
+            ),
             "stage": initial_stage,
             "status": "running",
             "note": (
                 "已读取上次角色产物和本轮补充资料，主笔正在重新交叉质证与汇总"
                 if resume_state is not None
                 else "Team Lead 正在建立公司基础数据包，完成后启动四位专家"
-                if has_data_package
+                if is_asset_graph
+                else "Team Lead 正在建立研究主题卡，完成后启动第一阶段两位专家"
+                if is_bottleneck_graph
                 else (
                     f"{len(normalized_members)} 位专家将分阶段协作，"
                     f"首阶段 {first_phase_count} 位并行研究"
@@ -760,24 +825,31 @@ class WebSocketChannel(BaseChannel):
             else "interrupted" if run_status in {"cancelled", "interrupted"}
             else None
         )
-        if run.get("has_data_package") is True:
-            data_package_status = (
+        preparation_node = str(run.get("preparation_node") or "").strip()
+        preparation_stage = str(run.get("preparation_stage") or "").strip()
+        if preparation_node:
+            preparation_status = (
                 terminal_step_status
-                if terminal_step_status is not None and stage == "preparation"
-                else "running" if stage == "preparation"
+                if terminal_step_status is not None and stage == preparation_stage
+                else "running" if stage == preparation_stage
                 else "completed"
             )
+            is_scope_brief = preparation_node == SCOPE_BRIEF
             steps.append({
-                "id": "data-package",
-                "title": "建立基础数据包",
+                "id": preparation_node,
+                "title": "建立研究主题卡" if is_scope_brief else "建立基础数据包",
                 "detail": (
-                    "正在统一公司摘要、财务指标、公告新闻和行业数据"
-                    if stage == "preparation"
+                    "正在明确趋势、地域、时间窗口和第一阶段研究边界"
+                    if is_scope_brief and stage == preparation_stage
+                    else "研究主题卡已建立，专家共享同一研究边界"
+                    if is_scope_brief
+                    else "正在统一公司摘要、财务指标、公告新闻和行业数据"
+                    if stage == preparation_stage
                     else "基础数据包已建立，专家共享同一数据口径"
                 ),
-                "status": data_package_status,
+                "status": preparation_status,
                 "kind": "preparation",
-                "stage_key": "preparation",
+                "stage_key": preparation_stage,
             })
         for member in run.get("members", []):
             if not isinstance(member, dict):
@@ -852,7 +924,7 @@ class WebSocketChannel(BaseChannel):
         current_step_id = active_step_ids[0] if len(active_step_ids) == 1 else None
         turn_id = str(
             run.get("turn_id")
-            or self.gateway.state.active_turn_id(f"websocket:{chat_id}")
+            or self.gateway.state.active_turn_id(webui_session_key_for_chat_id(chat_id))
             or ""
         ).strip()
         if turn_id:
@@ -911,13 +983,15 @@ class WebSocketChannel(BaseChannel):
         resolved_turn_id = (
             str(turn_id or "").strip()
             or str(
-                self.gateway.state.active_turn_id(f"websocket:{chat_id}") or ""
+                self.gateway.state.active_turn_id(
+                    webui_session_key_for_chat_id(chat_id)
+                ) or ""
             ).strip()
         )
         if not resolved_turn_id:
             return
         plan = self.gateway.state.turn_plan_snapshot(
-            session_key=f"websocket:{chat_id}",
+            session_key=webui_session_key_for_chat_id(chat_id),
             turn_id=resolved_turn_id,
         )
         if plan is None:
@@ -1540,7 +1614,7 @@ class WebSocketChannel(BaseChannel):
             resume_artifacts: list[str] = []
             if team_route["action"] == "resume" and expert_team is not None:
                 prior_run = self.gateway.state.latest_expert_team_resume(
-                    session_key=f"websocket:{cid}",
+                    session_key=webui_session_key_for_chat_id(cid),
                     team_id=str(expert_team.get("id") or ""),
                 )
                 candidate_state = (
@@ -1552,8 +1626,26 @@ class WebSocketChannel(BaseChannel):
                     team_route = {
                         "action": "clarify",
                         "reason": "resume_without_prior_run",
+                        **(
+                            {"team_id": str(expert_team.get("id") or "")}
+                            if expert_team.get("id") == SUPPLY_CHAIN_BOTTLENECK_TEAM_ID
+                            else {}
+                        ),
                     }
                 else:
+                    resumed_target = str(candidate_state.get("target") or "").strip()
+                    if not resumed_target:
+                        team_route = {
+                            "action": "clarify",
+                            "reason": "resume_without_prior_target",
+                            **(
+                                {"team_id": str(expert_team.get("id") or "")}
+                                if expert_team.get("id") == SUPPLY_CHAIN_BOTTLENECK_TEAM_ID
+                                else {}
+                            ),
+                        }
+                        candidate_state = None
+                if isinstance(candidate_state, dict):
                     resume_state = candidate_state
                     resume_artifacts = [
                         str(item)
@@ -1564,6 +1656,12 @@ class WebSocketChannel(BaseChannel):
                         "action": "run",
                         "reason": "resume_prior_run",
                         "previous_run_id": str(prior_run.get("run_id") or ""),
+                        "target": resumed_target,
+                        **(
+                            {"team_id": str(expert_team.get("id") or "")}
+                            if expert_team.get("id") == SUPPLY_CHAIN_BOTTLENECK_TEAM_ID
+                            else {}
+                        ),
                     }
             is_team_run = team_route["action"] == "run"
             metadata: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
@@ -1575,7 +1673,9 @@ class WebSocketChannel(BaseChannel):
             if envelope.get("webui") is True:
                 metadata["webui"] = True
                 metadata.update(self._transcripts.client_turn_metadata(envelope.get("turn_id")))
-                active_turn_id = self.gateway.state.active_turn_id(f"websocket:{cid}")
+                active_turn_id = self.gateway.state.active_turn_id(
+                    webui_session_key_for_chat_id(cid)
+                )
                 if active_turn_id:
                     client_turn_id = str(metadata.get(WEBUI_TURN_METADATA_KEY) or "").strip()
                     metadata[WEBUI_TURN_METADATA_KEY] = active_turn_id
@@ -1607,6 +1707,7 @@ class WebSocketChannel(BaseChannel):
                     "run_id": str(team_route.get("previous_run_id") or ""),
                     "artifacts": resume_artifacts,
                     "graph_state": resume_state,
+                    "team_id": str(expert_team.get("id") or "") if expert_team else "",
                 }
             if is_team_run:
                 metadata["expert_team_run_id"] = uuid.uuid4().hex[:12]
@@ -1623,7 +1724,7 @@ class WebSocketChannel(BaseChannel):
             )
             metadata[PROJECT_CONTEXT_METADATA_KEY] = {
                 **binding,
-                "session_key": f"websocket:{cid}",
+                "session_key": webui_session_key_for_chat_id(cid),
             }
             if metadata.get(ACTIVE_TURN_CORRECTION_METADATA_KEY) is True:
                 await asyncio.to_thread(
@@ -1675,6 +1776,7 @@ class WebSocketChannel(BaseChannel):
                         *resume_artifacts,
                         *(media_paths or []),
                     ] if resume_state is not None else None,
+                    target=str(team_route.get("target") or "") or None,
                 )
                 await self._send_event(
                     connection,
@@ -1702,6 +1804,7 @@ class WebSocketChannel(BaseChannel):
                 content=content,
                 media=media_paths or None,
                 metadata=metadata,
+                session_key=webui_session_key_for_chat_id(cid),
                 is_dm=False,
             )
             return
@@ -1735,7 +1838,9 @@ class WebSocketChannel(BaseChannel):
         try:
             return self._workspaces.persist_scope(chat_id, scope)
         except WorkspaceScopeError as exc:
-            state_session = self.gateway.state.get_session(f"websocket:{chat_id}")
+            state_session = self.gateway.state.get_session(
+                webui_session_key_for_chat_id(chat_id)
+            )
             await asyncio.to_thread(
                 self.gateway.logs.write,
                 level="warning",
@@ -1785,6 +1890,10 @@ class WebSocketChannel(BaseChannel):
         self._stream_text_buffers.clear()
         self._resumable_streams.clear()
         self._team_runs.clear()
+        try:
+            await asyncio.to_thread(self.gateway.state.checkpoint)
+        except Exception as exc:
+            self.logger.warning("state WAL checkpoint failed during shutdown: {}", exc)
         from nanobot.browser.mirror import browser_mirror
 
         browser_mirror.set_event_sink(None)
@@ -2210,7 +2319,7 @@ class WebSocketChannel(BaseChannel):
             await self._safe_send_to(connection, raw, label=" file_edit ")
 
         try:
-            session_key = f"websocket:{chat_id}"
+            session_key = webui_session_key_for_chat_id(chat_id)
             scope = self._workspaces.scope_for_session_key(session_key)
             seen_states: set[tuple[str, str]] = set()
             turn_id = (
@@ -2468,7 +2577,7 @@ class WebSocketChannel(BaseChannel):
         if not candidates:
             return
 
-        session_key = f"websocket:{chat_id}"
+        session_key = webui_session_key_for_chat_id(chat_id)
         if self.gateway.state.get_session(session_key) is None:
             return
         scope = self._workspaces.scope_for_session_key(session_key)
@@ -2770,7 +2879,7 @@ class WebSocketChannel(BaseChannel):
             )
         enriched_turn = dict(turn)
         plan = self.gateway.state.turn_plan_snapshot(
-            session_key=f"websocket:{chat_id}",
+            session_key=webui_session_key_for_chat_id(chat_id),
             turn_id=str(turn.get("id") or ""),
         )
         if plan is not None:
@@ -2832,7 +2941,7 @@ class WebSocketChannel(BaseChannel):
             if not isinstance(turn, dict) or not turn.get("id"):
                 continue
             plan = self.gateway.state.turn_plan_snapshot(
-                session_key=f"websocket:{chat_id}",
+                session_key=webui_session_key_for_chat_id(chat_id),
                 turn_id=str(turn["id"]),
             )
             if plan is not None:
@@ -2890,7 +2999,9 @@ class WebSocketChannel(BaseChannel):
         body: dict[str, Any] = {"event": "session_updated", "chat_id": chat_id}
         if scope:
             body["scope"] = scope
-        state_session = self.gateway.state.get_session(f"websocket:{chat_id}")
+        state_session = self.gateway.state.get_session(
+            webui_session_key_for_chat_id(chat_id)
+        )
         if state_session is not None:
             body["session_id"] = state_session.id
             body["project_id"] = state_session.project_id
@@ -3015,7 +3126,7 @@ class WebSocketChannel(BaseChannel):
         turn_id = str(run.get("turn_id") or "").strip()
         if turn_id:
             persisted_plan = self.gateway.state.turn_plan_snapshot(
-                session_key=f"websocket:{chat_id}",
+                session_key=webui_session_key_for_chat_id(chat_id),
                 turn_id=turn_id,
             )
             if persisted_plan is not None:
@@ -3065,12 +3176,20 @@ class WebSocketChannel(BaseChannel):
             return
         if str(state.get("run_id") or "") != run_id:
             return
-        if (
-            int(state.get("schema_version") or 0) < 2
-            or state.get("workflow") != "asset-research"
-        ):
+        if int(state.get("schema_version") or 0) < 2:
             return
-        valid_nodes = {DATA_PACKAGE, *MEMBER_NODES, TEAM_LEAD, REPORT_AUDIT}
+        workflow = str(state.get("workflow") or "")
+        if workflow == "asset-research":
+            valid_nodes = {DATA_PACKAGE, *MEMBER_NODES, TEAM_LEAD, REPORT_AUDIT}
+        elif workflow == "supply-chain-bottleneck":
+            valid_nodes = {
+                SCOPE_BRIEF,
+                *BOTTLENECK_MEMBER_NODES,
+                BOTTLENECK_TEAM_LEAD,
+                BOTTLENECK_REPORT_AUDIT,
+            }
+        else:
+            return
         active_nodes = state.get("active_nodes")
         if (
             not isinstance(active_nodes, list)

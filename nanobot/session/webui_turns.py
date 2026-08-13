@@ -29,7 +29,7 @@ from nanobot.bus.runtime_events import (
 from nanobot.cron.session_turns import CRON_HISTORY_META
 from nanobot.providers.base import LLMProvider
 from nanobot.session.goal_state import goal_state_ws_blob
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import Session, SessionManager, _is_valid_generated_title
 from nanobot.utils.helpers import strip_think, truncate_text
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.webui.interactive_prompt import (
@@ -47,6 +47,14 @@ TITLE_GENERATION_REASONING_EFFORT = "none"
 # Wall-clock turn start per ``chat_id`` (websocket only). Survives browser refresh while the
 # gateway process stays up; cleared on idle/stop and implicitly dropped on restart.
 _WEBSOCKET_TURN_WALL_STARTED_AT: dict[str, float] = {}
+
+
+def _webui_chat_id(msg: InboundMessage) -> str:
+    """Return the wire chat id for a WebUI turn, including cron child runs."""
+    session_key = str(msg.session_key or "").strip()
+    if session_key.startswith("cron:"):
+        return session_key
+    return str(msg.chat_id or "").strip()
 
 
 def mark_webui_session(session: Session, metadata: dict[str, Any]) -> bool:
@@ -111,12 +119,13 @@ async def maybe_generate_webui_title(
     current_title = session.metadata.get(WEBUI_TITLE_METADATA_KEY)
     if isinstance(current_title, str) and current_title.strip():
         cleaned_current_title = clean_generated_title(current_title)
-        if cleaned_current_title:
+        if cleaned_current_title and _is_valid_generated_title(cleaned_current_title):
             if cleaned_current_title != current_title:
                 session.metadata[WEBUI_TITLE_METADATA_KEY] = cleaned_current_title
                 sessions.save(session)
             return False
         session.metadata.pop(WEBUI_TITLE_METADATA_KEY, None)
+        sessions.save(session)
 
     user_text, assistant_text = _title_inputs(session)
     if not user_text:
@@ -158,8 +167,22 @@ async def maybe_generate_webui_title(
         logger.debug("Failed to generate webui session title for {}", session_key, exc_info=True)
         return False
 
-    title = clean_generated_title(response.content)
-    if not title or title.lower().startswith("error"):
+    raw_title = (response.content or "").strip()
+    title = clean_generated_title(raw_title)
+    reasoning_only = bool(
+        response.content
+        and response.reasoning_content
+        and response.content.strip() == response.reasoning_content.strip()
+    )
+    if (
+        response.finish_reason in {"error", "length", "max_tokens"}
+        or reasoning_only
+        or len(raw_title) > TITLE_MAX_CHARS
+        or "\n" in raw_title
+        or "\r" in raw_title
+        or not _is_valid_generated_title(title)
+        or title.lower().startswith("error")
+    ):
         logger.debug(
             "WebUI title generation returned no usable title for {} (finish_reason={})",
             session_key,
@@ -213,7 +236,9 @@ async def publish_turn_run_status(
     """Notify WebSocket clients while a user turn is executing (timing strip)."""
     if msg.channel != "websocket":
         return
-    cid = str(msg.chat_id)
+    cid = _webui_chat_id(msg)
+    if not cid:
+        return
     meta: dict[str, Any] = {
         **dict(msg.metadata or {}),
         "_goal_status": True,
@@ -404,7 +429,7 @@ class WebuiTurnCoordinator:
     async def _handle_goal_state_changed(self, event: GoalStateChanged) -> None:
         if not self._is_websocket_event(event.context):
             return
-        cid = str(event.context.chat_id or "").strip()
+        cid = _webui_chat_id(self._ctx_msg(event.context))
         if not cid:
             return
         await self.bus.publish_outbound(
@@ -413,6 +438,7 @@ class WebuiTurnCoordinator:
                 chat_id=cid,
                 content="",
                 metadata={
+                    **event.context.metadata,
                     "_goal_state_sync": True,
                     "goal_state": goal_state_ws_blob(event.session_metadata),
                 },
@@ -439,6 +465,7 @@ class WebuiTurnCoordinator:
     ) -> None:
         if not self._is_websocket_event(event.context):
             return
+        delivery_chat_id = _webui_chat_id(self._ctx_msg(event.context))
         persisted = False
         canonical_event: dict[str, Any] | None = None
         if self.transcripts is not None:
@@ -457,7 +484,7 @@ class WebuiTurnCoordinator:
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel=event.context.channel,
-                chat_id=event.context.chat_id,
+                chat_id=delivery_chat_id,
                 content="",
                 metadata={
                     **event.context.metadata,
@@ -476,6 +503,7 @@ class WebuiTurnCoordinator:
     ) -> None:
         if not self._is_websocket_event(event.context):
             return
+        delivery_chat_id = _webui_chat_id(self._ctx_msg(event.context))
         persisted = False
         canonical_event: dict[str, Any] | None = None
         if self.transcripts is not None:
@@ -502,7 +530,7 @@ class WebuiTurnCoordinator:
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel=event.context.channel,
-                chat_id=event.context.chat_id,
+                chat_id=delivery_chat_id,
                 content="",
                 metadata={
                     **event.context.metadata,
@@ -519,9 +547,13 @@ class WebuiTurnCoordinator:
         self,
         event: ThreadRuntimeStatusChanged,
     ) -> None:
-        if not event.session_key.startswith("websocket:"):
+        if not event.session_key.startswith(("websocket:", "cron:")):
             return
-        chat_id = event.session_key.split(":", 1)[1]
+        chat_id = (
+            event.session_key
+            if event.session_key.startswith("cron:")
+            else event.session_key.split(":", 1)[1]
+        )
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel="websocket",
@@ -529,6 +561,7 @@ class WebuiTurnCoordinator:
                 content="",
                 metadata={
                     "_thread_runtime_status_changed": True,
+                    "_webui_transcript_session_key": event.session_key,
                     "runtime_snapshot": dict(event.snapshot),
                 },
             )
@@ -569,7 +602,8 @@ class WebuiTurnCoordinator:
         # message is still queued behind it.  Clearing this before publishing
         # ``turn_end`` prevents an immediate session-list refresh from
         # reporting the completed turn as active.
-        _WEBSOCKET_TURN_WALL_STARTED_AT.pop(str(msg.chat_id or "").strip(), None)
+        delivery_chat_id = _webui_chat_id(msg)
+        _WEBSOCKET_TURN_WALL_STARTED_AT.pop(delivery_chat_id, None)
         turn_metadata: dict[str, Any] = {**msg.metadata, "_turn_end": True}
         if latency_ms is not None:
             turn_metadata["latency_ms"] = int(latency_ms)
@@ -577,7 +611,7 @@ class WebuiTurnCoordinator:
         turn_metadata["goal_state"] = goal_state_ws_blob(session.metadata)
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel,
-            chat_id=msg.chat_id,
+            chat_id=delivery_chat_id,
             content="",
             metadata=turn_metadata,
         ))
@@ -602,7 +636,7 @@ class WebuiTurnCoordinator:
             if generated:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
-                    chat_id=msg.chat_id,
+                    chat_id=_webui_chat_id(msg),
                     content="",
                     metadata={
                         **msg.metadata,
@@ -636,7 +670,7 @@ class WebuiTurnCoordinator:
             if generated:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=event.context.channel,
-                    chat_id=event.context.chat_id,
+                    chat_id=_webui_chat_id(self._ctx_msg(event.context)),
                     content="",
                     metadata={
                         **event.context.metadata,

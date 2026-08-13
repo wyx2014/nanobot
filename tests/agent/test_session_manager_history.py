@@ -217,6 +217,19 @@ def test_list_sessions_hides_generated_think_title(tmp_path):
     assert rows[0]["preview"] == "hello"
 
 
+def test_list_sessions_hides_truncated_generated_title(tmp_path):
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:chat-reasoning-title")
+    session.metadata["title"] = "被截断的自动标题…"
+    session.add_message("user", "分析青岛啤酒")
+    manager.save(session)
+
+    rows = manager.list_sessions()
+
+    assert rows[0]["title"] == ""
+    assert rows[0]["preview"] == "分析青岛啤酒"
+
+
 def test_list_sessions_keeps_user_edited_think_title(tmp_path):
     manager = SessionManager(tmp_path)
     session = manager.get_or_create("websocket:chat-user-title")

@@ -187,6 +187,91 @@ def test_scope_for_session_key_reads_metadata_without_full_history(
     assert scope.access_mode == "full"
 
 
+def test_durable_metadata_wins_when_sqlite_points_to_another_project(tmp_path) -> None:
+    default = tmp_path / "default"
+    expected = tmp_path / "expected"
+    default.mkdir()
+    expected.mkdir()
+    state = StateStore(tmp_path / "runtime" / "state.sqlite", default_workspace=default)
+    wrong_project = state.ensure_project(default)
+    controller = WebUIWorkspaceController(
+        session_manager=None,
+        default_workspace=default,
+        default_restrict_to_workspace=True,
+        state_store=state,
+    )
+
+    scope = controller.scope_for_session_metadata(
+        {
+            "project_id": "prj_0123456789abcdef0123456789abcdef",
+            "workspace_scope": {
+                "project_path": str(expected),
+                "access_mode": "full",
+            },
+        },
+        state_project=wrong_project,
+    )
+
+    assert scope.project_path == expected.resolve()
+    assert scope.access_mode == "full"
+
+
+def test_missing_persisted_project_path_does_not_fall_back_to_inbox(tmp_path) -> None:
+    default = tmp_path / "default"
+    removed = tmp_path / "removed-project"
+    default.mkdir()
+    controller = WebUIWorkspaceController(
+        session_manager=None,
+        default_workspace=default,
+        default_restrict_to_workspace=True,
+    )
+
+    scope = controller.scope_for_session_metadata(
+        {
+            "project_id": "prj_0123456789abcdef0123456789abcdef",
+            "workspace_scope": {
+                "project_path": str(removed),
+                "access_mode": "full",
+            },
+        },
+    )
+
+    assert not removed.exists()
+    assert scope.project_path == removed.resolve()
+    assert scope.access_mode == "full"
+
+
+def test_matching_sqlite_identity_can_supply_relocated_project_path(tmp_path) -> None:
+    default = tmp_path / "default"
+    old = tmp_path / "old"
+    relocated = tmp_path / "relocated"
+    default.mkdir()
+    old.mkdir()
+    relocated.mkdir()
+    state = StateStore(tmp_path / "runtime" / "state.sqlite", default_workspace=default)
+    project = state.ensure_project(relocated)
+    controller = WebUIWorkspaceController(
+        session_manager=None,
+        default_workspace=default,
+        default_restrict_to_workspace=True,
+        state_store=state,
+    )
+
+    scope = controller.scope_for_session_metadata(
+        {
+            "project_id": project.id,
+            "workspace_scope": {
+                "project_path": str(old),
+                "access_mode": "restricted",
+            },
+        },
+        state_project=project,
+    )
+
+    assert scope.project_path == relocated.resolve()
+    assert scope.access_mode == "restricted"
+
+
 def test_persist_scope_writes_stable_ids_to_first_jsonl_record_and_rejects_rebind(
     tmp_path,
 ) -> None:

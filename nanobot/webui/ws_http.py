@@ -13,7 +13,9 @@ import asyncio
 import io
 import json
 import mimetypes
+import os
 import re
+import sqlite3
 import time
 import zipfile
 from collections.abc import Callable
@@ -29,15 +31,18 @@ from websockets.http11 import Response
 from nanobot.command.builtin import builtin_command_palette
 from nanobot.cron.session_turns import is_bound_cron_job
 from nanobot.cron.types import CronJob, CronSchedule
+from nanobot.observability.trace_store import TraceStore
+from nanobot.session.manager import _metadata_title
+from nanobot.storage.lifecycle import LifecycleRegistry
+from nanobot.storage.logs import StructuredLogRecord, StructuredLogStore
+from nanobot.storage.session_events import SessionEventFileStore, SessionEventService
 from nanobot.storage.state import (
     SessionProjectMismatch,
     StateStore,
     StateStoreError,
 )
-from nanobot.storage.logs import StructuredLogRecord, StructuredLogStore
-from nanobot.observability.trace_store import TraceStore
-from nanobot.storage.session_events import SessionEventService
 from nanobot.utils.subagent_channel_display import scrub_subagent_messages_for_channel
+from nanobot.webui.expert_teams import EXPERT_TEAM_SESSION_KEY, public_expert_team_binding
 from nanobot.webui.file_preview import WebUIFilePreviewError, file_preview_payload
 from nanobot.webui.gateway_tokens import GatewayTokenStore, token_response_payload
 from nanobot.webui.http_utils import (
@@ -77,14 +82,6 @@ from nanobot.webui.http_utils import (
     safe_host_header as _safe_host_header,
 )
 from nanobot.webui.media_gateway import WebUIMediaGateway
-from nanobot.webui.expert_teams import EXPERT_TEAM_SESSION_KEY, public_expert_team_binding
-from nanobot.webui.session_automations import (
-    all_automations_payload,
-    serialize_automation_jobs,
-    session_automation_jobs,
-    session_automations_payload,
-)
-from nanobot.webui.session_list_index import list_webui_sessions
 from nanobot.webui.session_artifacts import (
     SessionArtifactError,
     artifact_content_type,
@@ -93,11 +90,22 @@ from nanobot.webui.session_artifacts import (
     registered_artifact_row,
     resolve_session_artifact,
 )
+from nanobot.webui.session_automations import (
+    all_automations_payload,
+    serialize_automation_jobs,
+    session_automation_jobs,
+    session_automations_payload,
+)
+from nanobot.webui.session_list_index import (
+    is_webui_sidebar_session_data,
+    list_webui_sessions,
+)
 from nanobot.webui.sidebar_state import (
     read_webui_sidebar_state,
     write_webui_sidebar_state,
 )
 from nanobot.webui.skills_api import webui_skill_detail_payload, webui_skills_payload
+from nanobot.webui.thread_disk import delete_webui_thread
 from nanobot.webui.transcript import build_webui_thread_response
 from nanobot.webui.workspaces import WebUIWorkspaceController
 
@@ -116,6 +124,13 @@ def _decode_api_key(raw_key: str) -> str | None:
     if _api_key_re.match(key) is None:
         return None
     return key
+
+
+def _state_title_for_session_list(title: str, metadata: Any) -> str:
+    """Apply generated-title validation to the SQLite projection as well as JSONL."""
+    if isinstance(metadata, dict) and metadata.get("title_user_edited") is True:
+        return _metadata_title(metadata)
+    return _metadata_title({"title": title})
 
 
 def _default_model_name_from_config() -> str | None:
@@ -196,6 +211,8 @@ class GatewayHTTPHandler:
         logs_store: StructuredLogStore,
         trace_store: TraceStore,
         journal_store: SessionEventService,
+        lifecycle_registry: LifecycleRegistry,
+        session_event_files: SessionEventFileStore,
         skills_workspace_path: Path,
         disabled_skills: set[str] | None = None,
         cron_service: CronService | None = None,
@@ -217,6 +234,8 @@ class GatewayHTTPHandler:
         self.logs = logs_store
         self.traces = trace_store
         self.journal = journal_store
+        self.lifecycle = lifecycle_registry
+        self.session_event_files = session_event_files
         self.skills_workspace_path = skills_workspace_path
         self.disabled_skills = disabled_skills or set()
         self.cron_service = cron_service
@@ -225,8 +244,8 @@ class GatewayHTTPHandler:
         self._log = log
         self._runtime_surface = runtime_surface
 
-        from nanobot.webui.settings_api import runtime_capabilities as _rc
         from nanobot.webui.schedule_routes import WebUIScheduleRouter
+        from nanobot.webui.settings_api import runtime_capabilities as _rc
         from nanobot.webui.settings_routes import WebUISettingsRouter
 
         self._capabilities = _rc(runtime_surface, runtime_capabilities_overrides or {})
@@ -248,6 +267,7 @@ class GatewayHTTPHandler:
             error_response=_http_error,
             logger=self._log,
             state_store=state_store,
+            purge_session=self._purge_schedule_run_session,
         )
 
     def workspace_controls_available(self, connection: Any) -> bool:
@@ -467,12 +487,19 @@ class GatewayHTTPHandler:
         if m:
             return self._handle_session_automations(request, m.group(1))
 
-        m = re.match(r"^/api/sessions/([^/]+)/delete$", got)
+        m = re.match(r"^/api/sessions/([^/]+)/(archive|delete)$", got)
         if m:
-            return self._handle_session_delete(request, m.group(1))
+            return self._handle_session_archive(
+                request,
+                m.group(1),
+                legacy_delete_route=m.group(2) == "delete",
+            )
         m = re.match(r"^/api/sessions/([^/]+)/restore$", got)
         if m:
             return self._handle_session_restore(request, m.group(1))
+        m = re.match(r"^/api/sessions/([^/]+)/purge$", got)
+        if m:
+            return self._handle_session_purge(request, m.group(1))
 
         return None
 
@@ -481,7 +508,14 @@ class GatewayHTTPHandler:
             return _http_error(401, "Unauthorized")
         if self.session_manager is None:
             return _http_error(503, "session manager unavailable")
-        payload = await asyncio.to_thread(self._sessions_list_payload)
+        include_archived = _query_first(
+            _parse_query(request.path),
+            "include_archived",
+        ) in {"1", "true", "yes"}
+        payload = await asyncio.to_thread(
+            self._sessions_list_payload,
+            include_archived=include_archived,
+        )
         return _http_json_response(payload)
 
     def _session_route_context(
@@ -509,9 +543,54 @@ class GatewayHTTPHandler:
                 decoded_key = state_session.session_key
         if not _is_webui_readable_session_key(decoded_key):
             return _http_error(404, "session not found")
+        lifecycle_state = self.lifecycle.session_state(decoded_key)
+        if lifecycle_state == "purged":
+            return _http_error(404, "session not found")
+        state_session = self.state.get_session(decoded_key)
+        if lifecycle_state == "archived" or (
+            state_session is not None and state_session.status == "archived"
+        ):
+            return _http_error(410, "session is archived")
         session_data = self.session_manager.read_session_file(decoded_key)
         if not isinstance(session_data, dict):
             return _http_error(404, "session not found")
+        state_project = (
+            self.state.get_project(state_session.project_id)
+            if state_session is not None
+            else None
+        )
+        metadata = session_data.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else None
+        scope = self.workspaces.scope_for_session_metadata(
+            metadata,
+            state_project=state_project,
+        )
+        metadata_project_id = (
+            metadata.get("project_id")
+            if isinstance(metadata, dict)
+            and isinstance(metadata.get("project_id"), str)
+            else None
+        )
+        project_lifecycle = (
+            (self.lifecycle.project(metadata_project_id) if metadata_project_id else None)
+            or self.lifecycle.project_for_path(scope.project_path)
+            or (
+                self.lifecycle.project(state_project.id)
+                or self.lifecycle.project_for_path(state_project.canonical_root_path)
+                if state_project is not None
+                else None
+            )
+        )
+        if project_lifecycle is not None and project_lifecycle.state == "purged":
+            return _http_error(404, "session not found")
+        if (
+            (state_project is not None and state_project.status == "archived")
+            or (
+                project_lifecycle is not None
+                and project_lifecycle.state == "archived"
+            )
+        ):
+            return _http_error(410, "workspace is archived")
         return decoded_key, session_data
 
     async def _handle_session_thread(
@@ -542,6 +621,27 @@ class GatewayHTTPHandler:
                 session_key,
             )
             return _http_error(503, "thread projection unavailable")
+        recovery_watermark = self.state.projector_watermark(session_key) or {}
+        recovery_error = recovery_watermark.get("error")
+        if recovery_error is not None:
+            await asyncio.to_thread(
+                self.logs.write,
+                level="error",
+                component="recovery",
+                event_name="thread_projection_withheld",
+                message=(
+                    "thread resource was withheld because event recovery did not "
+                    "reach a consistent boundary"
+                ),
+                project_id=state_session.project_id,
+                session_id=state_session.id,
+                error_code="THREAD_RECOVERY_INCOMPLETE",
+                details={"session_key": session_key, "error": recovery_error},
+            )
+            return _http_error(
+                409,
+                "conversation recovery is incomplete; progress and artifacts were withheld",
+            )
 
         raw_messages = session_data.get("messages")
         session_messages = (
@@ -650,11 +750,18 @@ class GatewayHTTPHandler:
             scope,
             state_session,
         )
+        artifact_turn = active_turn if isinstance(active_turn, dict) else latest_turn
+        artifact_turn_id = (
+            str(artifact_turn["id"])
+            if isinstance(artifact_turn, dict) and artifact_turn.get("id")
+            else None
+        )
         artifacts = await asyncio.to_thread(
             self.state.list_session_artifacts,
             session_key,
+            turn_id=artifact_turn_id,
         )
-        watermark = self.state.projector_watermark(session_key) or {}
+        watermark = recovery_watermark
         last_event_seq = int(watermark.get("last_event_seq") or 0)
 
         raw_after = _query_first(query, "after_event_seq")
@@ -889,10 +996,8 @@ class GatewayHTTPHandler:
             "truncated": False,
             "migrated_count": 0,
             "migration_failures": 0,
+            "pruned_count": 0,
         }
-        if state_session.artifact_indexed_at is not None:
-            return stats
-
         legacy_payload = await asyncio.to_thread(
             discover_session_artifacts,
             session_key,
@@ -900,6 +1005,32 @@ class GatewayHTTPHandler:
             scope=scope,
         )
         stats["truncated"] = legacy_payload.get("truncated") is True
+        allowed_paths = {
+            str(row["path"])
+            for row in legacy_payload.get("artifacts", [])
+            if isinstance(row, dict) and isinstance(row.get("path"), str)
+        }
+        stats["pruned_count"] = await asyncio.to_thread(
+            self.state.prune_unverified_referenced_artifacts,
+            session_key,
+            allowed_paths,
+        )
+        for row in legacy_payload.get("artifacts", []):
+            if not isinstance(row, dict):
+                continue
+            path = row.get("path")
+            turn_id = row.get("_turn_id")
+            if not isinstance(path, str) or not isinstance(turn_id, str):
+                continue
+            await asyncio.to_thread(
+                self.state.assign_referenced_artifact_turn,
+                session_key,
+                path,
+                turn_id,
+            )
+        if state_session.artifact_indexed_at is not None:
+            return stats
+
         for row in legacy_payload.get("artifacts", []):
             if not isinstance(row, dict) or not isinstance(row.get("path"), str):
                 continue
@@ -911,6 +1042,11 @@ class GatewayHTTPHandler:
                     relation_type="referenced",
                     artifact_kind=str(row.get("kind") or "file"),
                     mime_type=str(row.get("mime_type") or "application/octet-stream"),
+                    turn_id=(
+                        str(row["_turn_id"])
+                        if isinstance(row.get("_turn_id"), str)
+                        else None
+                    ),
                 )
                 stats["migrated_count"] = int(stats["migrated_count"]) + 1
             except (OSError, StateStoreError):
@@ -948,6 +1084,7 @@ class GatewayHTTPHandler:
         truncated = bool(migration["truncated"])
         migrated_count = int(migration["migrated_count"])
         migration_failures = int(migration["migration_failures"])
+        pruned_count = int(migration["pruned_count"])
 
         records = await asyncio.to_thread(
             self.state.list_session_artifacts,
@@ -971,6 +1108,7 @@ class GatewayHTTPHandler:
                 "artifact_count": len(records),
                 "migrated_count": migrated_count,
                 "migration_failures": migration_failures,
+                "pruned_count": pruned_count,
                 "truncated": truncated,
             },
         )
@@ -991,6 +1129,17 @@ class GatewayHTTPHandler:
     ) -> Any:
         existing = self.state.get_session(session_key)
         if existing is not None:
+            existing_project = self.state.get_project(existing.project_id)
+            expected_root = os.path.normcase(os.path.normpath(str(
+                Path(scope.project_path).expanduser().resolve(strict=False)
+            )))
+            actual_root = (
+                os.path.normcase(os.path.normpath(existing_project.canonical_root_path))
+                if existing_project is not None
+                else ""
+            )
+            if actual_root == expected_root:
+                return existing
             project = self.state.ensure_project(
                 scope.project_path,
                 name=scope.project_name,
@@ -1207,8 +1356,13 @@ class GatewayHTTPHandler:
             return _http_error(404, "session not found")
         return decoded_key, session_data
 
-    def _sessions_list_payload(self) -> dict[str, Any]:
+    def _sessions_list_payload(
+        self,
+        *,
+        include_archived: bool = False,
+    ) -> dict[str, Any]:
         assert self.session_manager is not None
+        self.reconcile_archived_lifecycle()
         sessions = list_webui_sessions(self.session_manager)
         from nanobot.session.webui_turns import websocket_turn_wall_started_at
 
@@ -1228,13 +1382,10 @@ class GatewayHTTPHandler:
             ):
                 continue
             existing_state = state_by_key.get(key)
-            if existing_state is not None and existing_state.status == "archived":
+            session_lifecycle = self.lifecycle.session(key)
+            if session_lifecycle is not None and session_lifecycle.state == "purged":
                 continue
             row = {k: v for k, v in s.items() if k != "path"}
-            chat_id = key.split(":", 1)[1]
-            started_at = websocket_turn_wall_started_at(chat_id)
-            if started_at is not None:
-                row["run_started_at"] = started_at
             metadata_data = self.session_manager.read_session_metadata(key)
             metadata = (
                 metadata_data.get("metadata")
@@ -1250,6 +1401,37 @@ class GatewayHTTPHandler:
                 metadata if isinstance(metadata, dict) else None,
                 state_project=state_project,
             )
+            metadata_project_id = (
+                metadata.get("project_id")
+                if isinstance(metadata, dict)
+                and isinstance(metadata.get("project_id"), str)
+                else None
+            )
+            project_lifecycle = (
+                (self.lifecycle.project(metadata_project_id) if metadata_project_id else None)
+                or self.lifecycle.project_for_path(scope.project_path)
+                or (
+                    self.lifecycle.project(existing_state.project_id)
+                    if existing_state is not None
+                    else None
+                )
+            )
+            if project_lifecycle is not None and project_lifecycle.state == "purged":
+                continue
+            if existing_state is not None and state_project is not None:
+                state_root = os.path.normcase(os.path.normpath(state_project.canonical_root_path))
+                scope_root = os.path.normcase(os.path.normpath(str(scope.project_path)))
+                if state_root != scope_root:
+                    self._log.error(
+                        "session projection project mismatch session={} state_project={} metadata_project={}",
+                        key,
+                        existing_state.project_id,
+                        metadata_project_id,
+                    )
+                    # Fail closed. Rebuildable SQLite must never move a
+                    # conversation into another workspace merely to keep a
+                    # sidebar row visible.
+                    continue
             row["workspace_scope"] = scope.payload()
             if existing_state is not None:
                 state_session = existing_state
@@ -1259,8 +1441,22 @@ class GatewayHTTPHandler:
                 session_data = self.session_manager.read_session_file(key)
                 if not isinstance(session_data, dict):
                     continue
+                projection_data = session_data
+                if project_lifecycle is not None and not metadata_project_id:
+                    projection_metadata = (
+                        dict(metadata) if isinstance(metadata, dict) else {}
+                    )
+                    projection_metadata["project_id"] = project_lifecycle.key
+                    projection_data = {
+                        **session_data,
+                        "metadata": projection_metadata,
+                    }
                 try:
-                    state_session = self._ensure_state_session(key, session_data, scope)
+                    state_session = self._ensure_state_session(
+                        key,
+                        projection_data,
+                        scope,
+                    )
                 except SessionProjectMismatch:
                     self._log.error(
                         "session project mismatch while listing session={}",
@@ -1268,8 +1464,35 @@ class GatewayHTTPHandler:
                     )
                     continue
                 state_by_key[key] = state_session
+            should_archive_session = (
+                existing_state is not None and existing_state.status == "archived"
+            ) or (
+                session_lifecycle is not None
+                and session_lifecycle.state == "archived"
+            )
+            should_archive_project = (
+                (state_project is not None and state_project.status == "archived")
+                or (
+                    project_lifecycle is not None
+                    and project_lifecycle.state == "archived"
+                )
+            )
+            if should_archive_project:
+                project = self.state.get_project(state_session.project_id)
+                if project is not None and project.status != "archived":
+                    self.state.archive_project(project.id)
+                state_session = self.state.get_session(key) or state_session
+                if not include_archived:
+                    continue
+            elif should_archive_session and state_session.status != "archived":
+                state_session = self.state.archive_session(key)
+            if state_session.status == "archived" and not include_archived:
+                continue
             row["session_id"] = state_session.id
             row["project_id"] = state_session.project_id
+            row["status"] = state_session.status
+            if session_lifecycle is not None:
+                row["lifecycle_updated_at"] = session_lifecycle.updated_at
             # Once a session is projected, SQLite owns its ordering and stable
             # identity.  The JSONL index remains useful for preview text.
             row["created_at"] = datetime.fromtimestamp(
@@ -1278,12 +1501,18 @@ class GatewayHTTPHandler:
             row["updated_at"] = datetime.fromtimestamp(
                 state_session.updated_at / 1_000
             ).isoformat()
-            if state_session.title:
-                row["title"] = state_session.title
+            state_title = _state_title_for_session_list(state_session.title, metadata)
+            if state_title:
+                row["title"] = state_title
             if isinstance(metadata, dict):
                 expert_team = public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
                 if expert_team is not None:
                     row["expert_team"] = expert_team
+            if state_session.status != "archived":
+                chat_id = key if key.startswith("cron:") else key.split(":", 1)[1]
+                started_at = websocket_turn_wall_started_at(chat_id)
+                if started_at is not None:
+                    row["run_started_at"] = started_at
             cleaned.append(row)
             listed_keys.add(key)
 
@@ -1292,7 +1521,7 @@ class GatewayHTTPHandler:
         # that were absent from the index instead of making the sidebar depend
         # on both stores being refreshed in the same request.
         for state_session in state_sessions:
-            if state_session.status == "archived":
+            if state_session.status == "archived" and not include_archived:
                 continue
             key = state_session.session_key
             if key in listed_keys or not (
@@ -1302,11 +1531,44 @@ class GatewayHTTPHandler:
             session_data = self.session_manager.read_session_file(key)
             if not isinstance(session_data, dict):
                 continue
+            if not is_webui_sidebar_session_data(session_data):
+                continue
             metadata = session_data.get("metadata")
             scope = self.workspaces.scope_for_session_metadata(
                 metadata if isinstance(metadata, dict) else None,
                 state_project=projects_by_id.get(state_session.project_id),
             )
+            state_project = projects_by_id.get(state_session.project_id)
+            metadata_project_id = (
+                metadata.get("project_id")
+                if isinstance(metadata, dict)
+                and isinstance(metadata.get("project_id"), str)
+                else None
+            )
+            if state_project is not None:
+                state_root = os.path.normcase(os.path.normpath(state_project.canonical_root_path))
+                scope_root = os.path.normcase(os.path.normpath(str(scope.project_path)))
+                if state_root != scope_root:
+                    continue
+            project_lifecycle = (
+                (self.lifecycle.project(metadata_project_id) if metadata_project_id else None)
+                or self.lifecycle.project(state_session.project_id)
+                or self.lifecycle.project_for_path(scope.project_path)
+            )
+            session_lifecycle = self.lifecycle.session(key)
+            if (
+                (project_lifecycle is not None and project_lifecycle.state == "purged")
+                or (session_lifecycle is not None and session_lifecycle.state == "purged")
+            ):
+                continue
+            if (
+                (state_project is not None and state_project.status == "archived")
+                or (
+                    project_lifecycle is not None
+                    and project_lifecycle.state == "archived"
+                )
+            ) and not include_archived:
+                continue
             preview = ""
             messages = session_data.get("messages")
             if isinstance(messages, list):
@@ -1325,16 +1587,23 @@ class GatewayHTTPHandler:
                 "updated_at": datetime.fromtimestamp(
                     state_session.updated_at / 1_000
                 ).isoformat(),
-                "title": state_session.title,
+                "title": (
+                    _state_title_for_session_list(state_session.title, metadata)
+                    or (preview if state_session.title else "")
+                ),
                 "preview": preview,
                 "workspace_scope": scope.payload(),
                 "session_id": state_session.id,
                 "project_id": state_session.project_id,
+                "status": state_session.status,
             }
-            chat_id = key.split(":", 1)[1]
-            started_at = websocket_turn_wall_started_at(chat_id)
-            if started_at is not None:
-                row["run_started_at"] = started_at
+            if session_lifecycle is not None:
+                row["lifecycle_updated_at"] = session_lifecycle.updated_at
+            if state_session.status != "archived":
+                chat_id = key if key.startswith("cron:") else key.split(":", 1)[1]
+                started_at = websocket_turn_wall_started_at(chat_id)
+                if started_at is not None:
+                    row["run_started_at"] = started_at
             if isinstance(metadata, dict):
                 expert_team = public_expert_team_binding(
                     metadata.get(EXPERT_TEAM_SESSION_KEY)
@@ -1466,7 +1735,13 @@ class GatewayHTTPHandler:
             )
         )
 
-    def _handle_session_delete(self, request: WsRequest, key: str) -> Response:
+    def _handle_session_archive(
+        self,
+        request: WsRequest,
+        key: str,
+        *,
+        legacy_delete_route: bool = False,
+    ) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         if self.session_manager is None:
@@ -1505,8 +1780,25 @@ class GatewayHTTPHandler:
                 return _http_error(409, "session_project_mismatch")
         if state_session is None:
             return _http_error(404, "session not found")
+        if self.state.active_turn_id(decoded_key) is not None:
+            return _http_error(409, "session has an active turn; stop it before archiving")
+        project = self.state.get_project(state_session.project_id)
+        self.lifecycle.archive_session(
+            decoded_key,
+            session_id=state_session.id,
+            project_id=state_session.project_id,
+            title=state_session.title,
+            project_root=(project.canonical_root_path if project is not None else None),
+        )
         self.state.archive_session(decoded_key)
-        return _http_json_response({"deleted": True, "archived": True})
+        payload = {
+            "archived": True,
+            "session_id": state_session.id,
+            "project_id": state_session.project_id,
+        }
+        if legacy_delete_route:
+            payload["deleted"] = True
+        return _http_json_response(payload)
 
     def _handle_session_restore(self, request: WsRequest, key: str) -> Response:
         if not self.check_api_token(request):
@@ -1514,10 +1806,33 @@ class GatewayHTTPHandler:
         decoded_key = _decode_api_key(key)
         if decoded_key is None:
             return _http_error(400, "invalid session key")
+        if self.lifecycle.session_state(decoded_key) == "purged":
+            return _http_error(410, "session was permanently deleted")
+        state_session = self.state.get_session(decoded_key)
+        if state_session is None and self.session_manager is not None:
+            session_data = self.session_manager.read_session_file(decoded_key)
+            if isinstance(session_data, dict):
+                try:
+                    state_session = self._ensure_state_session(
+                        decoded_key,
+                        session_data,
+                        self.workspaces.scope_for_session_key(decoded_key),
+                    )
+                except SessionProjectMismatch:
+                    return _http_error(409, "session_project_mismatch")
+        if state_session is None:
+            return _http_error(404, "archived session not found")
+        project = self.state.get_project(state_session.project_id)
+        if project is not None and (
+            project.status == "archived"
+            or self.lifecycle.project_state(project.id) == "archived"
+        ):
+            return _http_error(409, "restore the archived workspace first")
         try:
             restored = self.state.restore_session(decoded_key)
         except StateStoreError as exc:
             return _http_error(404, str(exc))
+        self.lifecycle.restore_session(decoded_key, session_id=restored.id)
         return _http_json_response(
             {
                 "restored": True,
@@ -1525,6 +1840,253 @@ class GatewayHTTPHandler:
                 "project_id": restored.project_id,
             }
         )
+
+    def _handle_session_purge(self, request: WsRequest, key: str) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        decoded_key = _decode_api_key(key)
+        if decoded_key is None:
+            return _http_error(400, "invalid session key")
+        state_session = self.state.get_session(decoded_key)
+        if state_session is None:
+            if self.lifecycle.session_state(decoded_key) == "purged":
+                return _http_json_response({"purged": True, "already_purged": True})
+            return _http_error(404, "archived session not found")
+        if state_session.status != "archived":
+            return _http_error(409, "archive the session before permanent deletion")
+        if self.state.active_turn_id(decoded_key) is not None:
+            return _http_error(409, "session has an active turn; stop it before deletion")
+        automation_jobs = session_automation_jobs(self.cron_service, decoded_key)
+        if automation_jobs:
+            return _http_json_response(
+                {
+                    "purged": False,
+                    "blocked_by_automations": True,
+                    "automations": serialize_automation_jobs(automation_jobs),
+                },
+                status=409,
+            )
+        self.lifecycle.purge_session(
+            decoded_key,
+            session_id=state_session.id,
+            project_id=state_session.project_id,
+            title=state_session.title,
+        )
+        result = self._purge_session_data(decoded_key, state_session.id)
+        return _http_json_response(result)
+
+    def _purge_schedule_run_session(self, session_key: str) -> dict[str, Any]:
+        """Permanently delete one completed schedule run's conversation."""
+        normalized_key = session_key.strip()
+        if not normalized_key:
+            raise StateStoreError("run session key is required")
+        if self.session_manager is None:
+            raise StateStoreError("session manager unavailable")
+        if self.state.active_turn_id(normalized_key) is not None:
+            raise StateStoreError(
+                "run session has an active turn; stop it before deletion"
+            )
+        if session_automation_jobs(self.cron_service, normalized_key):
+            raise StateStoreError(
+                "run session has linked automations; delete them before deletion"
+            )
+
+        existing = self.state.get_session(normalized_key)
+        lifecycle_entry = self.lifecycle.session(normalized_key)
+        session_id = existing.id if existing is not None else None
+        if session_id is None and lifecycle_entry is not None:
+            recorded_session_id = lifecycle_entry.metadata.get("session_id")
+            if isinstance(recorded_session_id, str) and recorded_session_id:
+                session_id = recorded_session_id
+
+        metadata: dict[str, Any] = (
+            dict(lifecycle_entry.metadata) if lifecycle_entry is not None else {}
+        )
+        if existing is not None:
+            metadata.update(
+                session_id=existing.id,
+                project_id=existing.project_id,
+                title=existing.title,
+            )
+        elif session_id is not None:
+            metadata["session_id"] = session_id
+        metadata["cleanup_completed"] = False
+
+        # Write the durable tombstone first. If the process exits during the
+        # physical cleanup, gateway startup will retry _purge_session_data.
+        self.lifecycle.purge_session(normalized_key, **metadata)
+        return self._purge_session_data(normalized_key, session_id)
+
+    def _purge_session_data(
+        self,
+        session_key: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Finish a tombstoned permanent deletion; safe to retry after a crash."""
+        existing = self.state.get_session(session_key)
+        resolved_session_id = session_id or (existing.id if existing is not None else None)
+        projection: dict[str, Any] = {"purged": True, "session_key": session_key}
+        if existing is not None:
+            if existing.status != "archived":
+                self.state.archive_session(session_key)
+            projection = self.state.purge_session(session_key)
+
+        cleanup_errors: list[str] = []
+        removed = {
+            "session_journal": False,
+            "webui_transcript": False,
+            "canonical_events": False,
+        }
+        try:
+            if self.session_manager is not None:
+                removed["session_journal"] = self.session_manager.delete_session(session_key)
+        except OSError as exc:
+            cleanup_errors.append(f"session_journal:{type(exc).__name__}")
+        try:
+            removed["webui_transcript"] = delete_webui_thread(session_key)
+        except OSError as exc:
+            cleanup_errors.append(f"webui_transcript:{type(exc).__name__}")
+        try:
+            removed["canonical_events"] = self.session_event_files.delete(session_key)
+        except OSError as exc:
+            cleanup_errors.append(f"canonical_events:{type(exc).__name__}")
+        if resolved_session_id:
+            try:
+                self.traces.delete_session(resolved_session_id)
+            except (OSError, sqlite3.Error):
+                cleanup_errors.append("traces:cleanup_failed")
+            try:
+                self.logs.delete_session(resolved_session_id)
+            except (OSError, sqlite3.Error):
+                cleanup_errors.append("logs:cleanup_failed")
+
+        entry = self.lifecycle.session(session_key)
+        metadata = dict(entry.metadata) if entry is not None else {}
+        if resolved_session_id:
+            metadata["session_id"] = resolved_session_id
+        metadata["cleanup_completed"] = not cleanup_errors
+        self.lifecycle.purge_session(session_key, **metadata)
+        return {
+            **projection,
+            "purged": True,
+            "removed": removed,
+            "cleanup_pending": bool(cleanup_errors),
+            "cleanup_errors": cleanup_errors,
+        }
+
+    def reconcile_purged_lifecycle(self) -> None:
+        """Complete interrupted purges before disk-backed sessions are listed."""
+        if self.session_manager is None:
+            return
+        for entry in self.lifecycle.session_entries():
+            if entry.state != "purged" or entry.metadata.get("cleanup_completed") is True:
+                continue
+            session_id = entry.metadata.get("session_id")
+            self._purge_session_data(
+                entry.key,
+                str(session_id) if isinstance(session_id, str) else None,
+            )
+
+        project_entries = [
+            entry
+            for entry in self.lifecycle.project_entries()
+            if entry.state == "purged"
+            and entry.metadata.get("cleanup_completed") is not True
+        ]
+        if not project_entries:
+            return
+
+        # If a crash happened immediately after the project tombstone, session
+        # tombstones may not yet exist. Resolve their durable workspace scope
+        # from metadata before removing the residual journals.
+        for row in list_webui_sessions(self.session_manager):
+            session_key = row.get("key")
+            if not isinstance(session_key, str):
+                continue
+            metadata_data = self.session_manager.read_session_metadata(session_key)
+            metadata = (
+                metadata_data.get("metadata")
+                if isinstance(metadata_data, dict)
+                else None
+            )
+            scope = self.workspaces.scope_for_session_metadata(
+                metadata if isinstance(metadata, dict) else None,
+            )
+            project_entry = self.lifecycle.project_for_path(scope.project_path)
+            if project_entry is None or project_entry.state != "purged":
+                continue
+            state_session = self.state.get_session(session_key)
+            session_id = state_session.id if state_session is not None else None
+            self.lifecycle.purge_session(
+                session_key,
+                session_id=session_id,
+                project_id=project_entry.key,
+                cleanup_completed=False,
+            )
+            self._purge_session_data(session_key, session_id)
+
+        for entry in project_entries:
+            project = self._state_project_for_lifecycle(entry)
+            if project is not None:
+                for session in self.state.list_project_sessions(
+                    project.id,
+                    include_archived=True,
+                ):
+                    self.lifecycle.purge_session(
+                        session.session_key,
+                        session_id=session.id,
+                        project_id=project.id,
+                        cleanup_completed=False,
+                    )
+                    self._purge_session_data(session.session_key, session.id)
+                if project.status != "archived":
+                    try:
+                        self.state.archive_project(project.id)
+                    except StateStoreError:
+                        continue
+                self.state.purge_project(project.id)
+            metadata = dict(entry.metadata)
+            metadata["cleanup_completed"] = True
+            self.lifecycle.purge_project(entry.key, **metadata)
+
+    def reconcile_archived_lifecycle(self) -> None:
+        """Reapply durable archive intent after a projection rebuild.
+
+        ``state.sqlite`` is only a query projection.  The lifecycle journal is
+        authoritative, so an active row recovered from a disk-backed session
+        must never make an archived workspace or conversation visible again.
+        """
+        for entry in self.lifecycle.project_entries():
+            if entry.state != "archived":
+                continue
+            project = self._state_project_for_lifecycle(entry)
+            if project is None or project.status == "archived":
+                continue
+            try:
+                self.state.archive_project(project.id)
+            except StateStoreError as exc:
+                self._log.warning(
+                    "could not reapply archived project lifecycle project={} error={}",
+                    project.id,
+                    exc,
+                )
+
+        for entry in self.lifecycle.session_entries():
+            if entry.state != "archived":
+                continue
+            session = self.state.get_session(entry.key)
+            if session is None or session.status == "archived":
+                continue
+            try:
+                self.state.archive_session(entry.key)
+            except StateStoreError as exc:
+                self._log.warning(
+                    "could not reapply archived session lifecycle session={} error={}",
+                    entry.key,
+                    exc,
+                )
 
     # -- Automation routes --------------------------------------------------
 
@@ -1658,12 +2220,17 @@ class GatewayHTTPHandler:
             return await self._handle_sessions_list(request)
         if got == "/api/projects":
             return await self._handle_projects_list(request)
+        if got == "/api/data-management/archives":
+            return await self._handle_data_management_archives(request)
         m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/archive$", got)
         if m:
             return await self._handle_project_archive(request, m.group(1))
         m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/restore$", got)
         if m:
             return await self._handle_project_restore(request, m.group(1))
+        m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/purge$", got)
+        if m:
+            return await self._handle_project_purge(request, m.group(1))
         m = re.match(r"^/api/projects/([A-Za-z0-9_-]+)/relocate$", got)
         if m:
             return await self._handle_project_relocate(request, m.group(1))
@@ -1799,6 +2366,11 @@ class GatewayHTTPHandler:
                     include_archived=True,
                 )
             }
+            projected_keys.update(
+                entry.key
+                for entry in self.lifecycle.session_entries()
+                if entry.state == "purged"
+            )
             has_unprojected = any(
                 isinstance(row.get("key"), str)
                 and (
@@ -1810,28 +2382,159 @@ class GatewayHTTPHandler:
             )
             if has_unprojected:
                 await asyncio.to_thread(self._sessions_list_payload)
+        await asyncio.to_thread(self.reconcile_archived_lifecycle)
         query = _parse_query(request.path)
         include_archived = _query_first(query, "include_archived") in {"1", "true", "yes"}
         projects = await asyncio.to_thread(
             self.state.list_projects,
             include_archived=include_archived,
         )
+        rows: list[dict[str, Any]] = []
+        for project in projects:
+            lifecycle = self._project_lifecycle_entry(project)
+            if lifecycle is not None and lifecycle.state == "purged":
+                continue
+            effective_status = (
+                "archived"
+                if lifecycle is not None and lifecycle.state == "archived"
+                else project.status
+            )
+            if effective_status == "archived" and not include_archived:
+                continue
+            rows.append({
+                **self._project_payload(project),
+                "status": effective_status,
+            })
         return _http_json_response(
-            {
-                "projects": [
-                    {
-                        "id": project.id,
-                        "kind": project.kind,
-                        "name": project.name,
-                        "root_path": project.root_path,
-                        "status": project.status,
-                        "created_at": project.created_at,
-                        "updated_at": project.updated_at,
-                    }
-                    for project in projects
-                ]
-            }
+            {"projects": rows}
         )
+
+    async def _handle_data_management_archives(
+        self,
+        request: WsRequest,
+    ) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self.session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        session_payload = await asyncio.to_thread(
+            self._sessions_list_payload,
+            include_archived=True,
+        )
+        projects = await asyncio.to_thread(
+            self.state.list_projects,
+            include_archived=True,
+        )
+        archived_projects = {
+            project.id: project
+            for project in projects
+            if project.status == "archived"
+            and (
+                (lifecycle := self._project_lifecycle_entry(project)) is None
+                or lifecycle.state != "purged"
+            )
+        }
+        archived_project_rows = []
+        for project in archived_projects.values():
+            sessions = await asyncio.to_thread(
+                self.state.list_project_sessions,
+                project.id,
+                include_archived=True,
+            )
+            lifecycle = self._project_lifecycle_entry(project)
+            archived_project_rows.append({
+                **self._project_payload(project),
+                "archived_at": (
+                    lifecycle.updated_at if lifecycle is not None else project.updated_at
+                ),
+                "session_count": len(sessions),
+                "files_deleted": False,
+            })
+
+        represented_paths = {
+            os.path.normcase(os.path.normpath(project.canonical_root_path))
+            for project in archived_projects.values()
+        }
+        for lifecycle in self.lifecycle.project_entries():
+            if lifecycle.state != "archived":
+                continue
+            raw_root = lifecycle.metadata.get("canonical_root_path")
+            if not isinstance(raw_root, str) or not raw_root:
+                raw_root = lifecycle.metadata.get("root_path")
+            if not isinstance(raw_root, str) or not raw_root:
+                continue
+            canonical_root = os.path.normcase(os.path.normpath(str(
+                Path(raw_root).expanduser().resolve(strict=False)
+            )))
+            if canonical_root in represented_paths:
+                continue
+            display_root = str(lifecycle.metadata.get("root_path") or raw_root)
+            display_name = str(
+                lifecycle.metadata.get("name")
+                or Path(display_root).name
+                or display_root
+            )
+            archived_project_rows.append({
+                "id": lifecycle.key,
+                "kind": str(lifecycle.metadata.get("kind") or "workspace"),
+                "name": display_name,
+                "root_path": display_root,
+                "status": "archived",
+                "created_at": lifecycle.updated_at,
+                "updated_at": lifecycle.updated_at,
+                "archived_at": lifecycle.updated_at,
+                "session_count": sum(
+                    1
+                    for entry in self.lifecycle.session_entries()
+                    if entry.state == "archived"
+                    and entry.metadata.get("project_id") == lifecycle.key
+                ),
+                "files_deleted": False,
+            })
+            represented_paths.add(canonical_root)
+
+        project_by_id = {project.id: project for project in projects}
+        archived_session_rows = []
+        for row in session_payload.get("sessions", []):
+            if row.get("status") != "archived":
+                continue
+            project_id = str(row.get("project_id") or "")
+            if project_id in archived_projects:
+                continue
+            session_key = str(row.get("key") or "")
+            if self.lifecycle.session_state(session_key) == "purged":
+                continue
+            project = project_by_id.get(project_id)
+            lifecycle = self.lifecycle.session(session_key)
+            archived_session_rows.append({
+                "session_key": session_key,
+                "session_id": row.get("session_id"),
+                "project_id": project_id,
+                "title": str(row.get("title") or row.get("preview") or ""),
+                "preview": str(row.get("preview") or ""),
+                "project_name": project.name if project is not None else "",
+                "project_root": project.root_path if project is not None else "",
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "archived_at": (
+                    lifecycle.updated_at
+                    if lifecycle is not None
+                    else int((project.updated_at if project is not None else 0))
+                ),
+            })
+        archived_session_rows.sort(
+            key=lambda row: int(row.get("archived_at") or 0),
+            reverse=True,
+        )
+        archived_project_rows.sort(
+            key=lambda row: int(row.get("archived_at") or 0),
+            reverse=True,
+        )
+        return _http_json_response({
+            "schema_version": 1,
+            "archived_sessions": archived_session_rows,
+            "archived_projects": archived_project_rows,
+        })
 
     @staticmethod
     def _project_payload(project: Any) -> dict[str, Any]:
@@ -1844,6 +2547,34 @@ class GatewayHTTPHandler:
             "created_at": project.created_at,
             "updated_at": project.updated_at,
         }
+
+    def _project_lifecycle_entry(self, project: Any) -> Any:
+        return (
+            self.lifecycle.project(project.id)
+            or self.lifecycle.project_for_path(project.canonical_root_path)
+        )
+
+    def _state_project_for_lifecycle(self, lifecycle: Any) -> Any:
+        project = self.state.get_project(lifecycle.key)
+        if project is not None:
+            return project
+        recorded_path = lifecycle.metadata.get("canonical_root_path")
+        if not isinstance(recorded_path, str) or not recorded_path:
+            recorded_path = lifecycle.metadata.get("root_path")
+        if not isinstance(recorded_path, str) or not recorded_path:
+            return None
+        canonical = os.path.normcase(os.path.normpath(str(
+            Path(recorded_path).expanduser().resolve(strict=False)
+        )))
+        return next(
+            (
+                candidate
+                for candidate in self.state.list_projects(include_archived=True)
+                if os.path.normcase(os.path.normpath(candidate.canonical_root_path))
+                == canonical
+            ),
+            None,
+        )
 
     def _require_project_mutation(self, request: WsRequest) -> Response | None:
         if not self.check_api_token(request):
@@ -1873,6 +2604,15 @@ class GatewayHTTPHandler:
                     409,
                     "project has active schedules; pause them before archiving",
                 )
+        existing = self.state.get_project(project_id)
+        if existing is None:
+            return _http_error(404, "project not found")
+        self.lifecycle.archive_project(
+            project_id,
+            canonical_root_path=existing.canonical_root_path,
+            root_path=existing.root_path,
+            name=existing.name,
+        )
         try:
             project = await asyncio.to_thread(self.state.archive_project, project_id)
         except StateStoreError as exc:
@@ -1895,12 +2635,140 @@ class GatewayHTTPHandler:
     ) -> Response:
         if error := self._require_project_mutation(request):
             return error
+        project = self.state.get_project(project_id)
+        lifecycle = (
+            self._project_lifecycle_entry(project)
+            if project is not None
+            else self.lifecycle.project(project_id)
+        )
+        if lifecycle is not None and lifecycle.state == "purged":
+            return _http_error(410, "workspace was permanently deleted")
         try:
-            project = await asyncio.to_thread(self.state.restore_project, project_id)
+            if project is None:
+                if lifecycle is None or lifecycle.state != "archived":
+                    return _http_error(404, "archived project not found")
+                project = await asyncio.to_thread(
+                    self._state_project_for_lifecycle,
+                    lifecycle,
+                )
+                if project is None:
+                    root_path = lifecycle.metadata.get("root_path")
+                    if not isinstance(root_path, str) or not root_path:
+                        root_path = lifecycle.metadata.get("canonical_root_path")
+                    if not isinstance(root_path, str) or not root_path:
+                        return _http_error(409, "archived workspace path is unavailable")
+                    project = await asyncio.to_thread(
+                        self.state.ensure_project,
+                        root_path,
+                        name=str(lifecycle.metadata.get("name") or "") or None,
+                    )
+                if project.status != "archived" and project.kind != "inbox":
+                    await asyncio.to_thread(self.state.archive_project, project.id)
+            project = await asyncio.to_thread(self.state.restore_project, project.id)
         except StateStoreError as exc:
             status = 404 if str(exc) == "project not found" else 409
             return _http_error(status, str(exc))
+        lifecycle_keys = {project_id, project.id}
+        if lifecycle is not None:
+            lifecycle_keys.add(lifecycle.key)
+        for lifecycle_key in lifecycle_keys:
+            self.lifecycle.restore_project(
+                lifecycle_key,
+                canonical_root_path=project.canonical_root_path,
+            )
+        # Sessions archived individually before the workspace was removed must
+        # stay archived when the workspace registration is restored.
+        for session in await asyncio.to_thread(
+            self.state.list_project_sessions,
+            project.id,
+            include_archived=True,
+        ):
+            if self.lifecycle.session_state(session.session_key) == "archived":
+                await asyncio.to_thread(self.state.archive_session, session.session_key)
         return _http_json_response({"project": self._project_payload(project)})
+
+    async def _handle_project_purge(
+        self,
+        request: WsRequest,
+        project_id: str,
+    ) -> Response:
+        if error := self._require_project_mutation(request):
+            return error
+        project = self.state.get_project(project_id)
+        if project is None:
+            lifecycle = self.lifecycle.project(project_id)
+            if lifecycle is not None and lifecycle.state == "purged":
+                return _http_json_response({"purged": True, "already_purged": True})
+            if lifecycle is None or lifecycle.state != "archived":
+                return _http_error(404, "archived project not found")
+            project = await asyncio.to_thread(
+                self._state_project_for_lifecycle,
+                lifecycle,
+            )
+            if project is None:
+                metadata = dict(lifecycle.metadata)
+                metadata["cleanup_completed"] = False
+                self.lifecycle.purge_project(project_id, **metadata)
+                await asyncio.to_thread(self.reconcile_purged_lifecycle)
+                return _http_json_response({"purged": True, "files_deleted": False})
+        project_lifecycle = self._project_lifecycle_entry(project)
+        if project.status != "archived" and not (
+            project_lifecycle is not None
+            and project_lifecycle.state == "archived"
+        ):
+            return _http_error(409, "archive the workspace before permanent deletion")
+        if project.status != "archived":
+            try:
+                project = await asyncio.to_thread(self.state.archive_project, project.id)
+            except StateStoreError as exc:
+                return _http_error(409, str(exc))
+        sessions = await asyncio.to_thread(
+            self.state.list_project_sessions,
+            project_id,
+            include_archived=True,
+        )
+        for session in sessions:
+            if session_automation_jobs(self.cron_service, session.session_key):
+                return _http_error(
+                    409,
+                    "workspace has linked automations; delete them before permanent deletion",
+                )
+            if self.state.active_turn_id(session.session_key) is not None:
+                return _http_error(409, "workspace has an active task")
+
+        lifecycle_keys = {project_id, project.id}
+        if project_lifecycle is not None:
+            lifecycle_keys.add(project_lifecycle.key)
+        for lifecycle_key in lifecycle_keys:
+            self.lifecycle.purge_project(
+                lifecycle_key,
+                canonical_root_path=project.canonical_root_path,
+                root_path=project.root_path,
+                name=project.name,
+                cleanup_completed=False,
+            )
+        for session in sessions:
+            self.lifecycle.purge_session(
+                session.session_key,
+                session_id=session.id,
+                project_id=project.id,
+                cleanup_completed=False,
+            )
+            await asyncio.to_thread(
+                self._purge_session_data,
+                session.session_key,
+                session.id,
+            )
+        result = await asyncio.to_thread(self.state.purge_project, project.id)
+        for lifecycle_key in lifecycle_keys:
+            self.lifecycle.purge_project(
+                lifecycle_key,
+                canonical_root_path=project.canonical_root_path,
+                root_path=project.root_path,
+                name=project.name,
+                cleanup_completed=True,
+            )
+        return _http_json_response({**result, "files_deleted": False})
 
     async def _handle_project_relocate(
         self,
@@ -2010,9 +2878,14 @@ class GatewayHTTPHandler:
             return _http_error(401, "Unauthorized")
         if self.state.get_project(project_id) is None:
             return _http_error(404, "project not found")
+        include_archived = _query_first(
+            _parse_query(request.path),
+            "include_archived",
+        ) in {"1", "true", "yes"}
         sessions = await asyncio.to_thread(
             self.state.list_project_sessions,
             project_id,
+            include_archived=include_archived,
         )
         return _http_json_response(
             {

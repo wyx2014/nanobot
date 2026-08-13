@@ -383,6 +383,7 @@ class AssetResearchWorkflowRuntime:
             resume_from=resume_from,
             supplemental_artifacts=supplemental_artifacts or [],
         )
+        state["target"] = target
         await self._publish_state(
             state,
             "resume_started" if resume_from is not None else "run_started",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -87,6 +88,48 @@ async def test_state_run_routes_asset_team_to_runtime_graph_not_general_agent(tm
     assert ctx.final_content == "graph delivered"
     assert ctx.stop_reason == "completed"
     assert ctx.turn_usage == {"total_tokens": 7}
+
+
+@pytest.mark.asyncio
+async def test_state_run_scopes_brand_new_webui_greeting_to_no_tools(tmp_path):
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.bus.events import InboundMessage
+
+    loop = _make_loop(tmp_path)
+    loop._run_agent_loop = AsyncMock(return_value=(
+        "你好！",
+        [],
+        [{"role": "assistant", "content": "你好！"}],
+        "completed",
+        False,
+    ))
+    runtime_events = MagicMock()
+    runtime_events.run_status_changed = AsyncMock()
+    loop._runtime_events = MagicMock(return_value=runtime_events)
+    session = MagicMock()
+    session.metadata = {}
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="chat-greeting",
+        content="你好晚上好 今天心情如何",
+        metadata={"webui": True},
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session_key="websocket:chat-greeting",
+        state=TurnState.RUN,
+        turn_id="turn-greeting",
+        session=session,
+        history=[],
+    )
+
+    event = await loop._state_run(ctx)
+
+    assert event == "ok"
+    passed_tools = loop._run_agent_loop.await_args.kwargs["tools"]
+    assert isinstance(passed_tools, ToolRegistry)
+    assert passed_tools.tool_names == []
 
 
 @pytest.mark.asyncio
@@ -175,6 +218,218 @@ async def test_asset_workflow_applies_strict_policy_only_to_report_audit(
     assert "finalize_on_max_iterations" not in kwargs
     assert "write_file" in kwargs["tools"].tool_names
     assert "edit_file" not in kwargs["tools"].tool_names
+
+
+@pytest.mark.asyncio
+async def test_supply_chain_workflow_fallback_writer_creates_html_artifact(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
+    from nanobot.bus.events import InboundMessage
+    from nanobot.graph.workflows.supply_chain_bottleneck_runtime import (
+        SupplyChainBottleneckWorkflowOutcome,
+    )
+    from nanobot.session.manager import Session
+
+    loop = _make_loop(tmp_path)
+    tools = ToolRegistry()
+    tools.register(ReadFileTool(workspace=tmp_path))
+    tools.register(WriteFileTool(workspace=tmp_path))
+    loop.tools = tools
+
+    captured: dict[str, Any] = {}
+
+    class FallbackOnlyRuntime:
+        def __init__(self, *, write_report, **_kwargs) -> None:
+            captured["write_report"] = write_report
+
+        async def run(self, **_kwargs) -> SupplyChainBottleneckWorkflowOutcome:
+            artifacts = await captured["write_report"](
+                "reports/bottleneck-map/test.md",
+                "# AI硬件供应链瓶颈地图\n\n## 结论\n\n测试正文。",
+            )
+            captured["artifacts"] = artifacts
+            return SupplyChainBottleneckWorkflowOutcome(
+                final_content="done",
+                stop_reason="completed",
+                graph_state={},
+                tools_used=["write_file"],
+                usage={},
+                artifacts=artifacts,
+            )
+
+    monkeypatch.setattr(
+        "nanobot.agent.loop.SupplyChainBottleneckWorkflowRuntime",
+        FallbackOnlyRuntime,
+    )
+    session = Session(key="websocket:bottleneck", metadata={})
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="bottleneck",
+        content="研究 AI 硬件供应链",
+        metadata={
+            "expert_team": {
+                "id": "supply-chain-bottleneck-team",
+                "mcp_presets": [],
+            },
+            "expert_team_run_id": "run-bottleneck",
+            "_expert_team_turn_route": {
+                "action": "run",
+                "target": "AI硬件",
+                "team_id": "supply-chain-bottleneck-team",
+            },
+        },
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session_key=session.key,
+        state=TurnState.RUN,
+        turn_id="turn-bottleneck",
+        session=session,
+        initial_messages=[{"role": "system", "content": "system"}],
+        tools=tools,
+    )
+
+    await loop._run_supply_chain_bottleneck_workflow(ctx)
+
+    assert len(captured["artifacts"]) == 1
+    html_path = captured["artifacts"][0]
+    assert html_path.endswith("test.html")
+    assert "Generated from Markdown by TPACowork" in Path(html_path).read_text(
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_asset_workflow_keeps_configured_financial_mcp_tools_for_graph_nodes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.bus.events import InboundMessage
+    from nanobot.graph.workflows.asset_research import DATA_PACKAGE, REPORT_AUDIT, TEAM_LEAD
+    from nanobot.graph.workflows.asset_research_runtime import AssetResearchWorkflowOutcome
+    from nanobot.session.manager import Session
+
+    loop = _make_loop(tmp_path)
+    tools = ToolRegistry()
+    financial_tools = {
+        "mcp_hexin-ifind-ds-stock-mcp_quote",
+        "mcp_juyuan_company_financials",
+        "mcp_caihui_mcp_company_financials",
+        "mcp_anysearch_search",
+    }
+    for name in {
+        "web_search",
+        "web_fetch",
+        "read_file",
+        "write_file",
+        *financial_tools,
+        "mcp_playwright_browser_snapshot",
+    }:
+        tool = MagicMock()
+        tool.name = name
+        tools.register(tool)
+    loop.tools = tools
+    loop._run_agent_loop = AsyncMock(return_value=(
+        "node complete",
+        [],
+        [],
+        "completed",
+        False,
+    ))
+
+    class CaptureGraphNodesRuntime:
+        def __init__(self, *, run_agent_node, **_kwargs) -> None:
+            self._run_agent_node = run_agent_node
+
+        async def run(self, **_kwargs) -> AssetResearchWorkflowOutcome:
+            await self._run_agent_node(DATA_PACKAGE, "data", False)
+            await self._run_agent_node(TEAM_LEAD, "lead", False)
+            await self._run_agent_node(REPORT_AUDIT, "audit", True)
+            return AssetResearchWorkflowOutcome(
+                final_content="done",
+                stop_reason="completed",
+                graph_state={},
+                tools_used=[],
+                usage={},
+                artifacts=[],
+            )
+
+    monkeypatch.setattr(
+        "nanobot.agent.loop.AssetResearchWorkflowRuntime",
+        CaptureGraphNodesRuntime,
+    )
+    team = {
+        "id": "asset-research-team",
+        "mcp_presets": [
+            {"name": "hexin-ifind-ds-stock-mcp", "configured": True},
+            {"name": "juyuan", "configured": True},
+            {"name": "caihui_mcp", "configured": True},
+            {"name": "anysearch", "configured": True},
+        ],
+    }
+    session = Session(key="websocket:finance", metadata={})
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="finance",
+        content="分析长江电力",
+        metadata={
+            "webui": True,
+            "expert_team": team,
+            "expert_team_run_id": "run-finance",
+            "_expert_team_turn_route": {
+                "action": "run",
+                "target": "长江电力",
+            },
+        },
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session_key=session.key,
+        state=TurnState.RUN,
+        turn_id="turn-finance",
+        session=session,
+        initial_messages=[{"role": "system", "content": "system"}],
+    )
+
+    await loop._run_asset_research_workflow(ctx)
+
+    assert loop._run_agent_loop.await_count == 3
+    for call in loop._run_agent_loop.await_args_list:
+        node_tools = set(call.kwargs["tools"].tool_names)
+        assert financial_tools.issubset(node_tools)
+        assert "mcp_playwright_browser_snapshot" not in node_tools
+
+
+@pytest.mark.asyncio
+async def test_run_agent_loop_respects_an_explicit_empty_tool_registry(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="你好！", tool_calls=[])
+    )
+    fallback_tool = MagicMock()
+    fallback_tool.name = "my"
+    fallback_tool.to_schema.return_value = {
+        "type": "function",
+        "function": {"name": "my", "description": "state", "parameters": {}},
+    }
+    loop.tools.register(fallback_tool)
+
+    final_content, _, _, _, _ = await loop._run_agent_loop(
+        [{"role": "user", "content": "你好"}],
+        channel="websocket",
+        session_key="websocket:greeting",
+        metadata={"webui": True},
+        tools=ToolRegistry(),
+    )
+
+    assert final_content == "你好！"
+    assert loop.provider.chat_with_retry.await_args.kwargs["tools"] == []
 
 
 @pytest.mark.asyncio

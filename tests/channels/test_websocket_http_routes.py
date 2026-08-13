@@ -17,10 +17,12 @@ from urllib.parse import quote, urlencode
 
 import httpx
 import pytest
+from websockets.datastructures import Headers
+from websockets.http11 import Request
 
 from nanobot.channels.websocket import WebSocketChannel, WebSocketConfig
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+from nanobot.cron.types import CronJob, CronPayload, CronRunRecord, CronSchedule
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 from nanobot.session.manager import Session, SessionManager
 from nanobot.storage.journal import SessionEventJournal
@@ -175,6 +177,213 @@ def test_session_listing_does_not_eagerly_replay_event_journals(
     gateway.journal.ensure_recovered.assert_not_called()
 
 
+def test_archived_session_does_not_resurrect_after_state_database_rebuild(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    sm = _seed_session(tmp_path, key="websocket:durable-archive")
+    first = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+    first.http._sessions_list_payload()
+    state_session = first.state.get_session("websocket:durable-archive")
+    assert state_session is not None
+    first.lifecycle.archive_session(
+        state_session.session_key,
+        session_id=state_session.id,
+        project_id=state_session.project_id,
+    )
+    first.state.archive_session(state_session.session_key)
+    first.state.checkpoint()
+    first.state.path.write_bytes(b"not-a-sqlite-database")
+
+    rebuilt = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+
+    assert rebuilt.state.quick_check() is True
+    assert rebuilt.http._sessions_list_payload()["sessions"] == []
+    recovered = rebuilt.state.get_session("websocket:durable-archive")
+    assert recovered is not None
+    assert recovered.status == "archived"
+    archived_rows = rebuilt.http._sessions_list_payload(include_archived=True)["sessions"]
+    assert [row["key"] for row in archived_rows] == ["websocket:durable-archive"]
+
+
+def test_archived_project_does_not_resurrect_after_state_database_rebuild(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "removed-workspace"
+    project_path.mkdir()
+    sm = SessionManager(tmp_path)
+    session = Session(
+        key="websocket:archived-project-chat",
+        metadata={
+            "title": "Archived project chat",
+            "workspace_scope": {"project_path": str(project_path)},
+        },
+    )
+    session.add_message("user", "remember this without showing the workspace")
+    sm.save(session)
+    first = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+    first.http._sessions_list_payload()
+    state_session = first.state.get_session("websocket:archived-project-chat")
+    assert state_session is not None
+    project = first.state.get_project(state_session.project_id)
+    assert project is not None
+    first.lifecycle.archive_project(
+        project.id,
+        name=project.name,
+        root_path=project.root_path,
+        canonical_root_path=project.canonical_root_path,
+    )
+    first.state.archive_project(project.id)
+    project_path.rmdir()
+    first.state.checkpoint()
+    first.state.path.write_bytes(b"not-a-sqlite-database")
+
+    rebuilt = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+
+    assert rebuilt.state.quick_check() is True
+    assert rebuilt.http._sessions_list_payload()["sessions"] == []
+    recovered_session = rebuilt.state.get_session("websocket:archived-project-chat")
+    assert recovered_session is not None
+    recovered_project = rebuilt.state.get_project(recovered_session.project_id)
+    assert recovered_project is not None
+    assert recovered_project.id == project.id
+    assert recovered_project.canonical_root_path == str(project_path.resolve())
+    assert recovered_project.status == "archived"
+    assert [
+        row["key"]
+        for row in rebuilt.http._sessions_list_payload(include_archived=True)["sessions"]
+    ] == ["websocket:archived-project-chat"]
+
+
+def test_misbound_session_projection_is_quarantined_and_rebuilt(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "durable-project"
+    project_path.mkdir()
+    durable_project_id = f"prj_{'a' * 32}"
+    key = "websocket:misbound-project-chat"
+    sm = SessionManager(tmp_path)
+    session = Session(
+        key=key,
+        metadata={
+            "title": "Durable project chat",
+            "project_id": durable_project_id,
+            "workspace_scope": {"project_path": str(project_path)},
+        },
+    )
+    session.add_message("user", "keep me with the durable project")
+    sm.save(session)
+
+    first = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+    first.http._sessions_list_payload()
+    projected = first.state.get_session(key)
+    assert projected is not None
+    assert projected.project_id == durable_project_id
+
+    inbox = first.state.ensure_project(tmp_path, kind="inbox")
+    first.state.bind_session(
+        key,
+        inbox.id,
+        title="Wrong inbox binding",
+        metadata=session.metadata,
+        allow_draft_rebind=True,
+    )
+    first.state.checkpoint()
+
+    rebuilt = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+
+    recovered = rebuilt.state.get_session(key)
+    assert recovered is not None
+    assert recovered.project_id == durable_project_id
+    recovered_project = rebuilt.state.get_project(recovered.project_id)
+    assert recovered_project is not None
+    assert recovered_project.canonical_root_path == str(project_path.resolve())
+    recovery_dirs = list(
+        (tmp_path / ".nanobot" / "recovery").glob("projection-bindings-*")
+    )
+    assert len(recovery_dirs) == 1
+    assert (recovery_dirs[0] / "state.sqlite").is_file()
+
+
+def test_matching_project_identity_allows_projection_relocation(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "original-project"
+    relocated_path = tmp_path / "relocated-project"
+    project_path.mkdir()
+    relocated_path.mkdir()
+    durable_project_id = f"prj_{'b' * 32}"
+    key = "websocket:relocated-project-chat"
+    sm = SessionManager(tmp_path)
+    session = Session(
+        key=key,
+        metadata={
+            "project_id": durable_project_id,
+            "workspace_scope": {"project_path": str(project_path)},
+        },
+    )
+    session.add_message("user", "follow an intentional project relocation")
+    sm.save(session)
+
+    first = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+    first.http._sessions_list_payload()
+    first.state.relocate_project(durable_project_id, relocated_path)
+    first.state.checkpoint()
+
+    reopened = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+
+    project = reopened.state.get_project(durable_project_id)
+    assert project is not None
+    assert project.canonical_root_path == str(relocated_path.resolve())
+    recovery_root = tmp_path / ".nanobot" / "recovery"
+    assert not recovery_root.exists() or not list(
+        recovery_root.glob("projection-bindings-*")
+    )
+
+
 def test_session_listing_uses_metadata_only_after_sqlite_projection(
     bus: MagicMock,
     tmp_path: Path,
@@ -244,6 +453,32 @@ def test_session_listing_merges_sqlite_session_missing_from_jsonl_index(
     assert row["workspace_scope"]["project_path"] == str(tmp_path)
     assert row["session_id"] == state_session.id
     assert row["project_id"] == project.id
+
+
+def test_session_listing_hides_reasoning_title_from_sqlite_projection(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    key = "websocket:reasoning-title"
+    sm = _seed_session(tmp_path, key=key)
+    session = sm.get_or_create(key)
+    bad_title = "被截断的自动标题…"
+    session.metadata["title"] = bad_title
+    sm.save(session)
+    gateway = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+    )
+    project = gateway.state.ensure_project(tmp_path)
+    gateway.state.bind_session(key, project.id, title=bad_title)
+
+    payload = gateway.http._sessions_list_payload()
+
+    [row] = payload["sessions"]
+    assert row["title"] == "hi"
+    assert row["preview"] == "hi"
 
 
 @pytest.mark.asyncio
@@ -459,6 +694,14 @@ async def test_session_artifact_routes_list_and_serve_workspace_file(
     report = tmp_path / "reports" / "market.pdf"
     report.parent.mkdir()
     report.write_bytes(b"%PDF-session-artifact")
+    unrelated = tmp_path / "reports" / "another-session.pdf"
+    unrelated.write_bytes(b"%PDF-unrelated")
+    session = sm.get_or_create("websocket:artifact-chat")
+    session.add_message(
+        "tool",
+        json.dumps({"files": [{"path": str(report)}]}),
+    )
+    sm.save(session)
     channel = _ch(
         bus,
         session_manager=sm,
@@ -485,6 +728,25 @@ async def test_session_artifact_routes_list_and_serve_workspace_file(
         assert any(
             artifact["path"] == "reports/market.pdf"
             for artifact in thread.json()["artifacts"]
+        )
+        assert all(
+            artifact["path"] != "reports/another-session.pdf"
+            for artifact in thread.json()["artifacts"]
+        )
+        channel.gateway.state.register_artifact(
+            "websocket:artifact-chat",
+            unrelated,
+            relation_type="referenced",
+        )
+        repaired = await _http_get(
+            "http://127.0.0.1:29938/api/sessions/"
+            "websocket%3Aartifact-chat/thread",
+            headers=auth,
+        )
+        assert repaired.status_code == 200
+        assert all(
+            artifact["path"] != "reports/another-session.pdf"
+            for artifact in repaired.json()["artifacts"]
         )
         listing = await _http_get(
             "http://127.0.0.1:29938/api/sessions/"
@@ -1362,7 +1624,12 @@ async def test_session_delete_archives_and_can_restore_without_removing_files(
     from nanobot.webui.transcript import append_transcript_object
 
     append_transcript_object("websocket:doomed", {"event": "user", "chat_id": "doomed", "text": "x"})
-    channel = _ch(bus, session_manager=sm, port=29903)
+    channel = _ch(
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+        port=29903,
+    )
     server_task = asyncio.create_task(channel.start())
     await asyncio.sleep(0.3)
     try:
@@ -1394,9 +1661,116 @@ async def test_session_delete_archives_and_can_restore_without_removing_files(
         )
         assert restored.status_code == 200
         assert restored.json()["restored"] is True
+
+        archived = await _http_get(
+            "http://127.0.0.1:29903/api/sessions/websocket:doomed/archive",
+            headers=auth,
+        )
+        assert archived.status_code == 200
+        assert archived.json()["archived"] is True
+        managed = await _http_get(
+            "http://127.0.0.1:29903/api/data-management/archives",
+            headers=auth,
+        )
+        assert managed.status_code == 200
+        assert [row["session_key"] for row in managed.json()["archived_sessions"]] == [
+            "websocket:doomed"
+        ]
+        purged = await _http_get(
+            "http://127.0.0.1:29903/api/sessions/websocket:doomed/purge",
+            headers=auth,
+        )
+        assert purged.status_code == 200
+        assert purged.json()["purged"] is True
+        assert not path.exists()
+        assert not webui_path.exists()
+        assert channel.gateway.state.get_session("websocket:doomed") is None
+        assert channel.gateway.lifecycle.session_state("websocket:doomed") == "purged"
+
+        # Even a residual/recreated JSONL cannot reappear after a projection
+        # rebuild because the durable purge tombstone is authoritative.
+        stray = Session(key="websocket:doomed")
+        stray.add_message("user", "stray residual")
+        sm.save(stray)
+        still_hidden = await _http_get(
+            "http://127.0.0.1:29903/api/sessions",
+            headers=auth,
+        )
+        assert all(
+            row["key"] != "websocket:doomed"
+            for row in still_hidden.json()["sessions"]
+        )
     finally:
         await channel.stop()
         await server_task
+
+
+def test_schedule_run_delete_purges_conversation_but_preserves_workspace_files(
+    bus: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    session_key = "cron:task-1:run-1"
+    sm = _seed_session(tmp_path, key=session_key)
+    from nanobot.webui.transcript import append_transcript_object
+
+    append_transcript_object(
+        session_key,
+        {"event": "user", "chat_id": session_key, "text": "scheduled prompt"},
+    )
+    workspace_file = tmp_path / "scheduled-report.md"
+    workspace_file.write_text("keep this report", encoding="utf-8")
+
+    cron = CronService(tmp_path / "cron" / "jobs.json")
+    created = cron.add_job(
+        name="Scheduled report",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="Create a report",
+        channel="websocket",
+        to="direct",
+        session_key="websocket:source",
+    )
+    cron._running = True
+    store = cron._load_store()
+    job = next(item for item in store.jobs if item.id == created.id)
+    job.state.run_history.append(
+        CronRunRecord(
+            run_at_ms=123,
+            status="ok",
+            run_id="run-1",
+            session_key=session_key,
+        )
+    )
+    cron._save_store()
+
+    gateway = _make_handler(
+        {"enabled": True},
+        bus,
+        session_manager=sm,
+        workspace_path=tmp_path,
+        cron_service=cron,
+    )
+    listed = gateway.http._sessions_list_payload()
+    assert any(row["key"] == session_key for row in listed["sessions"])
+    session_path = sm._get_session_path(session_key)
+    webui_path = tmp_path / "webui" / f"{SessionManager.safe_key(session_key)}.jsonl"
+    assert session_path.is_file()
+    assert webui_path.is_file()
+
+    request = Request(
+        f"/api/schedule/runs/delete?task_id={job.id}&run_id=run-1",
+        Headers(),
+    )
+    response = gateway.http.schedule_routes._delete_run(request)
+
+    assert response.status_code == 200
+    assert cron.get_job(job.id).state.run_history == []
+    assert gateway.state.get_session(session_key) is None
+    assert gateway.lifecycle.session_state(session_key) == "purged"
+    assert not session_path.exists()
+    assert not webui_path.exists()
+    assert workspace_file.read_text(encoding="utf-8") == "keep this report"
 
 
 @pytest.mark.asyncio

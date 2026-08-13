@@ -65,6 +65,35 @@ async def test_process_direct_websocket_clears_run_status(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cron_websocket_runtime_events_target_the_child_session(tmp_path) -> None:
+    loop = _make_loop(tmp_path)
+    session_key = "cron:reminder-1:1723456789000:abcd1234"
+
+    response = await loop.process_direct(
+        "deliver reminder",
+        session_key=session_key,
+        channel="websocket",
+        chat_id=session_key,
+    )
+
+    assert response is not None
+    events = []
+    while loop.bus.outbound_size:
+        events.append(await loop.bus.consume_outbound())
+    runtime_events = [
+        event
+        for event in events
+        if event.metadata.get("_goal_status")
+        or event.metadata.get("_thread_runtime_status_changed")
+        or event.metadata.get("_turn_lifecycle_started")
+        or event.metadata.get("_turn_lifecycle_completed")
+        or event.metadata.get("_turn_end")
+    ]
+    assert runtime_events
+    assert {event.chat_id for event in runtime_events} == {session_key}
+
+
+@pytest.mark.asyncio
 async def test_process_direct_commits_final_answer_before_turn_terminal(tmp_path) -> None:
     loop = _make_loop(tmp_path)
     seen: list[object] = []

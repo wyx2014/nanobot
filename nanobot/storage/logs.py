@@ -217,6 +217,16 @@ class StructuredLogStore:
             connection.commit()
             return max(0, int(cursor.rowcount))
 
+    def delete_session(self, session_id: str) -> int:
+        """Remove diagnostic rows owned by a permanently deleted session."""
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM logs WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.commit()
+            return max(0, int(cursor.rowcount))
+
     @classmethod
     def _redact(cls, value: Any) -> Any:
         if isinstance(value, dict):

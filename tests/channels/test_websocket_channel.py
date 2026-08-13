@@ -774,6 +774,81 @@ async def test_asset_research_team_uses_model_route_for_bare_stock_name(
 
 
 @pytest.mark.asyncio
+async def test_supply_chain_team_uses_model_route_and_starts_fixed_graph(
+    bus: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member_ids = [
+        "trend-verifier",
+        "chain-mapper",
+        "bottleneck-validator",
+        "company-screener",
+        "counter-case-analyst",
+    ]
+    team = {
+        "id": "supply-chain-bottleneck-team",
+        "name": "资产投研团队 · 供应链瓶颈研究",
+        "members": [
+            {
+                "id": member_id,
+                "name": member_id,
+                "phase": "discovery" if index < 2 else "validation",
+            }
+            for index, member_id in enumerate(member_ids)
+        ],
+        "mcp_presets": [],
+    }
+    router = AsyncMock(return_value={
+        "action": "run",
+        "reason": "bounded physical supply-chain theme",
+        "target": "AI基础设施供应链",
+    })
+    monkeypatch.setattr(
+        "nanobot.channels.websocket.normalize_expert_team_binding",
+        lambda _raw: team,
+    )
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"},
+        bus,
+        gateway=_basic_handler(bus, expert_team_turn_router=router),
+    )
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "message",
+            "chat_id": "chat-bottleneck",
+            "content": "帮我寻找 AI 基础设施的供应链瓶颈",
+            "expert_team": {"id": "supply-chain-bottleneck-team"},
+            "webui": True,
+        },
+    )
+
+    router.assert_awaited_once_with(
+        history=[],
+        user_message="帮我寻找 AI 基础设施的供应链瓶颈",
+        awaiting_target=False,
+        has_media=False,
+        team_id="supply-chain-bottleneck-team",
+    )
+    msg = bus.publish_inbound.await_args.args[0]
+    assert msg.metadata["_expert_team_turn_route"] == {
+        "action": "run",
+        "reason": "bounded physical supply-chain theme",
+        "target": "AI基础设施供应链",
+        "team_id": "supply-chain-bottleneck-team",
+    }
+    run = channel._team_runs[("chat-bottleneck", msg.metadata["expert_team_run_id"])]
+    assert run["graph_state"]["workflow"] == "supply-chain-bottleneck"
+    assert run["graph_state"]["active_nodes"] == ["scope-brief"]
+    assert run["graph_state"]["target"] == "AI基础设施供应链"
+    assert run["stage"] == "scoping"
+
+
+@pytest.mark.asyncio
 async def test_asset_research_model_route_uses_semantics_instead_of_keywords(
     bus: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
