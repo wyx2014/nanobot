@@ -1466,6 +1466,16 @@ def _run_gateway(
         except Exception as e:
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
+    async def _run_provider_prewarm() -> None:
+        started_at = time.perf_counter()
+        logger.info("Desktop provider prewarm started")
+        ready = await prewarm_provider(agent.provider, agent.model)
+        logger.info(
+            "Desktop provider prewarm finished (ready={}, elapsed_ms={})",
+            ready,
+            round((time.perf_counter() - started_at) * 1000),
+        )
+
     async def run():
         shutdown_event = asyncio.Event()
         service_tasks: list[asyncio.Task[Any]] = []
@@ -1489,7 +1499,7 @@ def _run_gateway(
             _desktop_startup_phase("gateway-service-tasks-scheduled", startup_started_at)
             if provider_prewarm_enabled:
                 transient_tasks.append(asyncio.create_task(
-                    prewarm_provider(agent.provider, agent.model),
+                    _run_provider_prewarm(),
                     name="nanobot-provider-prewarm",
                 ))
             if health_server_enabled:

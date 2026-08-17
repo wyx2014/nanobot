@@ -1,3 +1,5 @@
+import asyncio
+import time
 from unittest.mock import patch, sentinel
 
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
@@ -59,3 +61,58 @@ async def test_openai_compat_provider_timeout_can_be_overridden_by_env(monkeypat
         await provider._ensure_client()
 
     assert mock_async_openai.call_args.kwargs["timeout"] == 45.0
+
+
+async def test_openai_compat_provider_initializes_client_off_event_loop(monkeypatch) -> None:
+    calls = []
+
+    async def fake_to_thread(function, *args, **kwargs):
+        calls.append(function)
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "nanobot.providers.openai_compat_provider.asyncio.to_thread",
+        fake_to_thread,
+    )
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(api_key="test-key", api_base="https://example.com/v1")
+        await provider._ensure_client()
+
+    assert calls == [provider._initialize_client_sync]
+
+
+async def test_slow_sdk_initialization_keeps_event_loop_responsive(monkeypatch) -> None:
+    provider = OpenAICompatProvider(api_key="test-key", api_base="https://example.com/v1")
+    client = object()
+
+    def slow_initialization() -> None:
+        time.sleep(0.1)
+        provider._client = client
+
+    monkeypatch.setattr(provider, "_initialize_client_sync", slow_initialization)
+    initialization = asyncio.create_task(provider._ensure_client())
+    await asyncio.sleep(0.01)
+
+    assert initialization.done() is False
+    assert await initialization is client
+
+
+async def test_timed_out_prewarm_reuses_inflight_sdk_initialization(monkeypatch) -> None:
+    provider = OpenAICompatProvider(api_key="test-key", api_base="https://example.com/v1")
+    client = object()
+    calls = 0
+
+    def slow_initialization() -> None:
+        nonlocal calls
+        calls += 1
+        time.sleep(0.05)
+        provider._client = client
+
+    monkeypatch.setattr(provider, "_initialize_client_sync", slow_initialization)
+    try:
+        await asyncio.wait_for(provider._ensure_client(), timeout=0.01)
+    except TimeoutError:
+        pass
+
+    assert await provider._ensure_client() is client
+    assert calls == 1

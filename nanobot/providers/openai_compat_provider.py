@@ -384,6 +384,7 @@ class OpenAICompatProvider(LLMProvider):
         # to create (~700 ms on Windows). Defer until first use.
         self._client: AsyncOpenAIType | None = None
         self._client_lock = asyncio.Lock()
+        self._client_init_task: asyncio.Task[None] | None = None
 
         # Responses API circuit breaker: skip after repeated failures,
         # probe again after _RESPONSES_PROBE_INTERVAL_S seconds.
@@ -430,6 +431,23 @@ class OpenAICompatProvider(LLMProvider):
             http_client=http_client,
         )
 
+    def _initialize_client_sync(self) -> None:
+        """Import the SDK and construct its client outside the event-loop thread."""
+        global AsyncOpenAI
+        if AsyncOpenAI is None:
+            if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse"):
+                from langfuse.openai import AsyncOpenAI as _AsyncOpenAI
+            else:
+                if os.environ.get("LANGFUSE_SECRET_KEY"):
+                    logger.warning(
+                        "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
+                        "install with `pip install langfuse` to enable tracing"
+                    )
+                from openai import AsyncOpenAI as _AsyncOpenAI
+            AsyncOpenAI = _AsyncOpenAI
+
+        self._build_client()
+
     async def _ensure_client(self):
         """Return the shared OpenAI client, creating it on first call."""
         if self._client is not None:
@@ -437,20 +455,29 @@ class OpenAICompatProvider(LLMProvider):
         async with self._client_lock:
             if self._client is not None:
                 return self._client
-            global AsyncOpenAI
-            if AsyncOpenAI is None:
-                if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse"):
-                    from langfuse.openai import AsyncOpenAI as _AsyncOpenAI
-                else:
-                    if os.environ.get("LANGFUSE_SECRET_KEY"):
-                        logger.warning(
-                            "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
-                            "install with `pip install langfuse` to enable tracing"
-                        )
-                    from openai import AsyncOpenAI as _AsyncOpenAI
-                AsyncOpenAI = _AsyncOpenAI
-
-            self._build_client()
+            # On a freshly installed Windows runtime, Defender can make the
+            # first OpenAI SDK import take tens of seconds. Running that work
+            # on the gateway event-loop thread previously prevented the local
+            # WebSocket/HTTP server from binding during the whole scan.
+            if self._client_init_task is None:
+                self._client_init_task = asyncio.create_task(
+                    asyncio.to_thread(self._initialize_client_sync),
+                    name="openai-sdk-client-initialization",
+                )
+                # A bounded startup prewarm may stop awaiting this task while
+                # the worker thread is still finishing. Consume a later error
+                # without discarding the task; a real request can await the
+                # same task and receive that result instead of starting a
+                # duplicate SDK import.
+                self._client_init_task.add_done_callback(
+                    lambda task: None if task.cancelled() else task.exception()
+                )
+            initialization = self._client_init_task
+            try:
+                await asyncio.shield(initialization)
+            finally:
+                if initialization.done() and self._client_init_task is initialization:
+                    self._client_init_task = None
             return self._client
 
     def _setup_env(self, api_key: str, api_base: str | None) -> None:

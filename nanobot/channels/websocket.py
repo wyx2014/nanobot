@@ -1176,14 +1176,12 @@ class WebSocketChannel(BaseChannel):
         async def handler(connection: ServerConnection) -> None:
             await self._connection_loop(connection)
 
-        self.logger.info(
-            "WebSocket server listening on {}",
-            (
-                f"unix:{self.config.unix_socket_path}{self.config.path}"
-                if self.config.unix_socket_path
-                else f"{scheme}://{self.config.host}:{self.config.port}{self.config.path}"
-            ),
+        endpoint = (
+            f"unix:{self.config.unix_socket_path}{self.config.path}"
+            if self.config.unix_socket_path
+            else f"{scheme}://{self.config.host}:{self.config.port}{self.config.path}"
         )
+        self.logger.info("WebSocket server starting on {}", endpoint)
         if self.config.token_issue_path:
             self.logger.info(
                 "WebSocket token issue route: {}",
@@ -1227,6 +1225,7 @@ class WebSocketChannel(BaseChannel):
                     ssl=ssl_context,
                     logger=ws_logger,
                 )
+            self.logger.info("WebSocket server listening on {}", endpoint)
             try:
                 assert self._stop_event is not None
                 await self._stop_event.wait()
