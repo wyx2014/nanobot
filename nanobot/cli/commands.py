@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import time
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -63,6 +64,15 @@ if _desktop_log_file:
 from rich.console import Console  # noqa: E402
 
 _DESKTOP_GATEWAY_IMPORT_PROFILE = os.environ.get("NANOBOT_DESKTOP_GATEWAY") == "1"
+
+
+def _desktop_startup_phase(name: str, started_at: float) -> None:
+    if not _DESKTOP_GATEWAY_IMPORT_PROFILE:
+        return
+    print(
+        f"[startup] {name} elapsed_ms={(time.perf_counter() - started_at) * 1000:.1f}",
+        flush=True,
+    )
 
 if not _DESKTOP_GATEWAY_IMPORT_PROFILE:
     from prompt_toolkit import PromptSession, print_formatted_text  # noqa: E402
@@ -995,6 +1005,8 @@ def desktop_gateway(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the private local gateway used by nanobot Desktop."""
+    startup_started_at = time.perf_counter()
+    _desktop_startup_phase("desktop-command-entered", startup_started_at)
     if not token_issue_secret.strip():
         console.print("[red]Error: --token-issue-secret is required[/red]")
         raise typer.Exit(1)
@@ -1016,6 +1028,7 @@ def desktop_gateway(
             filter=lambda record: record["extra"].setdefault("channel", "-") or True,
         )
     cfg = _load_or_create_desktop_config(config, workspace)
+    _desktop_startup_phase("desktop-config-loaded", startup_started_at)
     _configure_desktop_gateway(
         cfg,
         webui_port=webui_port,
@@ -1035,6 +1048,7 @@ def desktop_gateway(
         },
         health_server_enabled=False,
         provider_prewarm_enabled=True,
+        startup_started_at=startup_started_at,
     )
 
 
@@ -1048,8 +1062,11 @@ def _run_gateway(
     webui_runtime_capabilities: dict[str, Any] | None = None,
     health_server_enabled: bool = True,
     provider_prewarm_enabled: bool = False,
+    startup_started_at: float | None = None,
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
+    startup_started_at = startup_started_at or time.perf_counter()
+    _desktop_startup_phase("gateway-runtime-imports-started", startup_started_at)
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
     from nanobot.bus.runtime_events import RuntimeEventBus
@@ -1065,11 +1082,13 @@ def _run_gateway(
     from nanobot.session.webui_turns import WebuiTurnCoordinator
     from nanobot.storage.logs import StructuredLogStore
     from nanobot.webui.token_usage import TokenUsageHook
+    _desktop_startup_phase("gateway-runtime-imports-complete", startup_started_at)
 
     port = port if port is not None else config.gateway.port
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
+    _desktop_startup_phase("workspace-templates-synced", startup_started_at)
     bus = MessageBus()
     runtime_events = RuntimeEventBus()
     try:
@@ -1077,6 +1096,7 @@ def _run_gateway(
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1) from exc
+    _desktop_startup_phase("provider-snapshot-built", startup_started_at)
     session_manager = SessionManager(config.workspace_path)
     performance_logs = StructuredLogStore(
         config.workspace_path / ".nanobot" / "logs.sqlite"
@@ -1105,6 +1125,7 @@ def _run_gateway(
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
         performance_log_store=performance_logs,
     )
+    _desktop_startup_phase("agent-loop-built", startup_started_at)
     from nanobot.bus.events import OutboundMessage
     from nanobot.session.keys import session_key_for_channel
 
@@ -1310,6 +1331,7 @@ def _run_gateway(
         webui_thread_runtime_registry=getattr(agent, "thread_runtime_registry", None),
         webui_expert_team_turn_router=getattr(agent, "route_expert_team_turn", None),
     )
+    _desktop_startup_phase("channel-manager-built", startup_started_at)
     channel_map = getattr(channels, "channels", {})
     websocket_channel = (
         channel_map.get("websocket")
@@ -1456,6 +1478,7 @@ def _run_gateway(
 
         try:
             await cron.start()
+            _desktop_startup_phase("cron-started", startup_started_at)
             service_tasks.extend([
                 asyncio.create_task(agent.run(), name="nanobot-agent-loop"),
                 asyncio.create_task(
@@ -1463,6 +1486,7 @@ def _run_gateway(
                     name="nanobot-channel-manager",
                 ),
             ])
+            _desktop_startup_phase("gateway-service-tasks-scheduled", startup_started_at)
             if provider_prewarm_enabled:
                 transient_tasks.append(asyncio.create_task(
                     prewarm_provider(agent.provider, agent.model),
@@ -1535,6 +1559,7 @@ def _run_gateway(
             if flushed:
                 logger.info("Shutdown: flushed {} session(s) to disk", flushed)
 
+    _desktop_startup_phase("gateway-event-loop-entering", startup_started_at)
     asyncio.run(run())
 
 
