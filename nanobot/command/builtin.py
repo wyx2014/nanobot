@@ -130,7 +130,9 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     loop = ctx.loop
     msg = ctx.msg
     total = await loop._cancel_active_tasks(ctx.key)
-    content = f"已停止 {total} 个任务。" if total else "没有运行中的任务。"
+    # A user-facing acknowledgement is clearer than exposing the internal
+    # number of cancelled agent/subagent tasks.
+    content = "用户已取消" if total else "没有运行中的任务。"
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content=content,
         metadata=dict(msg.metadata or {})

@@ -29,6 +29,7 @@ from nanobot.cron.types import (
 _STALE_RUNNING_RUN_MS = 24 * 60 * 60 * 1000
 _STALE_RUNNING_ERROR = "run interrupted before completion"
 _AUDIT_REPAIR_WINDOW_MS = 60 * 1000
+_ATOMIC_REPLACE_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
 
 
 class CronJobSkippedError(Exception):
@@ -532,13 +533,40 @@ class CronService:
         next start, wiping every scheduled job.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        # Use a unique sibling so concurrent writers never truncate each
+        # other's temporary file. Keeping it in the same directory preserves
+        # the atomicity guarantee of os.replace().
+        tmp_path = path.with_name(
+            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+
+            # Windows Defender, indexers, and backup tools can briefly hold a
+            # newly-created destination file and make os.replace() fail with
+            # WinError 5/32. Retry only that recoverable class of error; never
+            # fall back to a non-atomic overwrite that could corrupt the store.
+            for attempt, delay_s in enumerate(
+                (*_ATOMIC_REPLACE_RETRY_DELAYS_S, None), start=1
+            ):
+                try:
+                    os.replace(tmp_path, path)
+                    break
+                except PermissionError as exc:
+                    if delay_s is None:
+                        raise
+                    logger.warning(
+                        "Atomic replace temporarily blocked for {} "
+                        "(attempt {}/{}): {}",
+                        path,
+                        attempt,
+                        len(_ATOMIC_REPLACE_RETRY_DELAYS_S) + 1,
+                        exc,
+                    )
+                    time.sleep(delay_s)
             # fsync the parent directory so the rename itself is durable.
             # Skip on Windows where opening a directory raises PermissionError;
             # NTFS journals metadata synchronously so this is a no-op there.

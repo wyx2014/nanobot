@@ -25,18 +25,40 @@ from loguru import logger  # noqa: E402
 
 # Remove default handler and re-add with unified nanobot format
 logger.remove()
+_LOG_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+    "<level>{level: <5}</level> | "
+    "<cyan>{extra[channel]}</cyan> | "
+    "<level>{message}</level>"
+)
 _log_handler_id = logger.add(
     sys.stderr,
-    format=(
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <5}</level> | "
-        "<cyan>{extra[channel]}</cyan> | "
-        "<level>{message}</level>"
-    ),
+    format=_LOG_FORMAT,
     level="INFO",
     colorize=None,
     filter=lambda record: record["extra"].setdefault("channel", "-") or True,
 )
+
+# The Electron bridge supplies this path for packaged diagnostics. Failure to
+# create the optional file sink must never prevent the gateway from starting.
+_desktop_log_file = os.environ.get("NANOBOT_LOG_FILE")
+if _desktop_log_file:
+    try:
+        desktop_log_path = Path(_desktop_log_file)
+        desktop_log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            desktop_log_path,
+            format=_LOG_FORMAT,
+            level="INFO",
+            encoding="utf-8",
+            colorize=False,
+            rotation="5 MB",
+            retention=3,
+            filter=lambda record: record["extra"].setdefault("channel", "-")
+            or True,
+        )
+    except OSError as exc:
+        logger.warning("Could not initialize desktop log file {}: {}", _desktop_log_file, exc)
 
 from rich.console import Console  # noqa: E402
 
@@ -1479,10 +1501,9 @@ def _run_gateway(
         except asyncio.CancelledError:
             pass
         except Exception:
-            import traceback
-
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
-            console.print(traceback.format_exc())
+            logger.exception("Gateway crashed unexpectedly")
+            raise
         finally:
             restore_signal_handlers()
             if shutdown_waiter is not None:

@@ -72,7 +72,7 @@ class TestHandleStop:
         out = await cmd_stop(ctx)
 
         assert cancelled.is_set()
-        assert "已停止" in out.content
+        assert out.content == "用户已取消"
 
     @pytest.mark.asyncio
     async def test_stop_cancels_multiple_tasks(self):
@@ -99,7 +99,7 @@ class TestHandleStop:
         out = await cmd_stop(ctx)
 
         assert all(e.is_set() for e in events)
-        assert "2 个任务" in out.content
+        assert out.content == "用户已取消"
 
     @pytest.mark.asyncio
     async def test_stop_cancels_subagents_before_awaiting_main_task(self):
@@ -134,7 +134,7 @@ class TestHandleStop:
         out = await asyncio.wait_for(cmd_stop(ctx), timeout=1.0)
 
         assert subagents_cancelled.is_set()
-        assert "5 个任务" in out.content
+        assert out.content == "用户已取消"
 
 
 class TestDispatch:

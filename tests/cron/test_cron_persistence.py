@@ -9,10 +9,12 @@ jobs.json + don't silently overwrite corrupt store``.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+from nanobot.cron import service as cron_service_module
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronSchedule
 
@@ -81,6 +83,60 @@ def test_save_store_failure_does_not_corrupt_existing_file(
         service._save_store()
 
     assert store_path.read_bytes() == original
+
+
+def test_atomic_write_retries_transient_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short-lived Windows destination lock must not crash the gateway."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text("old", encoding="utf-8")
+    real_replace = os.replace
+    attempts = 0
+    sleeps: list[float] = []
+
+    def flaky_replace(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(13, "temporarily locked")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(cron_service_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(cron_service_module.time, "sleep", sleeps.append)
+
+    CronService._atomic_write(store_path, "new")
+
+    assert store_path.read_text(encoding="utf-8") == "new"
+    assert attempts == 3
+    assert len(sleeps) == 2
+    assert list(store_path.parent.glob("*.tmp")) == []
+
+
+def test_atomic_write_exhausts_retries_without_corrupting_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permanent lock must preserve the old store and remove the temp file."""
+    store_path = tmp_path / "cron" / "jobs.json"
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text("old", encoding="utf-8")
+    attempts = 0
+
+    def blocked_replace(_source: Path, _destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(13, "still locked")
+
+    monkeypatch.setattr(cron_service_module.os, "replace", blocked_replace)
+    monkeypatch.setattr(cron_service_module.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(PermissionError, match="still locked"):
+        CronService._atomic_write(store_path, "new")
+
+    assert attempts == len(cron_service_module._ATOMIC_REPLACE_RETRY_DELAYS_S) + 1
+    assert store_path.read_text(encoding="utf-8") == "old"
+    assert list(store_path.parent.glob("*.tmp")) == []
 
 
 def test_load_jobs_preserves_corrupt_store_and_returns_none(
