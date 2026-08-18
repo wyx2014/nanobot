@@ -4,10 +4,11 @@ import asyncio
 import os
 import re
 import shutil
+import time
 import urllib.parse
-from pathlib import Path
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
+from pathlib import Path
 from typing import Any, Mapping
 from weakref import WeakKeyDictionary
 
@@ -47,6 +48,32 @@ _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yar
 _SANITIZE_RE = re.compile(r"_+")
 _RELOAD_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 _ReconnectCallback = Callable[[str, str, Tool], Awaitable[Tool | None]]
+
+
+def _load_mcp_client_runtime() -> tuple[Any, Any, Any, Any, Any]:
+    """Load the MCP SDK's cold import path outside the gateway event loop."""
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.sse import sse_client
+    from mcp.client.stdio import stdio_client
+    from mcp.client.streamable_http import streamable_http_client
+
+    return (
+        ClientSession,
+        StdioServerParameters,
+        sse_client,
+        stdio_client,
+        streamable_http_client,
+    )
+
+
+async def _load_mcp_client_runtime_async() -> tuple[Any, Any, Any, Any, Any]:
+    """Keep first-install SDK imports from blocking local HTTP/WebSocket I/O."""
+    started_at = time.perf_counter()
+    runtime = await asyncio.to_thread(_load_mcp_client_runtime)
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    if elapsed_ms >= 100:
+        logger.info("MCP client runtime imported off event loop in {} ms", elapsed_ms)
+    return runtime
 
 
 def _is_malformed_mcp_progress_notification(message: Any) -> bool:
@@ -894,10 +921,13 @@ async def connect_mcp_servers(
     Each server gets its own stack to prevent cancel scope conflicts
     when multiple MCP servers are configured.
     """
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.sse import sse_client
-    from mcp.client.stdio import stdio_client
-    from mcp.client.streamable_http import streamable_http_client
+    (
+        ClientSession,
+        StdioServerParameters,
+        sse_client,
+        stdio_client,
+        streamable_http_client,
+    ) = await _load_mcp_client_runtime_async()
 
     async def connect_single_server(name: str, cfg) -> tuple[str, AsyncExitStack | None]:
         server_stack = AsyncExitStack()

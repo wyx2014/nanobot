@@ -494,6 +494,7 @@ class AgentLoop:
         thread_runtime_registry: ThreadRuntimeRegistry | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         performance_log_store: StructuredLogStore | None = None,
+        trace_retention_startup_delay_s: float = 0.0,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -503,6 +504,10 @@ class AgentLoop:
         self.runtime_events = runtime_events or RuntimeEventBus()
         self.runtime_event_publisher = RuntimeEventPublisher(self.runtime_events)
         self._performance_logs = performance_log_store
+        self._trace_retention_startup_delay_s = max(
+            0.0,
+            float(trace_retention_startup_delay_s),
+        )
         self.trace_store = (
             TraceStore(performance_log_store.path)
             if performance_log_store is not None
@@ -2440,7 +2445,11 @@ class AgentLoop:
             )
             if abandoned:
                 logger.warning("Recovered {} abandoned runtime trace(s)", abandoned)
-            self._schedule_background(self.trace_collector.apply_retention())
+            self._schedule_background(
+                self.trace_collector.apply_retention(
+                    startup_delay_s=self._trace_retention_startup_delay_s,
+                )
+            )
         if self._mcp_servers:
             self._mcp_warmup_complete = False
             self._mcp_owner_task = asyncio.create_task(

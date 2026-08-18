@@ -60,6 +60,8 @@ def test_desktop_gateway_enables_background_provider_prewarm(
     assert captured["webui_runtime_surface"] == "native"
     assert captured["health_server_enabled"] is False
     assert captured["provider_prewarm_enabled"] is True
+    assert captured["startup_grace_period_s"] == 0.5
+    assert captured["trace_retention_startup_delay_s"] == 30.0
 
 
 def test_desktop_playwright_mcp_migration_pins_latest() -> None:

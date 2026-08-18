@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from typing import Any
@@ -57,6 +58,23 @@ def test_mcp_progress_detection_accepts_flattened_sdk_message_shape():
 
     assert mcp_runtime._is_malformed_mcp_progress_notification(malformed) is True
     assert mcp_runtime._is_malformed_mcp_progress_notification(valid) is False
+
+
+@pytest.mark.asyncio
+async def test_mcp_sdk_cold_import_keeps_event_loop_responsive(monkeypatch: pytest.MonkeyPatch):
+    runtime = (object(), object(), object(), object(), object())
+
+    def _slow_import():
+        time.sleep(0.1)
+        return runtime
+
+    monkeypatch.setattr(mcp_runtime, "_load_mcp_client_runtime", _slow_import)
+
+    loading = asyncio.create_task(mcp_runtime._load_mcp_client_runtime_async())
+    await asyncio.sleep(0.01)
+
+    assert loading.done() is False
+    assert await loading == runtime
 
 
 def test_mcp_file_arguments_obey_restricted_project_scope(tmp_path):

@@ -120,7 +120,12 @@ class TraceCollector:
             # Trace failure is deliberately degraded to diagnostics only.
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            logger.warning("Trace collector degraded during {}: {}", method, exc)
+            logger.warning(
+                "Trace collector degraded during {} ({}): {}",
+                method,
+                type(exc).__name__,
+                exc,
+            )
             return None
 
     async def begin_trace(
@@ -357,7 +362,9 @@ class TraceCollector:
         )
         return int(result or 0)
 
-    async def apply_retention(self) -> int:
+    async def apply_retention(self, *, startup_delay_s: float = 0.0) -> int:
+        if startup_delay_s > 0:
+            await asyncio.sleep(startup_delay_s)
         now = time.time_ns() // 1_000_000
         day = 24 * 60 * 60 * 1_000
         result = await self._submit(

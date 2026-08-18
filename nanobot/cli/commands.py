@@ -64,6 +64,8 @@ if _desktop_log_file:
 from rich.console import Console  # noqa: E402
 
 _DESKTOP_GATEWAY_IMPORT_PROFILE = os.environ.get("NANOBOT_DESKTOP_GATEWAY") == "1"
+_DESKTOP_STARTUP_GRACE_PERIOD_S = 0.5
+_DESKTOP_TRACE_RETENTION_DELAY_S = 30.0
 
 
 def _desktop_startup_phase(name: str, started_at: float) -> None:
@@ -1048,6 +1050,8 @@ def desktop_gateway(
         },
         health_server_enabled=False,
         provider_prewarm_enabled=True,
+        startup_grace_period_s=_DESKTOP_STARTUP_GRACE_PERIOD_S,
+        trace_retention_startup_delay_s=_DESKTOP_TRACE_RETENTION_DELAY_S,
         startup_started_at=startup_started_at,
     )
 
@@ -1062,6 +1066,8 @@ def _run_gateway(
     webui_runtime_capabilities: dict[str, Any] | None = None,
     health_server_enabled: bool = True,
     provider_prewarm_enabled: bool = False,
+    startup_grace_period_s: float = 0.0,
+    trace_retention_startup_delay_s: float = 0.0,
     startup_started_at: float | None = None,
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
@@ -1124,6 +1130,7 @@ def _run_gateway(
         provider_signature=provider_snapshot.signature,
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
         performance_log_store=performance_logs,
+        trace_retention_startup_delay_s=trace_retention_startup_delay_s,
     )
     _desktop_startup_phase("agent-loop-built", startup_started_at)
     from nanobot.bus.events import OutboundMessage
@@ -1467,6 +1474,12 @@ def _run_gateway(
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
     async def _run_provider_prewarm() -> None:
+        if startup_grace_period_s > 0:
+            logger.info(
+                "Desktop provider prewarm waiting for startup grace (elapsed_ms={})",
+                round(startup_grace_period_s * 1000),
+            )
+            await asyncio.sleep(startup_grace_period_s)
         started_at = time.perf_counter()
         logger.info("Desktop provider prewarm started")
         ready = await prewarm_provider(agent.provider, agent.model)

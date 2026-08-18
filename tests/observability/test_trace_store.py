@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,23 @@ from nanobot.runtime.turn_lifecycle import (
     TurnLifecycleManager,
     TurnStatus,
 )
+
+
+@pytest.mark.asyncio
+async def test_trace_retention_can_wait_until_after_startup(monkeypatch) -> None:
+    collector = TraceCollector(TraceStore.__new__(TraceStore))
+    submit = AsyncMock(return_value=0)
+    sleeps: list[float] = []
+
+    async def _record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(collector, "_submit", submit)
+    monkeypatch.setattr("nanobot.observability.trace_collector.asyncio.sleep", _record_sleep)
+
+    assert await collector.apply_retention(startup_delay_s=30.0) == 0
+    assert sleeps == [30.0]
+    submit.assert_awaited_once()
 
 
 def test_trace_store_builds_run_span_tree_and_redacts_secrets(tmp_path) -> None:
