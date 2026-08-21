@@ -4,6 +4,10 @@ import json
 import os
 import re
 import shutil
+import sys
+import threading
+import time
+import uuid
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -25,6 +29,7 @@ from nanobot.utils.helpers import (
 )
 from nanobot.utils.runtime import normalize_tool_message_content
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
+from nanobot.utils.windows_file_diagnostics import collect_atomic_replace_diagnostics
 
 FILE_MAX_MESSAGES = 2000
 _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
@@ -49,6 +54,9 @@ _FORK_VOLATILE_METADATA_KEYS = {
     "title",
     "title_user_edited",
 }
+_ACTIVE_SESSION_SAVES_LOCK = threading.Lock()
+_ACTIVE_SESSION_SAVES: dict[str, list[dict[str, Any]]] = {}
+_WINDOWS_ATOMIC_REPLACE_ERRORS = {5, 32}
 
 
 def _sanitize_assistant_replay_text(content: str) -> str:
@@ -721,6 +729,19 @@ class SessionManager:
         """
         path = self._get_session_path(session.key)
         tmp_path = path.with_suffix(".jsonl.tmp")
+        save_operation = {
+            "operation_id": uuid.uuid4().hex[:12],
+            "session_key": session.key,
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+            "started_at": datetime.now().astimezone().isoformat(),
+            "started_monotonic": time.monotonic(),
+        }
+        save_scope = str(path.resolve())
+        with _ACTIVE_SESSION_SAVES_LOCK:
+            overlapping_saves = list(_ACTIVE_SESSION_SAVES.get(save_scope, ()))
+            _ACTIVE_SESSION_SAVES.setdefault(save_scope, []).append(save_operation)
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -739,7 +760,52 @@ class SessionManager:
                     f.flush()
                     os.fsync(f.fileno())
 
-            os.replace(tmp_path, path)
+            replace_started = time.monotonic()
+            try:
+                os.replace(tmp_path, path)
+            except OSError as exc:
+                should_diagnose = isinstance(exc, PermissionError) or (
+                    sys.platform == "win32"
+                    and getattr(exc, "winerror", None) in _WINDOWS_ATOMIC_REPLACE_ERRORS
+                )
+                if not should_diagnose:
+                    raise
+                try:
+                    diagnostic = collect_atomic_replace_diagnostics(
+                        tmp_path,
+                        path,
+                        exc,
+                        context={
+                            "save_operation": save_operation,
+                            "overlapping_saves_at_start": overlapping_saves,
+                            "elapsed_ms": round(
+                                (time.monotonic() - save_operation["started_monotonic"]) * 1000,
+                                3,
+                            ),
+                            "replace_elapsed_ms": round(
+                                (time.monotonic() - replace_started) * 1000,
+                                3,
+                            ),
+                            "fsync": fsync,
+                            "message_count": len(session.messages),
+                        },
+                    )
+                except Exception as diagnostic_exc:
+                    # Diagnostics must never replace the original persistence error.
+                    diagnostic = {
+                        "event": "session_atomic_replace_failed",
+                        "source": str(tmp_path),
+                        "target": str(path),
+                        "error": str(exc),
+                        "diagnostic_collection_error": (
+                            f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                        ),
+                    }
+                logger.error(
+                    "Session atomic replace diagnostic: {}",
+                    json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, default=str),
+                )
+                raise
 
             if fsync:
                 # fsync the directory so the rename is durable.
@@ -755,6 +821,16 @@ class SessionManager:
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
+        finally:
+            with _ACTIVE_SESSION_SAVES_LOCK:
+                active = _ACTIVE_SESSION_SAVES.get(save_scope, [])
+                _ACTIVE_SESSION_SAVES[save_scope] = [
+                    item
+                    for item in active
+                    if item["operation_id"] != save_operation["operation_id"]
+                ]
+                if not _ACTIVE_SESSION_SAVES[save_scope]:
+                    _ACTIVE_SESSION_SAVES.pop(save_scope, None)
 
         self._cache[session.key] = session
 
