@@ -8,12 +8,15 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import suppress
+from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import count
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from loguru import logger
 
@@ -57,6 +60,99 @@ _FORK_VOLATILE_METADATA_KEYS = {
 _ACTIVE_SESSION_SAVES_LOCK = threading.Lock()
 _ACTIVE_SESSION_SAVES: dict[str, list[dict[str, Any]]] = {}
 _WINDOWS_ATOMIC_REPLACE_ERRORS = {5, 32}
+_SESSION_READ_ACTIVITY_LOCK = threading.Lock()
+_ACTIVE_SESSION_READS: dict[str, list[dict[str, Any]]] = {}
+_RECENT_SESSION_READS: deque[dict[str, Any]] = deque(maxlen=256)
+_SESSION_READ_LOOKBACK_S = 2.0
+_SESSION_READ_OPERATION_IDS = count(1)
+
+
+def _session_file_scope(path: Path) -> str:
+    return str(path.resolve())
+
+
+@contextmanager
+def _tracked_session_file_read(
+    path: Path,
+    operation: str,
+    **details: Any,
+) -> Iterator[TextIO]:
+    """Track short-lived readers so Windows replace failures retain their cause."""
+    scope = _session_file_scope(path)
+    started_monotonic = time.monotonic()
+    activity = {
+        "operation_id": (
+            f"{os.getpid()}:{threading.get_ident()}:{next(_SESSION_READ_OPERATION_IDS)}"
+        ),
+        "operation": operation,
+        "scope": scope,
+        "path": str(path),
+        "pid": os.getpid(),
+        "thread_id": threading.get_ident(),
+        "thread_name": threading.current_thread().name,
+        "started_at": datetime.now().astimezone().isoformat(),
+        "started_monotonic": started_monotonic,
+        "details": details,
+    }
+    with _SESSION_READ_ACTIVITY_LOCK:
+        _ACTIVE_SESSION_READS.setdefault(scope, []).append(activity)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            yield handle
+    finally:
+        ended_monotonic = time.monotonic()
+        completed = {
+            **activity,
+            "ended_at": datetime.now().astimezone().isoformat(),
+            "ended_monotonic": ended_monotonic,
+            "duration_ms": round((ended_monotonic - started_monotonic) * 1000, 3),
+        }
+        with _SESSION_READ_ACTIVITY_LOCK:
+            active = _ACTIVE_SESSION_READS.get(scope, [])
+            _ACTIVE_SESSION_READS[scope] = [
+                item
+                for item in active
+                if item["operation_id"] != activity["operation_id"]
+            ]
+            if not _ACTIVE_SESSION_READS[scope]:
+                _ACTIVE_SESSION_READS.pop(scope, None)
+            _RECENT_SESSION_READS.append(completed)
+
+
+def _session_file_read_activity(
+    path: Path,
+    *,
+    overlap_started: float | None = None,
+    overlap_ended: float | None = None,
+) -> dict[str, Any]:
+    """Return active and just-finished reads for one durable session path."""
+    scope = _session_file_scope(path)
+    now = time.monotonic()
+    with _SESSION_READ_ACTIVITY_LOCK:
+        active = [dict(item) for item in _ACTIVE_SESSION_READS.get(scope, ())]
+        recent = [
+            dict(item)
+            for item in _RECENT_SESSION_READS
+            if item["scope"] == scope
+            and now - item["ended_monotonic"] <= _SESSION_READ_LOOKBACK_S
+        ]
+    result = {
+        "lookback_seconds": _SESSION_READ_LOOKBACK_S,
+        "active_readers": active,
+        "recent_readers": recent,
+    }
+    if overlap_started is not None and overlap_ended is not None:
+        result["overlap_interval_ms"] = round(
+            max(0.0, overlap_ended - overlap_started) * 1000,
+            3,
+        )
+        result["overlapping_readers"] = [
+            item
+            for item in [*active, *recent]
+            if item["started_monotonic"] <= overlap_ended
+            and item.get("ended_monotonic", overlap_ended) >= overlap_started
+        ]
+    return result
 
 
 def _sanitize_assistant_replay_text(content: str) -> str:
@@ -621,7 +717,7 @@ class SessionManager:
             updated_at = None
             last_consolidated = 0
 
-            with open(path, encoding="utf-8") as f:
+            with _tracked_session_file_read(path, "session_load", session_key=key) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -666,7 +762,7 @@ class SessionManager:
             last_consolidated = 0
             skipped = 0
 
-            with open(path, encoding="utf-8") as f:
+            with _tracked_session_file_read(path, "session_repair", session_key=key) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -760,10 +856,12 @@ class SessionManager:
                     f.flush()
                     os.fsync(f.fileno())
 
+            readers_before_replace = _session_file_read_activity(path)
             replace_started = time.monotonic()
             try:
                 os.replace(tmp_path, path)
             except OSError as exc:
+                replace_failed = time.monotonic()
                 should_diagnose = isinstance(exc, PermissionError) or (
                     sys.platform == "win32"
                     and getattr(exc, "winerror", None) in _WINDOWS_ATOMIC_REPLACE_ERRORS
@@ -778,12 +876,19 @@ class SessionManager:
                         context={
                             "save_operation": save_operation,
                             "overlapping_saves_at_start": overlapping_saves,
+                            "readers_before_replace": readers_before_replace,
+                            "readers_after_failure": _session_file_read_activity(path),
+                            "readers_overlapping_replace": _session_file_read_activity(
+                                path,
+                                overlap_started=replace_started,
+                                overlap_ended=replace_failed,
+                            ),
                             "elapsed_ms": round(
                                 (time.monotonic() - save_operation["started_monotonic"]) * 1000,
                                 3,
                             ),
                             "replace_elapsed_ms": round(
-                                (time.monotonic() - replace_started) * 1000,
+                                (replace_failed - replace_started) * 1000,
                                 3,
                             ),
                             "fsync": fsync,
@@ -943,7 +1048,11 @@ class SessionManager:
             created_at: str | None = None
             updated_at: str | None = None
             stored_key: str | None = None
-            with open(path, encoding="utf-8") as f:
+            with _tracked_session_file_read(
+                path,
+                "read_session_file",
+                session_key=key,
+            ) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -981,7 +1090,11 @@ class SessionManager:
         if not path.exists():
             return None
         try:
-            with open(path, encoding="utf-8") as f:
+            with _tracked_session_file_read(
+                path,
+                "read_session_metadata",
+                session_key=key,
+            ) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -1023,7 +1136,11 @@ class SessionManager:
             fallback_key = path.stem.replace("_", ":", 1)
             try:
                 # Read the metadata line and a small preview for session lists.
-                with open(path, encoding="utf-8") as f:
+                with _tracked_session_file_read(
+                    path,
+                    "list_sessions_scan",
+                    fallback_key=fallback_key,
+                ) as f:
                     first_line = f.readline().strip()
                     if first_line:
                         data = json.loads(first_line)

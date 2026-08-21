@@ -6,7 +6,25 @@ from pathlib import Path
 
 import nanobot.webui.session_list_index as session_list_index
 from nanobot.cron.session_turns import CRON_HISTORY_META
-from nanobot.session.manager import SessionManager
+from nanobot.session.manager import SessionManager, _session_file_read_activity
+
+
+def test_webui_session_scan_records_reader_diagnostics(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:reader-diagnostic")
+    session.add_message("user", "reader diagnostic")
+    manager.save(session)
+
+    assert list_webui_sessions(manager)[0]["preview"] == "reader diagnostic"
+
+    activity = _session_file_read_activity(manager.session_path(session.key))
+    matching = [
+        item
+        for item in activity["recent_readers"]
+        if item["operation"] == "webui_session_list_scan"
+    ]
+    assert matching
+    assert matching[-1]["details"]["fallback_key"] == session.key
 
 
 def test_webui_session_list_reuses_valid_index_without_scanning_files(

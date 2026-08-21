@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from threading import Event, Thread
 from unittest.mock import patch
 
 import pytest
 
-from nanobot.session.manager import _ACTIVE_SESSION_SAVES, SessionManager
+from nanobot.session.manager import (
+    _ACTIVE_SESSION_SAVES,
+    SessionManager,
+    _tracked_session_file_read,
+)
 from nanobot.utils import windows_file_diagnostics
 
 
@@ -152,3 +157,80 @@ def test_windows_sharing_violation_is_diagnosed(tmp_path: Path) -> None:
     assert raised.value is replace_error
     collect.assert_called_once()
     assert _ACTIVE_SESSION_SAVES == {}
+
+
+def test_session_save_diagnostic_captures_active_internal_reader(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:active-reader")
+    session.add_message("user", "first")
+    manager.save(session)
+    path = manager.session_path(session.key)
+    reader_started = Event()
+    release_reader = Event()
+
+    def hold_reader() -> None:
+        with _tracked_session_file_read(
+            path,
+            "webui_session_list_scan",
+            fallback_key=path.stem,
+        ):
+            reader_started.set()
+            release_reader.wait(timeout=2)
+
+    reader = Thread(target=hold_reader, name="diagnostic-reader")
+    reader.start()
+    assert reader_started.wait(timeout=2)
+
+    try:
+        replace_error = PermissionError(13, "denied")
+        with (
+            patch("nanobot.session.manager.os.replace", side_effect=replace_error),
+            patch(
+                "nanobot.session.manager.collect_atomic_replace_diagnostics",
+                return_value={"event": "session_atomic_replace_failed"},
+            ) as collect,
+        ):
+            with pytest.raises(PermissionError):
+                manager.save(session)
+
+        context = collect.call_args.kwargs["context"]
+        active = context["readers_before_replace"]["active_readers"]
+        assert active[0]["operation"] == "webui_session_list_scan"
+        assert active[0]["thread_name"] == "diagnostic-reader"
+        assert active[0]["details"]["fallback_key"] == path.stem
+        overlaps = context["readers_overlapping_replace"]["overlapping_readers"]
+        assert overlaps[0]["operation_id"] == active[0]["operation_id"]
+    finally:
+        release_reader.set()
+        reader.join(timeout=2)
+
+    assert not reader.is_alive()
+
+
+def test_session_save_diagnostic_retains_just_finished_reader(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:recent-reader")
+    session.add_message("user", "first")
+    manager.save(session)
+    path = manager.session_path(session.key)
+
+    with _tracked_session_file_read(path, "read_session_file", session_key=session.key):
+        pass
+
+    replace_error = PermissionError(13, "denied")
+    with (
+        patch("nanobot.session.manager.os.replace", side_effect=replace_error),
+        patch(
+            "nanobot.session.manager.collect_atomic_replace_diagnostics",
+            return_value={"event": "session_atomic_replace_failed"},
+        ) as collect,
+    ):
+        with pytest.raises(PermissionError):
+            manager.save(session)
+
+    context = collect.call_args.kwargs["context"]
+    recent = context["readers_after_failure"]["recent_readers"]
+    matching = [item for item in recent if item["operation"] == "read_session_file"]
+    assert matching
+    assert matching[-1]["details"]["session_key"] == session.key
+    assert context["readers_overlapping_replace"]["overlapping_readers"] == []

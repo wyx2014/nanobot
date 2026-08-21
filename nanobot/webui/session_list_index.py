@@ -24,6 +24,7 @@ from nanobot.session.manager import (
     SessionManager,
     _message_preview_text,
     _metadata_title,
+    _tracked_session_file_read,
 )
 
 _INDEX_VERSION = 2
@@ -290,7 +291,11 @@ def _indexed_row_for_session(session: Session, path: Path) -> dict[str, Any]:
 def _scan_session_row(session_manager: SessionManager, path: Path) -> dict[str, Any] | None:
     fallback_key = path.stem.replace("_", ":", 1)
     try:
-        with open(path, encoding="utf-8") as f:
+        with _tracked_session_file_read(
+            path,
+            "webui_session_list_scan",
+            fallback_key=fallback_key,
+        ) as f:
             first_line = f.readline().strip()
             if not first_line:
                 return None
