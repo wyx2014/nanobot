@@ -94,8 +94,10 @@ from nanobot.security.project_context import (
     reset_project_context,
 )
 from nanobot.security.workspace_access import (
+    WORKSPACE_SCOPE_METADATA_KEY,
     WorkspaceScopeResolver,
     bind_workspace_scope,
+    build_workspace_scope,
     reset_workspace_scope,
 )
 from nanobot.session import turn_continuation
@@ -3164,6 +3166,12 @@ class AgentLoop:
             return
         from nanobot.storage.state import StateStore, StateStoreError
 
+        raw_message_scope = ctx.msg.metadata.get(WORKSPACE_SCOPE_METADATA_KEY)
+        raw_session_scope = ctx.session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY)
+        has_explicit_scope = isinstance(raw_message_scope, dict) or isinstance(
+            raw_session_scope,
+            dict,
+        )
         scope = self.workspace_scopes.for_message(ctx.msg, ctx.session.metadata)
         try:
             state = StateStore(
@@ -3173,20 +3181,28 @@ class AgentLoop:
             project = state.get_project(project_id)
             if project is None:
                 raise StateStoreError("inherited project is not registered")
-            if (
-                Path(project.canonical_root_path).resolve(strict=False)
-                != scope.project_path.expanduser().resolve(strict=False)
-            ):
+            project_root = Path(project.canonical_root_path).resolve(strict=False)
+            if not has_explicit_scope:
+                # Legacy WebUI schedules persisted project_id/workspacePath but
+                # not the runtime workspace_scope envelope.  The registered
+                # project identity is authoritative for these child sessions.
+                scope = build_workspace_scope(
+                    project_root,
+                    scope.access_mode,
+                    source_channel=ctx.msg.channel,
+                )
+            elif project_root != scope.project_path.expanduser().resolve(strict=False):
                 raise StateStoreError(
                     "inherited project does not match the effective workspace"
                 )
+            scope_metadata = scope.metadata()
             state_session = state.bind_session(
                 ctx.session_key,
                 project.id,
                 title=str(ctx.session.metadata.get("title") or ""),
                 metadata={
                     "project_id": project.id,
-                    "workspace_scope": scope.metadata(),
+                    "workspace_scope": scope_metadata,
                     "parent_project_id": ctx.msg.metadata.get("_parent_project_id"),
                 },
                 artifact_index_initialized=True,
@@ -3203,8 +3219,10 @@ class AgentLoop:
             "session_key": ctx.session_key,
         }
         ctx.msg.metadata[PROJECT_CONTEXT_METADATA_KEY] = context_metadata
+        ctx.msg.metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope_metadata
         ctx.session.metadata["project_id"] = project.id
         ctx.session.metadata["session_id"] = state_session.id
+        ctx.session.metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope_metadata
 
     def _repair_legacy_project_consolidation(self, session: Session) -> bool:
         """Restore raw replay hidden by the removed project-memory pipeline.

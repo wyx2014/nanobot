@@ -8,7 +8,7 @@ from websockets.http11 import Request, Response
 
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronRunRecord, CronSchedule
-from nanobot.storage.state import StateStoreError
+from nanobot.storage.state import StateStore, StateStoreError
 from nanobot.webui.schedule_routes import WebUIScheduleRouter, _schedule_from_query
 
 
@@ -24,6 +24,7 @@ def _router(
     service: CronService,
     *,
     purge_session=None,
+    state_store: StateStore | None = None,
 ) -> WebUIScheduleRouter:
     return WebUIScheduleRouter(
         cron_service=service,
@@ -39,6 +40,7 @@ def _router(
         json_response=_json_response,
         error_response=_error_response,
         logger=MagicMock(),
+        state_store=state_store,
         purge_session=purge_session,
     )
 
@@ -102,6 +104,37 @@ def test_monthly_schedule_query_clamps_day_to_valid_cron_range() -> None:
 
     assert schedule.expr == "0 9 31 * *"
     assert metadata["dayOfMonth"] == 31
+
+
+async def test_create_schedule_persists_registered_workspace_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    state = StateStore(
+        workspace / ".nanobot" / "state.sqlite",
+        default_workspace=workspace,
+    )
+    service = CronService(workspace / "cron" / "jobs.json")
+    request = Request(
+        "/api/schedule/tasks/create"
+        f"?name=weekly&prompt=report&workspace_path={project_path}",
+        Headers(),
+    )
+
+    response = await _router(service, state_store=state).dispatch(
+        request,
+        "/api/schedule/tasks/create",
+    )
+
+    assert response is not None
+    assert response.status_code == 200
+    [job] = service.list_jobs(include_disabled=True)
+    project = state.get_project(job.payload.project_id or "")
+    assert project is not None
+    assert job.payload.origin_metadata["workspace_scope"] == {
+        "project_path": project.canonical_root_path,
+    }
 
 
 async def test_delete_run_route_removes_completed_record(tmp_path) -> None:

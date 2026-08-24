@@ -60,11 +60,21 @@ _FORK_VOLATILE_METADATA_KEYS = {
 _ACTIVE_SESSION_SAVES_LOCK = threading.Lock()
 _ACTIVE_SESSION_SAVES: dict[str, list[dict[str, Any]]] = {}
 _WINDOWS_ATOMIC_REPLACE_ERRORS = {5, 32}
+_WINDOWS_SESSION_REPLACE_MIN_INTERVAL_S = 0.1
+_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
 _SESSION_READ_ACTIVITY_LOCK = threading.Lock()
 _ACTIVE_SESSION_READS: dict[str, list[dict[str, Any]]] = {}
 _RECENT_SESSION_READS: deque[dict[str, Any]] = deque(maxlen=256)
 _SESSION_READ_LOOKBACK_S = 2.0
 _SESSION_READ_OPERATION_IDS = count(1)
+
+
+def _is_retryable_windows_replace_error(exc: OSError) -> bool:
+    """Return whether *exc* is a transient Windows replace conflict."""
+    return (
+        sys.platform == "win32"
+        and getattr(exc, "winerror", None) in _WINDOWS_ATOMIC_REPLACE_ERRORS
+    )
 
 
 def _session_file_scope(path: Path) -> str:
@@ -657,6 +667,18 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        self._save_locks_guard = threading.Lock()
+        self._save_locks: dict[str, threading.Lock] = {}
+        self._last_replace_monotonic: dict[str, float] = {}
+
+    def _save_lock_for(self, scope: str) -> threading.Lock:
+        """Return the process-local writer lock for one durable session path."""
+        with self._save_locks_guard:
+            lock = self._save_locks.get(scope)
+            if lock is None:
+                lock = threading.Lock()
+                self._save_locks[scope] = lock
+            return lock
 
     @staticmethod
     def safe_key(key: str) -> str:
@@ -824,7 +846,11 @@ class SessionManager:
         the most recent writes.
         """
         path = self._get_session_path(session.key)
-        tmp_path = path.with_suffix(".jsonl.tmp")
+        tmp_path = path.with_name(
+            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        save_scope = str(path.resolve())
+        save_lock = self._save_lock_for(save_scope)
         save_operation = {
             "operation_id": uuid.uuid4().hex[:12],
             "session_key": session.key,
@@ -834,12 +860,31 @@ class SessionManager:
             "started_at": datetime.now().astimezone().isoformat(),
             "started_monotonic": time.monotonic(),
         }
-        save_scope = str(path.resolve())
+        lock_wait_started = time.monotonic()
+        save_lock.acquire()
+        lock_wait_ms = round((time.monotonic() - lock_wait_started) * 1000, 3)
         with _ACTIVE_SESSION_SAVES_LOCK:
             overlapping_saves = list(_ACTIVE_SESSION_SAVES.get(save_scope, ()))
             _ACTIVE_SESSION_SAVES.setdefault(save_scope, []).append(save_operation)
 
         try:
+            spacing_wait_s = 0.0
+            if sys.platform == "win32":
+                last_replace = self._last_replace_monotonic.get(save_scope)
+                if last_replace is not None:
+                    spacing_wait_s = max(
+                        0.0,
+                        _WINDOWS_SESSION_REPLACE_MIN_INTERVAL_S
+                        - (time.monotonic() - last_replace),
+                    )
+                    if spacing_wait_s > 0:
+                        logger.debug(
+                            "Spacing consecutive session writes for {} by {:.1f}ms",
+                            path,
+                            spacing_wait_s * 1000,
+                        )
+                        time.sleep(spacing_wait_s)
+
             with open(tmp_path, "w", encoding="utf-8") as f:
                 metadata_line = {
                     "_type": "metadata",
@@ -858,8 +903,30 @@ class SessionManager:
 
             readers_before_replace = _session_file_read_activity(path)
             replace_started = time.monotonic()
+            replace_attempts = 0
+            retry_wait_s = 0.0
             try:
-                os.replace(tmp_path, path)
+                for attempt, delay_s in enumerate(
+                    (*_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S, None), start=1
+                ):
+                    replace_attempts = attempt
+                    try:
+                        os.replace(tmp_path, path)
+                        break
+                    except OSError as exc:
+                        if not _is_retryable_windows_replace_error(exc) or delay_s is None:
+                            raise
+                        logger.warning(
+                            "Session atomic replace temporarily blocked for {} "
+                            "(attempt {}/{}, retry_in_ms={}): {}",
+                            path,
+                            attempt,
+                            len(_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S) + 1,
+                            round(delay_s * 1000),
+                            exc,
+                        )
+                        time.sleep(delay_s)
+                        retry_wait_s += delay_s
             except OSError as exc:
                 replace_failed = time.monotonic()
                 should_diagnose = isinstance(exc, PermissionError) or (
@@ -875,6 +942,10 @@ class SessionManager:
                         exc,
                         context={
                             "save_operation": save_operation,
+                            "lock_wait_ms": lock_wait_ms,
+                            "spacing_wait_ms": round(spacing_wait_s * 1000, 3),
+                            "replace_attempts": replace_attempts,
+                            "retry_wait_ms": round(retry_wait_s * 1000, 3),
                             "overlapping_saves_at_start": overlapping_saves,
                             "readers_before_replace": readers_before_replace,
                             "readers_after_failure": _session_file_read_activity(path),
@@ -911,6 +982,15 @@ class SessionManager:
                     json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, default=str),
                 )
                 raise
+            self._last_replace_monotonic[save_scope] = time.monotonic()
+            if replace_attempts > 1:
+                logger.info(
+                    "Session atomic replace recovered for {} after {} attempts "
+                    "(retry_wait_ms={})",
+                    path,
+                    replace_attempts,
+                    round(retry_wait_s * 1000),
+                )
 
             if fsync:
                 # fsync the directory so the rename is durable.
@@ -936,6 +1016,7 @@ class SessionManager:
                 ]
                 if not _ACTIVE_SESSION_SAVES[save_scope]:
                     _ACTIVE_SESSION_SAVES.pop(save_scope, None)
+            save_lock.release()
 
         self._cache[session.key] = session
 

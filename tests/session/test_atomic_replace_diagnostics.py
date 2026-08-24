@@ -107,10 +107,13 @@ def test_session_save_logs_diagnostics_and_preserves_original_error(tmp_path: Pa
     assert context["save_operation"]["started_at"]
     assert context["overlapping_saves_at_start"] == []
     assert context["message_count"] == 1
+    assert context["replace_attempts"] == 1
+    assert context["retry_wait_ms"] == 0
+    assert context["spacing_wait_ms"] == 0
     assert context["elapsed_ms"] >= 0
     assert context["replace_elapsed_ms"] >= 0
     assert "session_atomic_replace_failed" in log_error.call_args.args[1]
-    assert not manager.session_path(session.key).with_suffix(".jsonl.tmp").exists()
+    assert list(manager.sessions_dir.glob("*.tmp")) == []
     assert _ACTIVE_SESSION_SAVES == {}
 
 
@@ -146,6 +149,7 @@ def test_windows_sharing_violation_is_diagnosed(tmp_path: Path) -> None:
     with (
         patch.object(sys, "platform", "win32"),
         patch("nanobot.session.manager.os.replace", side_effect=replace_error),
+        patch("nanobot.session.manager.time.sleep"),
         patch(
             "nanobot.session.manager.collect_atomic_replace_diagnostics",
             return_value={"event": "session_atomic_replace_failed"},

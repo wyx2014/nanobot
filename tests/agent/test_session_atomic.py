@@ -1,10 +1,22 @@
 """Tests for atomic session save and corrupt-file repair."""
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
+from nanobot.session import manager as session_manager_module
 from nanobot.session.manager import Session, SessionManager
+
+
+def _windows_permission_error(winerror: int) -> PermissionError:
+    exc = PermissionError(13, "temporarily blocked")
+    exc.winerror = winerror
+    return exc
 
 
 class TestAtomicSave:
@@ -39,11 +51,6 @@ class TestAtomicSave:
     def test_tmp_file_cleaned_up_on_write_failure(self, tmp_path: Path):
         mgr = SessionManager(tmp_path)
         session = Session(key="test:fail")
-        path = mgr._get_session_path("test:fail")
-        tmp_path_file = path.with_suffix(".jsonl.tmp")
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path_file.write_text("stale")
 
         class BadMessage:
             def __init__(self, data):
@@ -64,12 +71,177 @@ class TestAtomicSave:
 
         import unittest.mock
         with unittest.mock.patch("nanobot.session.manager.json.dumps", side_effect=failing_dumps):
-            try:
+            with pytest.raises(OSError, match="simulated disk full"):
                 mgr.save(session)
-            except OSError:
-                pass
 
-        assert not tmp_path_file.exists()
+        assert list(mgr.sessions_dir.glob("*.tmp")) == []
+
+    def test_windows_transient_replace_error_is_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        mgr = SessionManager(tmp_path)
+        session = Session(key="test:retry")
+        session.add_message("user", "latest")
+        path = mgr._get_session_path(session.key)
+        path.write_text("old", encoding="utf-8")
+        real_replace = session_manager_module.os.replace
+        attempts = 0
+        sleeps: list[float] = []
+        sources: list[Path] = []
+
+        def flaky_replace(source: Path, destination: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            sources.append(Path(source))
+            if attempts < 3:
+                raise _windows_permission_error(5)
+            real_replace(source, destination)
+
+        monkeypatch.setattr(session_manager_module.sys, "platform", "win32")
+        monkeypatch.setattr(session_manager_module.os, "replace", flaky_replace)
+        monkeypatch.setattr(session_manager_module.time, "sleep", sleeps.append)
+
+        mgr.save(session)
+
+        assert attempts == 3
+        assert sleeps == [0.05, 0.1]
+        assert len(set(sources)) == 1
+        assert sources[0].name.startswith(f"{path.name}.")
+        assert sources[0].name.endswith(".tmp")
+        assert path.read_text(encoding="utf-8") != "old"
+        assert list(mgr.sessions_dir.glob("*.tmp")) == []
+
+    def test_windows_replace_retry_exhaustion_preserves_existing_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        mgr = SessionManager(tmp_path)
+        session = Session(key="test:retry-exhausted")
+        session.add_message("user", "latest")
+        path = mgr._get_session_path(session.key)
+        path.write_text("old", encoding="utf-8")
+        attempts = 0
+        sleeps: list[float] = []
+
+        def blocked_replace(_source: Path, _destination: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise _windows_permission_error(32)
+
+        monkeypatch.setattr(session_manager_module.sys, "platform", "win32")
+        monkeypatch.setattr(session_manager_module.os, "replace", blocked_replace)
+        monkeypatch.setattr(session_manager_module.time, "sleep", sleeps.append)
+        monkeypatch.setattr(
+            session_manager_module,
+            "collect_atomic_replace_diagnostics",
+            lambda *_args, **_kwargs: {"event": "test"},
+        )
+
+        with pytest.raises(PermissionError):
+            mgr.save(session)
+
+        assert attempts == len(
+            session_manager_module._WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S
+        ) + 1
+        assert sleeps == list(
+            session_manager_module._WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S
+        )
+        assert path.read_text(encoding="utf-8") == "old"
+        assert list(mgr.sessions_dir.glob("*.tmp")) == []
+
+    def test_unrelated_replace_error_is_not_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        mgr = SessionManager(tmp_path)
+        session = Session(key="test:no-retry")
+        path = mgr._get_session_path(session.key)
+        path.write_text("old", encoding="utf-8")
+        attempts = 0
+        sleeps: list[float] = []
+
+        def blocked_replace(_source: Path, _destination: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise _windows_permission_error(123)
+
+        monkeypatch.setattr(session_manager_module.sys, "platform", "win32")
+        monkeypatch.setattr(session_manager_module.os, "replace", blocked_replace)
+        monkeypatch.setattr(session_manager_module.time, "sleep", sleeps.append)
+        monkeypatch.setattr(
+            session_manager_module,
+            "collect_atomic_replace_diagnostics",
+            lambda *_args, **_kwargs: {"event": "test"},
+        )
+
+        with pytest.raises(PermissionError):
+            mgr.save(session)
+
+        assert attempts == 1
+        assert sleeps == []
+        assert path.read_text(encoding="utf-8") == "old"
+        assert list(mgr.sessions_dir.glob("*.tmp")) == []
+
+    def test_windows_consecutive_replaces_are_spaced(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        mgr = SessionManager(tmp_path)
+        session = Session(key="test:spacing")
+        clock = [1000.0]
+        sleeps: list[float] = []
+
+        def monotonic() -> float:
+            return clock[0]
+
+        def advance(delay: float) -> None:
+            sleeps.append(delay)
+            clock[0] += delay
+
+        monkeypatch.setattr(session_manager_module.sys, "platform", "win32")
+        monkeypatch.setattr(session_manager_module.time, "monotonic", monotonic)
+        monkeypatch.setattr(session_manager_module.time, "sleep", advance)
+
+        mgr.save(session)
+        clock[0] += 0.009
+        session.add_message("user", "second checkpoint")
+        mgr.save(session)
+
+        assert sleeps == [pytest.approx(0.091)]
+        assert list(mgr.sessions_dir.glob("*.tmp")) == []
+
+    def test_same_session_writers_are_serialized_and_use_unique_temp_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        mgr = SessionManager(tmp_path)
+        session = Session(key="test:serialized")
+        session.add_message("user", "hello")
+        real_replace = session_manager_module.os.replace
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+        sources: list[Path] = []
+
+        def slow_replace(source: Path, destination: Path) -> None:
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+                sources.append(Path(source))
+            try:
+                time.sleep(0.02)
+                real_replace(source, destination)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        monkeypatch.setattr(session_manager_module.os, "replace", slow_replace)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(mgr.save, session) for _ in range(2)]
+            for future in futures:
+                future.result()
+
+        assert max_active == 1
+        assert len(set(sources)) == 2
+        assert list(mgr.sessions_dir.glob("*.tmp")) == []
 
     def test_overwrite_preserves_latest_data(self, tmp_path: Path):
         mgr = SessionManager(tmp_path)

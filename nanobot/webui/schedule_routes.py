@@ -11,6 +11,7 @@ from websockets.http11 import Response
 
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronRunRecord, CronSchedule
+from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 from nanobot.storage.state import StateStore, StateStoreError
 
 QueryParams = dict[str, list[str]]
@@ -198,7 +199,7 @@ class WebUIScheduleRouter:
         return self._parse_query(request.path)
 
     def _meta(self, query: QueryParams, schedule: dict[str, Any]) -> dict[str, Any]:
-        return {
+        metadata: dict[str, Any] = {
             _META_NS: {
                 "description": _first(query, "description"),
                 "prompt": _first(query, "prompt"),
@@ -207,6 +208,15 @@ class WebUIScheduleRouter:
                 "schedule": schedule,
             }
         }
+        if self.state is not None:
+            workspace_path = _first(query, "workspace_path").strip()
+            project = self.state.ensure_project(
+                workspace_path or self.state.default_workspace
+            )
+            metadata[WORKSPACE_SCOPE_METADATA_KEY] = {
+                "project_path": project.canonical_root_path,
+            }
+        return metadata
 
     def _project_id(self, query: QueryParams) -> str | None:
         workspace_path = _first(query, "workspace_path").strip()
