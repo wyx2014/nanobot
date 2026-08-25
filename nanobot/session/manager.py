@@ -67,6 +67,7 @@ _ACTIVE_SESSION_READS: dict[str, list[dict[str, Any]]] = {}
 _RECENT_SESSION_READS: deque[dict[str, Any]] = deque(maxlen=256)
 _SESSION_READ_LOOKBACK_S = 2.0
 _SESSION_READ_OPERATION_IDS = count(1)
+_SLOW_SESSION_IO_LOG_MS = 500
 
 
 def _is_retryable_windows_replace_error(exc: OSError) -> bool:
@@ -111,11 +112,12 @@ def _tracked_session_file_read(
             yield handle
     finally:
         ended_monotonic = time.monotonic()
+        duration_ms = round((ended_monotonic - started_monotonic) * 1000, 3)
         completed = {
             **activity,
             "ended_at": datetime.now().astimezone().isoformat(),
             "ended_monotonic": ended_monotonic,
-            "duration_ms": round((ended_monotonic - started_monotonic) * 1000, 3),
+            "duration_ms": duration_ms,
         }
         with _SESSION_READ_ACTIVITY_LOCK:
             active = _ACTIVE_SESSION_READS.get(scope, [])
@@ -127,6 +129,14 @@ def _tracked_session_file_read(
             if not _ACTIVE_SESSION_READS[scope]:
                 _ACTIVE_SESSION_READS.pop(scope, None)
             _RECENT_SESSION_READS.append(completed)
+        if duration_ms >= _SLOW_SESSION_IO_LOG_MS:
+            logger.warning(
+                "slow session read operation={} session_key={} duration_ms={} thread={}",
+                operation,
+                details.get("session_key", details.get("fallback_key", "-")),
+                round(duration_ms),
+                threading.current_thread().name,
+            )
 
 
 def _session_file_read_activity(
@@ -867,8 +877,13 @@ class SessionManager:
             overlapping_saves = list(_ACTIVE_SESSION_SAVES.get(save_scope, ()))
             _ACTIVE_SESSION_SAVES.setdefault(save_scope, []).append(save_operation)
 
+        spacing_wait_s = 0.0
+        write_elapsed_ms = 0.0
+        replace_elapsed_ms = 0.0
+        directory_fsync_ms = 0.0
+        replace_attempts = 0
+        retry_wait_s = 0.0
         try:
-            spacing_wait_s = 0.0
             if sys.platform == "win32":
                 last_replace = self._last_replace_monotonic.get(save_scope)
                 if last_replace is not None:
@@ -885,6 +900,7 @@ class SessionManager:
                         )
                         time.sleep(spacing_wait_s)
 
+            write_started = time.monotonic()
             with open(tmp_path, "w", encoding="utf-8") as f:
                 metadata_line = {
                     "_type": "metadata",
@@ -900,11 +916,10 @@ class SessionManager:
                 if fsync:
                     f.flush()
                     os.fsync(f.fileno())
+            write_elapsed_ms = (time.monotonic() - write_started) * 1000
 
             readers_before_replace = _session_file_read_activity(path)
             replace_started = time.monotonic()
-            replace_attempts = 0
-            retry_wait_s = 0.0
             try:
                 for attempt, delay_s in enumerate(
                     (*_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S, None), start=1
@@ -982,6 +997,7 @@ class SessionManager:
                     json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, default=str),
                 )
                 raise
+            replace_elapsed_ms = (time.monotonic() - replace_started) * 1000
             self._last_replace_monotonic[save_scope] = time.monotonic()
             if replace_attempts > 1:
                 logger.info(
@@ -997,12 +1013,16 @@ class SessionManager:
                 # On Windows, opening a directory with O_RDONLY raises
                 # PermissionError — skip the dir sync there (NTFS
                 # journals metadata synchronously).
+                directory_fsync_started = time.monotonic()
                 with suppress(PermissionError):
                     fd = os.open(str(path.parent), os.O_RDONLY)
                     try:
                         os.fsync(fd)
                     finally:
                         os.close(fd)
+                directory_fsync_ms = (
+                    time.monotonic() - directory_fsync_started
+                ) * 1000
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
@@ -1017,6 +1037,25 @@ class SessionManager:
                 if not _ACTIVE_SESSION_SAVES[save_scope]:
                     _ACTIVE_SESSION_SAVES.pop(save_scope, None)
             save_lock.release()
+
+        duration_ms = (time.monotonic() - save_operation["started_monotonic"]) * 1000
+        if duration_ms >= _SLOW_SESSION_IO_LOG_MS:
+            logger.warning(
+                "slow session save session_key={} duration_ms={} lock_wait_ms={} "
+                "spacing_wait_ms={} write_ms={} replace_ms={} retry_wait_ms={} "
+                "directory_fsync_ms={} replace_attempts={} fsync={} message_count={}",
+                session.key,
+                round(duration_ms),
+                round(lock_wait_ms),
+                round(spacing_wait_s * 1000),
+                round(write_elapsed_ms),
+                round(replace_elapsed_ms),
+                round(retry_wait_s * 1000),
+                round(directory_fsync_ms),
+                replace_attempts,
+                fsync,
+                len(session.messages),
+            )
 
         self._cache[session.key] = session
 

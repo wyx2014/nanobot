@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -64,6 +65,28 @@ def test_schema_initializes_with_wal_and_core_relations(tmp_path: Path) -> None:
         } <= tables
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+
+
+def test_session_display_query_logs_lock_and_sql_timings(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    project = store.ensure_project(tmp_path / "inbox")
+    store.bind_session("websocket:slow-query", project.id)
+
+    with (
+        patch("nanobot.storage.state._SLOW_STATE_QUERY_LOG_MS", 0),
+        patch("nanobot.storage.state.logger.warning") as log_warning,
+    ):
+        assert store.session_display_event_envelopes("websocket:slow-query") == []
+
+    args = log_warning.call_args.args
+    assert args[0].startswith("slow state query")
+    assert args[1] >= 0
+    assert args[2] >= 0
+    assert args[3] >= 0
+    assert args[4] >= 0
+    assert args[5] >= 0
+    assert args[6] == 0
+    assert args[7] == 200
 
 
 def test_project_and_session_ids_are_stable_and_session_project_is_immutable(

@@ -21,6 +21,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
+from loguru import logger
+
 STATE_SCHEMA_VERSION = 9
 _VALID_MESSAGE_JSON_MIGRATION_VERSION = 9
 _SAFE_JSON_CHAR_LIMIT = 64_000
@@ -41,6 +43,7 @@ _ARTIFACT_RELATIONS = {
     "intermediate",
     "final",
 }
+_SLOW_STATE_QUERY_LOG_MS = 500
 
 
 class StateStoreError(RuntimeError):
@@ -3968,7 +3971,10 @@ class StateStore:
         retains the exact rich WebUI envelope needed by the compatibility
         renderer.
         """
+        operation_started = time.perf_counter()
+        lookup_started = operation_started
         session = self.get_session(session_key)
+        session_lookup_ms = (time.perf_counter() - lookup_started) * 1000
         if session is None:
             return []
         before_clause = ""
@@ -3977,9 +3983,14 @@ class StateStore:
             before_clause = "AND m.sequence_no < ?"
             params.append(max(0, int(before_event_seq)))
         params.append(max(1, min(int(limit), 1_001)))
-        with self._lock, self._connection() as connection:
-            rows = connection.execute(
-                f"""
+        lock_wait_started = time.perf_counter()
+        self._lock.acquire()
+        lock_acquired = time.perf_counter()
+        try:
+            with self._connection() as connection:
+                query_started = time.perf_counter()
+                rows = connection.execute(
+                    f"""
                 WITH safe_messages AS (
                     SELECT
                         source.*,
@@ -4037,33 +4048,37 @@ class StateStore:
                 {before_clause}
                 ORDER BY m.sequence_no DESC
                 LIMIT ?
-                """,
-                params,
-            ).fetchall()
-            # Terminal turn events (``turn_completed`` / ``turn_end``) carry the
-            # turn's ``usage`` (and duration), but they are not message rows and
-            # therefore never surface through the ``messages`` join above. Fetch
-            # them within the same page window so the transcript replay can stamp
-            # usage onto the final assistant reply, matching the persisted
-            # transcript path.
-            terminal_rows: list[Any] = []
-            if rows:
-                row_min_seq = int(rows[-1]["event_seq"])
-                row_max_seq = int(rows[0]["event_seq"])
-                # A terminal event is typically recorded a few seqs after the
-                # final message of its turn; widen the upper bound so the last
-                # reply in the page also receives its usage.
-                terminal_rows = connection.execute(
-                    """
-                    SELECT event_id, event_seq, event_type, recorded_at, payload_json
-                    FROM projected_events
-                    WHERE project_id = ? AND session_id = ?
-                      AND event_type IN ('turn_completed', 'turn_end')
-                      AND event_seq BETWEEN ? AND ?
-                    ORDER BY event_seq ASC
                     """,
-                    (session.project_id, session.id, row_min_seq, row_max_seq + 8),
+                    params,
                 ).fetchall()
+                # Terminal turn events (``turn_completed`` / ``turn_end``) carry the
+                # turn's ``usage`` (and duration), but they are not message rows and
+                # therefore never surface through the ``messages`` join above. Fetch
+                # them within the same page window so the transcript replay can stamp
+                # usage onto the final assistant reply, matching the persisted
+                # transcript path.
+                terminal_rows: list[Any] = []
+                if rows:
+                    row_min_seq = int(rows[-1]["event_seq"])
+                    row_max_seq = int(rows[0]["event_seq"])
+                    # A terminal event is typically recorded a few seqs after the
+                    # final message of its turn; widen the upper bound so the last
+                    # reply in the page also receives its usage.
+                    terminal_rows = connection.execute(
+                        """
+                        SELECT event_id, event_seq, event_type, recorded_at, payload_json
+                        FROM projected_events
+                        WHERE project_id = ? AND session_id = ?
+                          AND event_type IN ('turn_completed', 'turn_end')
+                          AND event_seq BETWEEN ? AND ?
+                        ORDER BY event_seq ASC
+                        """,
+                        (session.project_id, session.id, row_min_seq, row_max_seq + 8),
+                    ).fetchall()
+                sql_ms = (time.perf_counter() - query_started) * 1000
+        finally:
+            self._lock.release()
+        decode_started = time.perf_counter()
         events: list[dict[str, Any]] = []
         for row in reversed(rows):
             payload: dict[str, Any] = {}
@@ -4130,6 +4145,21 @@ class StateStore:
                         if int(entry.get("event_seq") or 0) < seq < upper:
                             merged.append(terminal_by_seq[seq])
                 events = merged
+        decode_ms = (time.perf_counter() - decode_started) * 1000
+        duration_ms = (time.perf_counter() - operation_started) * 1000
+        if duration_ms >= _SLOW_STATE_QUERY_LOG_MS:
+            logger.warning(
+                "slow state query operation=session_display_event_envelopes "
+                "duration_ms={} session_lookup_ms={} lock_wait_ms={} sql_ms={} "
+                "decode_ms={} row_count={} limit={}",
+                round(duration_ms),
+                round(session_lookup_ms),
+                round((lock_acquired - lock_wait_started) * 1000),
+                round(sql_ms),
+                round(decode_ms),
+                len(rows),
+                limit,
+            )
         return events
 
     def session_turn_user_event_envelope(

@@ -445,22 +445,35 @@ async def test_loop_persists_provider_ttft_with_turn_scope(tmp_path):
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
 
-    final_content, _, _, _, _ = await loop._run_agent_loop(
-        [{"role": "user", "content": "hello"}],
-        channel="websocket",
-        message_id="request-1",
-        session_key="websocket:chat-1",
-        metadata={
-            "_runtime_turn_id": "turn-1",
-            PROJECT_CONTEXT_METADATA_KEY: {
-                "project_id": "project-1",
-                "session_id": "session-1",
-                "session_key": "websocket:chat-1",
+    def observe_provider_timing(payload: dict[str, Any]) -> None:
+        if payload.get("event") == "request_started":
+            payload["turn_elapsed_ms"] = 123
+
+    with (
+        patch("nanobot.agent.runner._SLOW_PROVIDER_TIMING_CALLBACK_MS", 0),
+        patch("nanobot.agent.runner.logger.warning") as log_warning,
+    ):
+        final_content, _, _, _, _ = await loop._run_agent_loop(
+            [{"role": "user", "content": "hello"}],
+            channel="websocket",
+            message_id="request-1",
+            session_key="websocket:chat-1",
+            metadata={
+                "_runtime_turn_id": "turn-1",
+                PROJECT_CONTEXT_METADATA_KEY: {
+                    "project_id": "project-1",
+                    "session_id": "session-1",
+                    "session_key": "websocket:chat-1",
+                },
             },
-        },
-    )
+            provider_timing_observer=observe_provider_timing,
+        )
 
     assert final_content == "done"
+    assert any(
+        call.args and str(call.args[0]).startswith("slow provider timing callback")
+        for call in log_warning.call_args_list
+    )
     records = logs.query(session_id="session-1")
     ttft = next(record for record in records if record.event_name == "provider_ttft")
     assert ttft.project_id == "project-1"
@@ -471,6 +484,11 @@ async def test_loop_persists_provider_ttft_with_turn_scope(tmp_path):
     assert ttft.details["model"] == "test-model"
     assert ttft.details["iteration"] == 0
     assert ttft.details["prompt_estimate"] > 0
+    request_started = next(
+        record for record in records
+        if record.event_name == "provider_request_started"
+    )
+    assert request_started.details["turn_elapsed_ms"] == 123
 
 
 @pytest.mark.asyncio

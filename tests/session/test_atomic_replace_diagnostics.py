@@ -238,3 +238,48 @@ def test_session_save_diagnostic_retains_just_finished_reader(tmp_path: Path) ->
     assert matching
     assert matching[-1]["details"]["session_key"] == session.key
     assert context["readers_overlapping_replace"]["overlapping_readers"] == []
+
+
+def test_session_save_emits_phase_timings_only_after_slow_threshold(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    session = manager.get_or_create("websocket:slow-save")
+    session.add_message("user", "hello")
+
+    with (
+        patch("nanobot.session.manager._SLOW_SESSION_IO_LOG_MS", 0),
+        patch("nanobot.session.manager.logger.warning") as log_warning,
+    ):
+        manager.save(session)
+
+    slow_save = next(
+        call for call in log_warning.call_args_list
+        if call.args and str(call.args[0]).startswith("slow session save")
+    )
+    assert slow_save.args[1] == session.key
+    assert slow_save.args[2] >= 0
+    assert slow_save.args[3] >= 0
+    assert slow_save.args[5] >= 0
+    assert slow_save.args[6] >= 0
+
+
+def test_tracked_session_read_emits_slow_operation_timing(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text("{}\n", encoding="utf-8")
+
+    with (
+        patch("nanobot.session.manager._SLOW_SESSION_IO_LOG_MS", 0),
+        patch("nanobot.session.manager.logger.warning") as log_warning,
+    ):
+        with _tracked_session_file_read(
+            path,
+            "read_session_file",
+            session_key="websocket:slow-read",
+        ) as handle:
+            handle.read()
+
+    assert log_warning.call_args.args[0].startswith("slow session read")
+    assert log_warning.call_args.args[1] == "read_session_file"
+    assert log_warning.call_args.args[2] == "websocket:slow-read"
+    assert log_warning.call_args.args[3] >= 0

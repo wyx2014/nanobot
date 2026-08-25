@@ -94,6 +94,7 @@ _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _MAX_CONSECUTIVE_REPEAT_LOOKUP_BLOCKS = 3
+_SLOW_PROVIDER_TIMING_CALLBACK_MS = 500
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
@@ -1121,6 +1122,7 @@ class AgentRunner:
             callback = spec.provider_timing_callback
             if callback is None:
                 return
+            callback_started = time.perf_counter()
             try:
                 outcome = callback(payload)
                 if inspect.isawaitable(outcome):
@@ -1128,6 +1130,20 @@ class AgentRunner:
             except Exception:
                 # Diagnostics must never be able to fail a model request.
                 logger.exception("Provider timing callback failed")
+            finally:
+                callback_ms = round(
+                    (time.perf_counter() - callback_started) * 1000
+                )
+                if callback_ms >= _SLOW_PROVIDER_TIMING_CALLBACK_MS:
+                    logger.warning(
+                        "slow provider timing callback event={} duration_ms={} "
+                        "provider={} model={} iteration={}",
+                        payload.get("event"),
+                        callback_ms,
+                        provider_name,
+                        spec.model,
+                        context.iteration,
+                    )
 
         provider_started_at = 0.0
         first_event_recorded = False

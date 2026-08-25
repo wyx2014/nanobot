@@ -156,6 +156,11 @@ if TYPE_CHECKING:
     from nanobot.storage.logs import StructuredLogStore
 
 
+_SLOW_TURN_STEP_LOG_MS = 500
+_SLOW_PRE_PROVIDER_LOG_MS = 2_000
+_SLOW_TURN_RUN_LOG_MS = 30_000
+
+
 def _project_skill_scope(workspace: Path, project_path: Path | str | None, metadata: dict[str, Any]) -> dict[str, list[str]]:
     granted = project_skill_grants(workspace, project_path)
     requested = metadata.get("skill_scope")
@@ -388,6 +393,8 @@ class TurnContext:
     tools: ToolRegistry | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
+    turn_monotonic_started_at: float = field(default_factory=time.perf_counter)
+    provider_request_started_ms: int | None = None
     visible_run_started_at: float | None = None
     turn_latency_ms: int | None = None
     turn_usage: dict[str, int] = field(default_factory=dict)
@@ -1290,6 +1297,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         tools: ToolRegistry | None = None,
         max_iterations: int | None = None,
+        provider_timing_observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -1556,6 +1564,8 @@ class AgentLoop:
         )
 
         async def _provider_timing(payload: dict[str, Any]) -> None:
+            if provider_timing_observer is not None:
+                provider_timing_observer(payload)
             logs = self._performance_logs
             if logs is None:
                 return
@@ -1586,6 +1596,19 @@ class AgentLoop:
                     duration_ms,
                     details.get("measurement"),
                     details.get("first_event"),
+                    details.get("provider"),
+                    details.get("model"),
+                    details.get("iteration"),
+                    details.get("prompt_estimate"),
+                    project_id or "-",
+                    state_session_id or "-",
+                    turn_id or "-",
+                )
+            elif event == "request_started":
+                logger.info(
+                    "provider_request_started turn_elapsed_ms={} provider={} model={} "
+                    "iteration={} prompt_estimate={} project_id={} session_id={} turn_id={}",
+                    details.get("turn_elapsed_ms", "-"),
                     details.get("provider"),
                     details.get("model"),
                     details.get("iteration"),
@@ -1701,7 +1724,10 @@ class AgentLoop:
                     message_metadata=metadata,
                 ),
                 provider_timing_callback=(
-                    _provider_timing if self._performance_logs is not None else None
+                    _provider_timing
+                    if self._performance_logs is not None
+                    or provider_timing_observer is not None
+                    else None
                 ),
             ))
         finally:
@@ -3045,6 +3071,21 @@ class AgentLoop:
                 duration,
                 event,
             )
+            state_log_threshold = (
+                _SLOW_TURN_RUN_LOG_MS
+                if ctx.state is TurnState.RUN
+                else _SLOW_TURN_STEP_LOG_MS
+            )
+            if duration >= state_log_threshold:
+                logger.warning(
+                    "slow turn state turn_id={} session_key={} state={} duration_ms={} "
+                    "event={}",
+                    ctx.turn_id,
+                    ctx.session_key,
+                    ctx.state.name,
+                    round(duration),
+                    event,
+                )
 
             next_state = self._TRANSITIONS.get((ctx.state, event))
             if next_state is None:
@@ -3059,7 +3100,59 @@ class AgentLoop:
             ctx.turn_id,
             len(ctx.trace),
         )
+        turn_duration_ms = round(
+            (time.perf_counter() - ctx.turn_monotonic_started_at) * 1000
+        )
+        slow_pre_provider = (
+            ctx.provider_request_started_ms is not None
+            and ctx.provider_request_started_ms >= _SLOW_PRE_PROVIDER_LOG_MS
+        )
+        slow_state = any(
+            entry.duration_ms
+            >= (
+                _SLOW_TURN_RUN_LOG_MS
+                if entry.state is TurnState.RUN
+                else _SLOW_TURN_STEP_LOG_MS
+            )
+            for entry in ctx.trace
+        )
+        if slow_pre_provider or slow_state:
+            state_timings = ",".join(
+                f"{entry.state.name}:{round(entry.duration_ms)}"
+                for entry in ctx.trace
+            )
+            logger.warning(
+                "slow turn summary turn_id={} session_key={} duration_ms={} "
+                "provider_request_started_ms={} states={}",
+                ctx.turn_id,
+                ctx.session_key,
+                turn_duration_ms,
+                (
+                    ctx.provider_request_started_ms
+                    if ctx.provider_request_started_ms is not None
+                    else "none"
+                ),
+                state_timings,
+            )
         return ctx.outbound
+
+    @staticmethod
+    def _log_slow_turn_step(
+        ctx: TurnContext,
+        step: str,
+        started: float,
+    ) -> None:
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        if duration_ms < _SLOW_TURN_STEP_LOG_MS:
+            return
+        logger.warning(
+            "slow turn step turn_id={} session_key={} state={} step={} duration_ms={}",
+            ctx.turn_id,
+            ctx.session_key,
+            ctx.state.name,
+            step,
+            duration_ms,
+        )
 
     def _assemble_outbound(
         self,
@@ -3121,18 +3214,28 @@ class AgentLoop:
 
         # Session is already fetched by the caller (_process_message) but
         # ensure it exists in case this handler is invoked independently.
+        step_started = time.perf_counter()
         if ctx.session is None:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
+        self._log_slow_turn_step(ctx, "session_get_or_create", step_started)
+
+        step_started = time.perf_counter()
         self.workspace_scopes.persist_message_scope(ctx.session, msg)
         self._ensure_inherited_project_session(ctx)
         self._repair_legacy_project_consolidation(ctx.session)
-        await self._runtime_events().session_turn_started(msg, ctx.session_key)
+        self._log_slow_turn_step(ctx, "project_scope_restore", step_started)
 
+        step_started = time.perf_counter()
+        await self._runtime_events().session_turn_started(msg, ctx.session_key)
+        self._log_slow_turn_step(ctx, "session_turn_started_event", step_started)
+
+        step_started = time.perf_counter()
         if self._restore_runtime_checkpoint(ctx.session):
             self.sessions.save(ctx.session)
         if self._restore_pending_user_turn(ctx.session):
             self.sessions.save(ctx.session)
         self._consume_pending_interactive_prompt_answer(ctx)
+        self._log_slow_turn_step(ctx, "checkpoint_restore", step_started)
 
         return "ok"
 
@@ -3410,6 +3513,7 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
+        step_started = time.perf_counter()
         if not ctx.ephemeral:
             consolidator = self._consolidator_for_session(ctx.session, ctx.msg)
             if consolidator is not None:
@@ -3424,6 +3528,9 @@ class AgentLoop:
                     self.auto_compact.summary_for_session(ctx.session)
                     or ctx.pending_summary
                 )
+        self._log_slow_turn_step(ctx, "consolidation_check", step_started)
+
+        step_started = time.perf_counter()
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
@@ -3449,7 +3556,9 @@ class AgentLoop:
             ctx.session_key,
             self.llm_runtime(),
         )
+        self._log_slow_turn_step(ctx, "history_build", step_started)
 
+        step_started = time.perf_counter()
         ctx.initial_messages = self._build_initial_messages(
             ctx.msg,
             ctx.session,
@@ -3457,11 +3566,15 @@ class AgentLoop:
             ctx.pending_summary,
             include_memory_recent_history=not ctx.ephemeral,
         )
+        self._log_slow_turn_step(ctx, "context_build", step_started)
+
+        step_started = time.perf_counter()
         ctx.user_persisted_early = self._persist_user_message_early(
             ctx.msg,
             ctx.session,
             record_profile_candidate=not ctx.ephemeral,
         )
+        self._log_slow_turn_step(ctx, "persist_user_message", step_started)
 
         if ctx.on_progress is None:
             ctx.on_progress = await self._build_bus_progress_callback(ctx.msg)
@@ -3508,6 +3621,17 @@ class AgentLoop:
                         metadata=ctx.msg.metadata,
                         has_history=bool(ctx.history),
                     )
+
+                def _observe_provider_timing(payload: dict[str, Any]) -> None:
+                    if payload.get("event") != "request_started":
+                        return
+                    turn_elapsed_ms = round(
+                        (time.perf_counter() - ctx.turn_monotonic_started_at) * 1000
+                    )
+                    payload["turn_elapsed_ms"] = turn_elapsed_ms
+                    if ctx.provider_request_started_ms is None:
+                        ctx.provider_request_started_ms = turn_elapsed_ms
+
                 result = await self._run_agent_loop(
                     ctx.initial_messages,
                     on_progress=ctx.on_progress,
@@ -3525,6 +3649,7 @@ class AgentLoop:
                     run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
                     hooks=ctx.hooks,
                     tools=normal_tools,
+                    provider_timing_observer=_observe_provider_timing,
                 )
         finally:
             prompt_requested = interactive_prompt_requested_in_turn()

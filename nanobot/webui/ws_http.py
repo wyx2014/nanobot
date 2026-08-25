@@ -110,6 +110,7 @@ from nanobot.webui.transcript import build_webui_thread_response
 from nanobot.webui.workspaces import WebUIWorkspaceController
 
 _SLOW_WEBUI_HTTP_LOG_MS = 1_000
+_SLOW_WEBUI_STAGE_LOG_MS = 500
 _AUTOMATION_VALUES_HEADER = "X-Nanobot-Automation-Values"
 
 if TYPE_CHECKING:
@@ -369,6 +370,76 @@ class GatewayHTTPHandler:
             elapsed_ms,
         )
 
+    def _log_slow_stage(self, route: str, stage: str, started: float) -> None:
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        if duration_ms < _SLOW_WEBUI_STAGE_LOG_MS:
+            return
+        self._log.warning(
+            "slow webui stage route={} stage={} duration_ms={} execution=event_loop",
+            route,
+            stage,
+            duration_ms,
+        )
+
+    async def _run_blocking_stage(
+        self,
+        route: str,
+        stage: str,
+        func: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run blocking work while separating queue, work, and loop-resume delay."""
+        submitted = time.perf_counter()
+        worker_started: float | None = None
+        worker_ended: float | None = None
+        outcome = "ok"
+
+        def invoke() -> Any:
+            nonlocal worker_started, worker_ended
+            worker_started = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                worker_ended = time.perf_counter()
+
+        try:
+            return await asyncio.to_thread(invoke)
+        except BaseException as exc:
+            outcome = type(exc).__name__
+            raise
+        finally:
+            resumed = time.perf_counter()
+            duration_ms = round((resumed - submitted) * 1000)
+            if duration_ms >= _SLOW_WEBUI_STAGE_LOG_MS:
+                queue_ms = (
+                    round((worker_started - submitted) * 1000)
+                    if worker_started is not None
+                    else duration_ms
+                )
+                execution_ms = (
+                    round((worker_ended - worker_started) * 1000)
+                    if worker_started is not None and worker_ended is not None
+                    else 0
+                )
+                resume_delay_ms = (
+                    round((resumed - worker_ended) * 1000)
+                    if worker_ended is not None
+                    else 0
+                )
+                self._log.warning(
+                    "slow webui stage route={} stage={} duration_ms={} "
+                    "threadpool_queue_ms={} execution_ms={} event_loop_resume_ms={} "
+                    "outcome={}",
+                    route,
+                    stage,
+                    duration_ms,
+                    queue_ms,
+                    execution_ms,
+                    resume_delay_ms,
+                    outcome,
+                )
+
     # -- Token issue --------------------------------------------------------
 
     def _handle_token_issue(self, connection: Any, request: Any) -> Any:
@@ -599,10 +670,14 @@ class GatewayHTTPHandler:
         key: str,
     ) -> Response:
         """Return the single, session-partitioned Thread Resource read model."""
+        route = "thread"
+        stage_started = time.perf_counter()
         context = self._session_route_context(request, key)
+        self._log_slow_stage(route, "session_route_context", stage_started)
         if isinstance(context, Response):
             return context
         session_key, session_data = context
+        stage_started = time.perf_counter()
         scope = self.workspaces.scope_for_session_key(session_key)
         try:
             state_session = self._ensure_state_session(
@@ -612,9 +687,15 @@ class GatewayHTTPHandler:
             )
         except SessionProjectMismatch:
             return _http_error(409, "session_project_mismatch")
+        self._log_slow_stage(route, "state_session_bind", stage_started)
 
         try:
-            await asyncio.to_thread(self.journal.ensure_recovered, session_key)
+            await self._run_blocking_stage(
+                route,
+                "journal_recovery",
+                self.journal.ensure_recovered,
+                session_key,
+            )
         except Exception:
             self._log.exception(
                 "thread resource journal recovery failed session={}",
@@ -665,7 +746,9 @@ class GatewayHTTPHandler:
                 return _http_error(400, "invalid before_message_event_seq")
             if before_message_event_seq <= 0:
                 return _http_error(400, "invalid before_message_event_seq")
-        event_rows = await asyncio.to_thread(
+        event_rows = await self._run_blocking_stage(
+            route,
+            "message_query",
             self.state.session_display_event_envelopes,
             session_key,
             limit=message_limit + 1,
@@ -682,7 +765,9 @@ class GatewayHTTPHandler:
         if has_more_messages and event_rows and event_rows[0].get("event") != "user":
             oldest_turn_id = str(event_rows[0].get("turn_id") or "").strip()
             if oldest_turn_id:
-                user_anchor = await asyncio.to_thread(
+                user_anchor = await self._run_blocking_stage(
+                    route,
+                    "message_page_anchor_query",
                     self.state.session_turn_user_event_envelope,
                     session_key,
                     turn_id=oldest_turn_id,
@@ -690,6 +775,7 @@ class GatewayHTTPHandler:
                 )
                 if user_anchor is not None:
                     event_rows = [user_anchor, *event_rows]
+        stage_started = time.perf_counter()
         thread = build_webui_thread_response(
             session_key,
             event_rows=event_rows,
@@ -706,6 +792,7 @@ class GatewayHTTPHandler:
             "messages": [],
             "has_pending_tool_calls": False,
         }
+        self._log_slow_stage(route, "thread_payload_build", stage_started)
 
         if self.thread_runtime_registry is None:
             runtime = {
@@ -744,19 +831,23 @@ class GatewayHTTPHandler:
             if isinstance(plan_turn, dict) and plan_turn.get("id")
             else None
         )
+        stage_started = time.perf_counter()
         artifact_migration = await self._ensure_session_artifact_index(
             session_key,
             session_data,
             scope,
             state_session,
         )
+        self._log_slow_stage(route, "artifact_index", stage_started)
         artifact_turn = active_turn if isinstance(active_turn, dict) else latest_turn
         artifact_turn_id = (
             str(artifact_turn["id"])
             if isinstance(artifact_turn, dict) and artifact_turn.get("id")
             else None
         )
-        artifacts = await asyncio.to_thread(
+        artifacts = await self._run_blocking_stage(
+            route,
+            "artifact_query",
             self.state.list_session_artifacts,
             session_key,
             turn_id=artifact_turn_id,
@@ -774,7 +865,9 @@ class GatewayHTTPHandler:
             if after_event_seq < 0:
                 return _http_error(400, "invalid after_event_seq")
         incremental = (
-            await asyncio.to_thread(
+            await self._run_blocking_stage(
+                route,
+                "incremental_event_query",
                 self.state.session_event_envelopes,
                 session_key,
                 after_event_seq=after_event_seq,
@@ -2351,17 +2444,22 @@ class GatewayHTTPHandler:
     async def _handle_projects_list(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
+        route = "projects"
         if self.session_manager is not None:
             # Normal reads are SQLite-only.  Preserve one-time migration for
             # legacy JSONL sessions that predate the projection database
             # without rebuilding every session payload on each project read.
-            indexed_sessions = await asyncio.to_thread(
+            indexed_sessions = await self._run_blocking_stage(
+                route,
+                "session_index_scan",
                 list_webui_sessions,
                 self.session_manager,
             )
             projected_keys = {
                 session.session_key
-                for session in await asyncio.to_thread(
+                for session in await self._run_blocking_stage(
+                    route,
+                    "state_session_query",
                     self.state.list_sessions,
                     include_archived=True,
                 )
@@ -2381,11 +2479,21 @@ class GatewayHTTPHandler:
                 for row in indexed_sessions
             )
             if has_unprojected:
-                await asyncio.to_thread(self._sessions_list_payload)
-        await asyncio.to_thread(self.reconcile_archived_lifecycle)
+                await self._run_blocking_stage(
+                    route,
+                    "legacy_session_projection",
+                    self._sessions_list_payload,
+                )
+        await self._run_blocking_stage(
+            route,
+            "lifecycle_reconcile",
+            self.reconcile_archived_lifecycle,
+        )
         query = _parse_query(request.path)
         include_archived = _query_first(query, "include_archived") in {"1", "true", "yes"}
-        projects = await asyncio.to_thread(
+        projects = await self._run_blocking_stage(
+            route,
+            "state_project_query",
             self.state.list_projects,
             include_archived=include_archived,
         )
