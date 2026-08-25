@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from websockets.http11 import Request as WsRequest
@@ -34,6 +35,70 @@ def _int(query: QueryParams, key: str, default: int) -> int:
         return default
 
 
+def _iso_datetime(timestamp_ms: int) -> str:
+    value = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).isoformat()
+    return value.replace("+00:00", "Z")
+
+
+def _once_schedule(query: QueryParams, tz: str | None) -> tuple[CronSchedule, dict[str, Any]]:
+    value = _first(query, "at").strip()
+    if not value:
+        raise ValueError("at is required for a one-time schedule")
+    try:
+        normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError("at must be a valid ISO datetime") from None
+
+    if parsed.tzinfo is None:
+        if tz:
+            from zoneinfo import ZoneInfo
+
+            try:
+                parsed = parsed.replace(tzinfo=ZoneInfo(tz))
+            except Exception:
+                raise ValueError(f"unknown timezone '{tz}'") from None
+        else:
+            parsed = parsed.astimezone()
+
+    at_ms = int(parsed.timestamp() * 1000)
+    now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+    if at_ms <= now_ms:
+        raise ValueError("one-time schedule must be in the future")
+
+    metadata: dict[str, Any] = {
+        "frequency": "once",
+        "at": _iso_datetime(at_ms),
+    }
+    if tz:
+        metadata["timezone"] = tz
+    return CronSchedule(kind="at", at_ms=at_ms), metadata
+
+
+def _custom_schedule(query: QueryParams, tz: str | None) -> tuple[CronSchedule, dict[str, Any]]:
+    cron_expression = _first(query, "cron_expression").strip()
+    if cron_expression:
+        metadata: dict[str, Any] = {
+            "frequency": "custom",
+            "cronExpression": cron_expression,
+        }
+        if tz:
+            metadata["timezone"] = tz
+        return CronSchedule(kind="cron", expr=cron_expression, tz=tz), metadata
+
+    every_ms_value = _first(query, "every_ms").strip()
+    try:
+        every_ms = int(every_ms_value)
+    except ValueError:
+        every_ms = 0
+    if every_ms <= 0:
+        raise ValueError("custom schedule requires cron_expression or a positive every_ms")
+    return CronSchedule(kind="every", every_ms=every_ms), {
+        "frequency": "custom",
+        "everyMs": every_ms,
+    }
+
+
 def _job_meta(job: CronJob) -> dict[str, Any]:
     meta = job.payload.origin_metadata if isinstance(job.payload.origin_metadata, dict) else {}
     if not meta:
@@ -49,6 +114,13 @@ def _schedule_from_query(query: QueryParams) -> tuple[CronSchedule, bool, dict[s
     day = max(0, min(6, _int(query, "day_of_week", 1)))
     month_day = max(1, min(31, _int(query, "day_of_month", 1)))
     tz = _first(query, "timezone", "") or None
+
+    if frequency == "once":
+        schedule, metadata = _once_schedule(query, tz)
+        return schedule, True, metadata
+    if frequency == "custom":
+        schedule, metadata = _custom_schedule(query, tz)
+        return schedule, True, metadata
 
     meta_schedule: dict[str, Any] = {"frequency": frequency}
     enabled = True
@@ -72,12 +144,128 @@ def _schedule_from_query(query: QueryParams) -> tuple[CronSchedule, bool, dict[s
         # force-run them through /api/schedule/tasks/run.
         expr = "0 0 1 1 *"
         enabled = False
-    else:
+    elif frequency == "daily":
         expr = f"{minute} {hour} * * *"
-        meta_schedule["frequency"] = "daily"
         meta_schedule["time"] = {"hour": hour, "minute": minute}
+    else:
+        raise ValueError(f"unsupported schedule frequency '{frequency}'")
 
     return CronSchedule(kind="cron", expr=expr, tz=tz), enabled, meta_schedule
+
+
+def _cron_schedule_payload(schedule: CronSchedule) -> dict[str, Any]:
+    expression = (schedule.expr or "").strip()
+    fields = expression.split()
+    timezone = schedule.tz
+
+    def _number(value: str, minimum: int, maximum: int) -> int | None:
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if minimum <= parsed <= maximum else None
+
+    if len(fields) == 5:
+        minute_text, hour_text, month_day_text, month_text, week_day_text = fields
+        minute = _number(minute_text, 0, 59)
+        hour = _number(hour_text, 0, 23)
+        month_day = _number(month_day_text, 1, 31)
+        week_day = _number(week_day_text, 0, 6)
+
+        if (
+            minute is not None
+            and hour_text == "*"
+            and month_day_text == "*"
+            and month_text == "*"
+            and week_day_text == "*"
+        ):
+            payload: dict[str, Any] = {
+                "frequency": "hourly",
+                "time": {"hour": 0, "minute": minute},
+            }
+        elif (
+            minute is not None
+            and hour is not None
+            and month_day_text == "*"
+            and month_text == "*"
+            and week_day_text == "1-5"
+        ):
+            payload = {
+                "frequency": "weekdays",
+                "time": {"hour": hour, "minute": minute},
+            }
+        elif (
+            minute is not None
+            and hour is not None
+            and month_day_text == "*"
+            and month_text == "*"
+            and week_day_text == "*"
+        ):
+            payload = {
+                "frequency": "daily",
+                "time": {"hour": hour, "minute": minute},
+            }
+        elif (
+            minute is not None
+            and hour is not None
+            and month_day_text == "*"
+            and month_text == "*"
+            and week_day is not None
+        ):
+            payload = {
+                "frequency": "weekly",
+                "time": {"hour": hour, "minute": minute},
+                "dayOfWeek": week_day,
+            }
+        elif (
+            minute is not None
+            and hour is not None
+            and month_day is not None
+            and month_text == "*"
+            and week_day_text == "*"
+        ):
+            payload = {
+                "frequency": "monthly",
+                "time": {"hour": hour, "minute": minute},
+                "dayOfMonth": month_day,
+            }
+        else:
+            payload = {"frequency": "custom", "cronExpression": expression}
+    else:
+        payload = {"frequency": "custom", "cronExpression": expression}
+
+    if timezone:
+        payload["timezone"] = timezone
+    return payload
+
+
+def _schedule_payload(job: CronJob, meta: dict[str, Any]) -> dict[str, Any]:
+    schedule = job.schedule
+    metadata = meta.get("schedule")
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    if schedule.kind == "at" and schedule.at_ms is not None:
+        payload: dict[str, Any] = {
+            "frequency": "once",
+            "at": _iso_datetime(schedule.at_ms),
+        }
+        timezone = metadata.get("timezone")
+        if isinstance(timezone, str) and timezone:
+            payload["timezone"] = timezone
+        return payload
+
+    if schedule.kind == "every":
+        return {
+            "frequency": "custom",
+            "everyMs": schedule.every_ms,
+        }
+
+    if schedule.kind == "cron":
+        if metadata.get("frequency") == "manual" and schedule.expr == "0 0 1 1 *":
+            return {"frequency": "manual"}
+        return _cron_schedule_payload(schedule)
+
+    return {"frequency": "custom"}
 
 
 def _message(prompt: str, skill_name: str) -> str:
@@ -106,20 +294,21 @@ def _run_payload(job: CronJob, run: CronRunRecord) -> dict[str, Any]:
 
 def _task_payload(job: CronJob) -> dict[str, Any]:
     meta = _job_meta(job)
-    schedule = meta.get("schedule")
-    if not isinstance(schedule, dict):
-        schedule = {"frequency": "manual" if not job.enabled else "daily"}
+    schedule = _schedule_payload(job, meta)
     prompt = meta.get("prompt")
     if not isinstance(prompt, str):
         prompt = job.payload.message
     runs = [_run_payload(job, run) for run in reversed(job.state.run_history)]
+    status = "active" if job.enabled else "paused"
+    if job.schedule.kind == "at" and not job.enabled and job.state.last_run_at_ms is not None:
+        status = "completed"
     return {
         "id": job.id,
         "name": job.name,
         "description": meta.get("description") if isinstance(meta.get("description"), str) else "",
         "prompt": prompt,
         "schedule": schedule,
-        "status": "active" if job.enabled else "paused",
+        "status": status,
         "skillName": meta.get("skillName") if isinstance(meta.get("skillName"), str) else "",
         "workspacePath": meta.get("workspacePath") if isinstance(meta.get("workspacePath"), str) else "",
         "createdAt": job.created_at_ms,
@@ -239,9 +428,9 @@ class WebUIScheduleRouter:
         prompt = _first(query, "prompt").strip()
         if not name or not prompt:
             return self._error_response(400, "name and prompt are required")
-        schedule, enabled, meta_schedule = _schedule_from_query(query)
         skill_name = _first(query, "skill_name")
         try:
+            schedule, enabled, meta_schedule = _schedule_from_query(query)
             job = self.cron.add_job(
                 name=name,
                 schedule=schedule,
@@ -268,9 +457,9 @@ class WebUIScheduleRouter:
         prompt = _first(query, "prompt").strip()
         if not name or not prompt:
             return self._error_response(400, "name and prompt are required")
-        schedule, enabled, meta_schedule = _schedule_from_query(query)
         skill_name = _first(query, "skill_name")
         try:
+            schedule, enabled, meta_schedule = _schedule_from_query(query)
             result = self.cron.update_job(
                 job_id,
                 name=name,
@@ -278,6 +467,7 @@ class WebUIScheduleRouter:
                 message=_message(prompt, skill_name),
                 origin_metadata=self._meta(query, meta_schedule),
                 project_id=self._project_id(query),
+                delete_after_run=False,
             )
         except ValueError as exc:
             return self._error_response(400, str(exc))

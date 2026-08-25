@@ -11,7 +11,16 @@ Use the `cron` tool to schedule reminders or recurring tasks.
 
 1. **Reminder** - message is sent directly to user
 2. **Task** - message is a task description, agent executes and sends result
-3. **One-time** - runs once at a specific time, then auto-deletes
+3. **One-time** - runs once at a specific time
+
+## Choosing the Schedule
+
+- If the user gives a specific or relative date/time (for example, "tomorrow", "next Tuesday",
+  or "August 30") and does not use recurrence wording, create a one-time `at` job.
+- Use `cron_expr` or `every_seconds` only when the user explicitly says the task should repeat
+  (for example, "every day", "weekly", "each month", or "every 20 minutes").
+- Never turn a one-time reminder into a daily schedule as a fallback. Ask for the missing time if
+  the requested date cannot be scheduled precisely.
 
 ## Examples
 

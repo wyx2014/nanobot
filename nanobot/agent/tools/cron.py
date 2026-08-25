@@ -37,7 +37,9 @@ _CRON_PARAMETERS = tool_parameters_schema(
     ),
     at=StringSchema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
-        "Naive values use the tool's default timezone."
+        "Use this when the user names a specific date/time without recurrence words; do not "
+        "turn that request into a daily/weekly cron expression. Naive values use the tool's "
+        "default timezone."
     ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     required=["action"],
@@ -122,6 +124,8 @@ class CronTool(Tool, ContextAware):
     def description(self) -> str:
         return (
             "Schedule reminders and recurring tasks. Actions: add, list, remove. "
+            "A specific or relative date/time without recurrence wording is a one-time `at` job; "
+            "use `cron_expr` or `every_seconds` only when the user explicitly asks to repeat it. "
             f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
         )
 
@@ -193,6 +197,9 @@ class CronTool(Tool, ContextAware):
         )
         if not origin_channel or not origin_chat_id:
             return "Error: scheduled cron jobs must be created from a chat session"
+        schedules_provided = sum(bool(value) for value in (every_seconds, cron_expr, at))
+        if schedules_provided > 1:
+            return "Error: provide exactly one of every_seconds, cron_expr, or at"
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
         if tz:
@@ -200,7 +207,6 @@ class CronTool(Tool, ContextAware):
                 return err
 
         # Build schedule
-        delete_after = False
         if every_seconds:
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
@@ -220,8 +226,9 @@ class CronTool(Tool, ContextAware):
                     return err
                 dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
             at_ms = int(dt.timestamp() * 1000)
+            if at_ms <= int(datetime.now().timestamp() * 1000):
+                return "Error: one-time schedule must be in the future"
             schedule = CronSchedule(kind="at", at_ms=at_ms)
-            delete_after = True
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
@@ -229,7 +236,7 @@ class CronTool(Tool, ContextAware):
             name=name or message[:30],
             schedule=schedule,
             message=message,
-            delete_after_run=delete_after,
+            delete_after_run=False,
             session_key=session_key,
             project_id=project_id,
             created_session_id=created_session_id,
@@ -237,7 +244,10 @@ class CronTool(Tool, ContextAware):
             origin_chat_id=origin_chat_id,
             origin_metadata=origin_metadata,
         )
-        return f"Created job '{job.name}' (id: {job.id})"
+        return (
+            f"Created job '{job.name}' (id: {job.id}); "
+            f"schedule: {self._format_timing(schedule)}"
+        )
 
     def _format_timing(self, schedule: CronSchedule) -> str:
         """Format schedule as a human-readable timing string."""

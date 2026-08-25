@@ -5,7 +5,15 @@ from datetime import datetime
 
 import pytest
 
-from nanobot.agent.memory import _HISTORY_ENTRY_HARD_CAP, MemoryStore
+from nanobot.agent.memory import (
+    _HISTORY_ENTRY_HARD_CAP,
+    EXPERT_TEAM_HISTORY_SOURCE,
+    EXPERT_TEAM_TURN_KEY,
+    PROFILE_CANDIDATE_KIND,
+    PROFILE_CANDIDATE_RECORDED_KEY,
+    PROFILE_CANDIDATE_SOURCE,
+    MemoryStore,
+)
 
 
 @pytest.fixture
@@ -41,7 +49,7 @@ class TestMemoryStoreBasicIO:
     def test_get_memory_context_returns_formatted_content(self, store):
         store.write_memory("important fact")
         ctx = store.get_memory_context()
-        assert "Long-term Memory" in ctx
+        assert "Legacy Memory" in ctx
         assert "important fact" in ctx
 
 class TestHistoryWithCursor:
@@ -158,6 +166,104 @@ class TestHistoryWithCursor:
         )
 
         assert [e["content"] for e in entries] == ["unified entry", "own cron entry"]
+
+    def test_profile_candidate_is_visible_to_dream_but_not_runtime_prompt(self, store):
+        messages = [
+            {
+                "role": "user",
+                "content": "I prefer concise replies in every conversation.",
+                "timestamp": "2026-08-24T10:00:00",
+            },
+            {"role": "assistant", "content": "I will use a four-step workflow."},
+            {"role": "tool", "content": "private project output"},
+        ]
+
+        assert store.append_profile_candidates(
+            messages,
+            session_key="websocket:project-chat",
+        ) == 1
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert entries[0]["kind"] == PROFILE_CANDIDATE_KIND
+        assert entries[0]["source"] == "user"
+        assert entries[0]["content"].startswith(PROFILE_CANDIDATE_SOURCE)
+        assert "concise replies" in entries[0]["content"]
+        assert "four-step workflow" not in entries[0]["content"]
+        assert "private project output" not in entries[0]["content"]
+        assert messages[0][PROFILE_CANDIDATE_RECORDED_KEY] is True
+        assert store.read_recent_history_for_prompt(
+            since_cursor=0,
+            session_key="websocket:project-chat",
+        ) == []
+
+    def test_profile_candidate_is_idempotent_across_replayed_session_messages(self, store):
+        message = {
+            "role": "user",
+            "content": "Please remember that my name is Ada.",
+            "timestamp": "2026-08-24T10:00:00",
+        }
+
+        store.append_profile_candidates([dict(message)], session_key="websocket:chat-1")
+        store.append_profile_candidates([dict(message)], session_key="websocket:chat-1")
+
+        assert len(store.read_unprocessed_history(since_cursor=0)) == 1
+
+    def test_expert_team_candidate_keeps_user_text_and_source_boundary(self, store):
+        messages = [
+            {
+                "role": "user",
+                "content": "For all future chats, call me Ada.",
+                "timestamp": "2026-08-24T10:00:00",
+                EXPERT_TEAM_TURN_KEY: "asset-research-team",
+            },
+            {
+                "role": "assistant",
+                "content": "Use four named roles and a scoring rubric.",
+                EXPERT_TEAM_TURN_KEY: "asset-research-team",
+            },
+        ]
+
+        store.append_profile_candidates(messages, session_key="websocket:expert-chat")
+
+        entry = store.read_unprocessed_history(since_cursor=0)[0]
+        assert entry["source"] == "expert-team"
+        assert entry["content"].startswith(EXPERT_TEAM_HISTORY_SOURCE)
+        assert PROFILE_CANDIDATE_SOURCE in entry["content"]
+        assert "call me Ada" in entry["content"]
+        assert "four named roles" not in entry["content"]
+
+    def test_internal_and_injected_user_messages_are_not_profile_candidates(self, store):
+        cron_message = {"role": "user", "content": "Run the scheduled report", "_cron_turn": True}
+        injected = {"role": "user", "content": "synthetic continuation", "injected_event": "runtime"}
+        command = {"role": "user", "content": "/status", "_command": True}
+        prompt_answer = {
+            "role": "user",
+            "content": "30-60 minutes",
+            "interactive_prompt_answer": {"answerType": "option"},
+        }
+
+        assert store.append_profile_candidates(
+            [cron_message],
+            session_key="cron:job-1",
+        ) == 0
+        assert store.append_profile_candidates(
+            [injected],
+            session_key="websocket:chat-1",
+        ) == 0
+        assert store.append_profile_candidates(
+            [command],
+            session_key="websocket:chat-1",
+        ) == 0
+        assert store.append_profile_candidates(
+            [prompt_answer],
+            session_key="websocket:chat-1",
+        ) == 0
+        assert store.read_unprocessed_history(since_cursor=0) == []
+        assert cron_message[PROFILE_CANDIDATE_RECORDED_KEY] is True
+        assert injected[PROFILE_CANDIDATE_RECORDED_KEY] is True
+        assert command[PROFILE_CANDIDATE_RECORDED_KEY] is True
+        assert prompt_answer[PROFILE_CANDIDATE_RECORDED_KEY] is True
 
     def test_read_unprocessed_skips_entries_without_cursor(self, store):
         """Regression: entries missing the cursor key should be silently skipped."""

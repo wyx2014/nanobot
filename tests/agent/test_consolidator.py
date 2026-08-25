@@ -6,9 +6,11 @@ import pytest
 
 from nanobot.agent.memory import (
     _ARCHIVE_SUMMARY_MAX_CHARS,
-    Consolidator,
     EXPERT_TEAM_HISTORY_SOURCE,
     EXPERT_TEAM_TURN_KEY,
+    PROFILE_CANDIDATE_KIND,
+    PROFILE_CANDIDATE_RECORDED_KEY,
+    Consolidator,
     MemoryStore,
 )
 from nanobot.providers.base import LLMResponse
@@ -102,7 +104,7 @@ class TestConsolidatorSummarize:
         store,
     ):
         mock_provider.chat_with_retry.return_value = MagicMock(
-            content="- [durable] Private portfolio constraint: max position is 5%.",
+            content="- [permanent] User prefers concise replies across conversations.",
             finish_reason="stop",
         )
         messages = [{
@@ -113,10 +115,11 @@ class TestConsolidatorSummarize:
 
         result = await consolidator.archive(messages, session_key="websocket:chat-1")
 
-        assert result == "- [durable] Private portfolio constraint: max position is 5%."
+        assert result == "- [permanent] User prefers concise replies across conversations."
         prompt = mock_provider.chat_with_retry.await_args.kwargs["messages"][0]["content"]
         assert "Expert-team memory boundary" in prompt
         assert "named analysis frameworks" in prompt
+        assert "project facts" in prompt
         entries = store.read_unprocessed_history(since_cursor=0)
         assert entries[0]["content"].startswith(EXPERT_TEAM_HISTORY_SOURCE)
 
@@ -176,6 +179,7 @@ class TestConsolidatorPromptContract:
             assert mark in prompt
         assert "check context below" not in prompt.lower()
         assert "Do not mark something [skip] merely because it might already exist" in prompt
+        assert "Only direct USER statements" in prompt
 
     async def test_session_only_consolidation_preserves_tools_instead_of_snip_filtering(
         self,
@@ -213,6 +217,8 @@ class TestConsolidatorPromptContract:
 
         assert "[source: expert-team]" in prompt
         assert "does not imply that its methodology should carry" in prompt
+        assert "[source: user-profile-candidate]" in prompt
+        assert "Do not add new project or session facts to MEMORY.md" in prompt
 
 
 class TestConsolidatorArchiveErrorHandling:
@@ -502,6 +508,48 @@ class TestCompactIdleSession:
             get_tool_definitions=MagicMock(return_value=[]),
             max_completion_tokens=100,
         )
+
+    @pytest.mark.asyncio
+    async def test_short_session_backfills_profile_candidates_without_llm(
+        self,
+        store,
+        mock_provider,
+    ):
+        """Idle compaction backfills legacy/unrecorded short chats for Dream."""
+        from nanobot.session.manager import SessionManager
+
+        sessions = SessionManager(store.workspace)
+        profile_consolidator = Consolidator(
+            store=None,
+            profile_store=store,
+            provider=mock_provider,
+            model="test-model",
+            sessions=sessions,
+            context_window_tokens=1000,
+            build_messages=MagicMock(return_value=[]),
+            get_tool_definitions=MagicMock(return_value=[]),
+            max_completion_tokens=100,
+        )
+        session = sessions.get_or_create("websocket:short-project")
+        session.add_message("user", "Please call me Ada in every conversation.")
+        session.add_message("assistant", "I will use a special four-role workflow.")
+        sessions.save(session)
+
+        result = await profile_consolidator.compact_idle_session(
+            session.key,
+            max_suffix=8,
+        )
+
+        assert result == ""
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert entries[0]["kind"] == PROFILE_CANDIDATE_KIND
+        assert "call me Ada" in entries[0]["content"]
+        assert "four-role workflow" not in entries[0]["content"]
+        assert sessions.get_or_create(session.key).messages[0][
+            PROFILE_CANDIDATE_RECORDED_KEY
+        ] is True
+        mock_provider.chat_with_retry.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_archives_prefix_keeps_suffix(self, real_consolidator, mock_provider):

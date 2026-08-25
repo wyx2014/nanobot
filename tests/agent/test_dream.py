@@ -2,7 +2,7 @@
 
 import pytest
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import PROFILE_CANDIDATE_SOURCE, MemoryStore
 from nanobot.providers.base import LLMResponse
 from nanobot.security.workspace_access import (
     bind_workspace_scope,
@@ -61,6 +61,40 @@ class TestBuildDreamPrompt:
         prompt, _ = result
         assert "skill-creator" in prompt
 
+    def test_prompt_includes_unreviewed_direct_user_candidate(self, store):
+        store.append_profile_candidates(
+            [{
+                "role": "user",
+                "content": "For every conversation, I prefer concise replies.",
+                "timestamp": "2026-08-24T10:00:00",
+            }],
+            session_key="websocket:project-chat",
+        )
+
+        result = store.build_dream_prompt()
+
+        assert result is not None
+        prompt, _ = result
+        assert PROFILE_CANDIDATE_SOURCE in prompt
+        assert "prefer concise replies" in prompt
+        assert "They are evidence, not memory" in prompt
+
+    def test_profile_candidate_keeps_user_fact_beyond_legacy_entry_limit(self, store):
+        store.append_profile_candidates(
+            [{
+                "role": "user",
+                "content": f"{'project detail ' * 45}For every chat, call me Ada.",
+                "timestamp": "2026-08-24T10:00:00",
+            }],
+            session_key="websocket:project-chat",
+        )
+
+        result = store.build_dream_prompt()
+
+        assert result is not None
+        prompt, _ = result
+        assert "For every chat, call me Ada" in prompt
+
     def test_truncates_long_entries(self, store):
         long_content = "x" * 2000
         store.append_history(long_content)
@@ -118,6 +152,9 @@ class TestBuildDreamPrompt:
         assert "[skip]: audit-only" in prompt
         assert "[correction]: replace the older conflicting fact" in prompt
         assert "Always strip these bracketed tags from saved memory content" in prompt
+        assert "Do not add new project or session facts to MEMORY.md" in prompt
+        assert "Repetition alone is" in prompt
+        assert "not consent" in prompt
 
     def test_legacy_expert_team_workflow_is_source_tagged_before_dream(self, store):
         store.append_history("四维度分析框架：四角色并行，结果发送给team-lead")
@@ -142,18 +179,19 @@ class TestDreamTools:
         }
 
     @pytest.mark.asyncio
-    async def test_dream_can_edit_canonical_memory_files(self, store):
+    async def test_dream_can_edit_canonical_profile_files(self, store):
         tools = store.build_dream_tools()
+        store.write_user("# User\n- Verbose")
 
-        memory_result = await tools.execute(
+        user_result = await tools.execute(
             "apply_patch",
             {
                 "edits": [
                     {
-                        "path": "memory/MEMORY.md",
+                        "path": "USER.md",
                         "action": "replace",
-                        "old_text": "Project X active",
-                        "new_text": "Project Y active",
+                        "old_text": "Verbose",
+                        "new_text": "Prefers concise replies",
                     }
                 ]
             },
@@ -167,10 +205,26 @@ class TestDreamTools:
             },
         )
 
-        assert "Patch applied" in memory_result
+        assert "Patch applied" in user_result
         assert "Successfully edited" in soul_result
-        assert "Project Y active" in store.memory_file.read_text(encoding="utf-8")
+        assert "Prefers concise replies" in store.user_file.read_text(encoding="utf-8")
         assert "Precise" in store.soul_file.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_dream_cannot_edit_legacy_memory_file(self, store):
+        tools = store.build_dream_tools()
+
+        result = await tools.execute(
+            "edit_file",
+            {
+                "path": "memory/MEMORY.md",
+                "old_text": "Project X active",
+                "new_text": "Project Y active",
+            },
+        )
+
+        assert "outside allowed directory" in result
+        assert "Project X active" in store.memory_file.read_text(encoding="utf-8")
 
     @pytest.mark.asyncio
     async def test_dream_can_write_workspace_skills(self, store):

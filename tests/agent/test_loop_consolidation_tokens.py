@@ -4,6 +4,11 @@ import pytest
 
 import nanobot.agent.memory as memory_module
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.memory import (
+    EXPERT_TEAM_HISTORY_SOURCE,
+    PROFILE_CANDIDATE_KIND,
+)
+from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
@@ -41,9 +46,10 @@ def test_project_session_uses_session_only_consolidator(tmp_path) -> None:
         "access_mode": "restricted",
     }
 
-    assert loop._memory_store_for_session(session) is None
     assert loop._consolidator_for_session(session) is loop.session_consolidator
+    assert loop.session_consolidator is loop.consolidator
     assert loop.session_consolidator.store is None
+    assert loop.session_consolidator.profile_store is loop.context.memory
 
 
 def test_root_project_session_also_uses_session_only_consolidator(tmp_path) -> None:
@@ -56,8 +62,59 @@ def test_root_project_session_also_uses_session_only_consolidator(tmp_path) -> N
         "access_mode": "full",
     }
 
-    assert loop._memory_store_for_session(session) is None
     assert loop._consolidator_for_session(session) is loop.session_consolidator
+    assert loop.session_consolidator.profile_store is loop.context.memory
+
+
+@pytest.mark.asyncio
+async def test_short_project_turn_records_profile_candidate_without_compaction(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    session = loop.sessions.get_or_create("websocket:root-project")
+    session.metadata["project_id"] = "prj_root"
+    loop.sessions.save(session)
+
+    await loop.process_direct(
+        "Please remember that I prefer concise replies in every chat.",
+        session_key=session.key,
+    )
+
+    entries = loop.context.memory.read_unprocessed_history(since_cursor=0)
+    assert len(entries) == 1
+    assert entries[0]["kind"] == PROFILE_CANDIDATE_KIND
+    assert "prefer concise replies" in entries[0]["content"]
+    # One provider call serves the chat turn; profile capture itself adds no LLM call.
+    assert loop.provider.chat_with_retry.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_turn_does_not_record_profile_candidate(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+
+    await loop.process_direct(
+        "This synthetic prompt is not user-profile evidence.",
+        session_key="cli:ephemeral-check",
+        ephemeral=True,
+    )
+
+    assert loop.context.memory.read_unprocessed_history(since_cursor=0) == []
+
+
+def test_expert_team_turn_is_source_tagged_at_capture_boundary(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    session = loop.sessions.get_or_create("websocket:expert-chat")
+    message = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="expert-chat",
+        content="Across all chats, call me Ada.",
+        metadata={"expert_team": {"id": "asset-research-team"}},
+    )
+
+    assert loop._persist_user_message_early(message, session) is True
+
+    entry = loop.context.memory.read_unprocessed_history(since_cursor=0)[0]
+    assert entry["source"] == "expert-team"
+    assert entry["content"].startswith(EXPERT_TEAM_HISTORY_SOURCE)
 
 
 @pytest.mark.asyncio

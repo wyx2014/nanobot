@@ -755,6 +755,28 @@ async def test_run_job_preserves_running_service_state(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_one_time_job_is_retained_as_history_after_run(tmp_path) -> None:
+    async def on_job(_job) -> None:
+        return None
+
+    service = CronService(tmp_path / "cron" / "jobs.json", on_job=on_job)
+    job = service.add_job(
+        name="one-time reminder",
+        schedule=CronSchedule(kind="at", at_ms=int(time.time() * 1000) + 60_000),
+        message="remember this",
+        delete_after_run=False,
+        **_bound_chat(),
+    )
+
+    assert await service.run_job(job.id, force=True) is True
+    archived = service.get_job(job.id)
+    assert archived is not None
+    assert archived.enabled is False
+    assert archived.state.next_run_at_ms is None
+    assert archived.state.run_history[-1].status == "ok"
+
+
+@pytest.mark.asyncio
 async def test_running_service_honors_external_disable(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
     called: list[str] = []

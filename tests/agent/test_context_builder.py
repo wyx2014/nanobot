@@ -358,6 +358,30 @@ class TestBuildSystemPrompt:
         assert "Inbox-only customer secret" not in result
         assert "Prior Inbox-only discussion" not in result
 
+    def test_project_uses_global_profile_and_only_project_agents(self, tmp_path):
+        builder = _builder(tmp_path)
+        (tmp_path / "SOUL.md").write_text("Global calm style", encoding="utf-8")
+        (tmp_path / "USER.md").write_text(
+            "The user prefers concise replies everywhere.",
+            encoding="utf-8",
+        )
+        project = tmp_path / "customer-a"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("Project release rules", encoding="utf-8")
+        (project / "SOUL.md").write_text("Project-only persona", encoding="utf-8")
+        (project / "USER.md").write_text("Project-only user profile", encoding="utf-8")
+
+        result = builder.build_system_prompt(
+            workspace=project,
+            project_id="prj_customer_a",
+        )
+
+        assert "Project release rules" in result
+        assert "Global calm style" in result
+        assert "prefers concise replies everywhere" in result
+        assert "Project-only persona" not in result
+        assert "Project-only user profile" not in result
+
 # ---------------------------------------------------------------------------
 # build_messages
 # ---------------------------------------------------------------------------
@@ -542,7 +566,7 @@ class TestBuildMessages:
         assert "safe follow-up" in replay
         assert "current question" in replay
 
-    def test_skill_scope_filters_disallowed_skill_from_memory_and_recent_history(self, tmp_path):
+    def test_legacy_memory_is_not_injected_and_recent_history_is_skill_filtered(self, tmp_path):
         ws_skills = tmp_path / "skills"
         ws_skills.mkdir()
         _write_skill(ws_skills, "allowed-skill", "Allowed skill")
@@ -571,7 +595,7 @@ class TestBuildMessages:
             session_key="websocket:c",
         )[0]["content"]
 
-        assert "allowed-skill is useful" in system
+        assert "allowed-skill is useful" not in system
         assert "safe recent fact" in system
         assert "ifind-finance-data" not in system
 

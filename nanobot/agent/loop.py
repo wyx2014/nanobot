@@ -623,20 +623,6 @@ class AgentLoop:
             asyncio.Semaphore(_max) if _max > 0 else None
         )
         self.consolidator = Consolidator(
-            store=self.context.memory,
-            provider=provider,
-            model=self.model,
-            sessions=self.sessions,
-            context_window_tokens=self.context_window_tokens,
-            build_messages=self.context.build_messages,
-            get_tool_definitions=self.tools.get_definitions,
-            max_completion_tokens=provider.generation.max_tokens,
-            consolidation_ratio=consolidation_ratio,
-            unified_session=unified_session,
-        )
-        # Project-bound sessions still need compaction, but their summaries
-        # must remain in session metadata instead of entering global memory.
-        self.session_consolidator = Consolidator(
             store=None,
             provider=provider,
             model=self.model,
@@ -647,7 +633,14 @@ class AgentLoop:
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
             unified_session=unified_session,
+            profile_store=self.context.memory,
         )
+        # Conversation continuity and global user-profile learning are separate:
+        # the full summary stays session-local, while direct user-authored profile
+        # candidates from every chat are sent to Dream through profile_store.
+        # Keep the legacy attribute as an alias so every runtime entry point uses
+        # exactly the same compaction policy.
+        self.session_consolidator = self.consolidator
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
             consolidator=self.consolidator,
@@ -742,7 +735,6 @@ class AgentLoop:
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
-        self.session_consolidator.set_provider(provider, model, context_window_tokens)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
             self._runtime_model_publisher(
@@ -1147,6 +1139,8 @@ class AgentLoop:
         self,
         msg: InboundMessage,
         session: Session,
+        *,
+        record_profile_candidate: bool = True,
         **kwargs: Any,
     ) -> bool:
         """Persist the triggering user message before the turn starts.
@@ -1169,6 +1163,14 @@ class AgentLoop:
                 text = text_override
             extra.update(cron_extra)
             session.add_message("user", text, **extra)
+            # Profile learning must not depend on token pressure or idle
+            # compaction. Persist the direct user message immediately as an
+            # unreviewed candidate; Dream decides whether any fact is durable.
+            if record_profile_candidate and not kwargs.get("_command"):
+                self.consolidator.record_profile_candidates(
+                    [session.messages[-1]],
+                    session_key=session.key,
+                )
             self._mark_pending_user_turn(session)
             self.sessions.save(session)
             return True
@@ -1202,37 +1204,14 @@ class AgentLoop:
             unified_session=self._unified_session,
         )
 
-    def _memory_store_for_session(
-        self,
-        session: Session,
-        msg: InboundMessage | None = None,
-    ) -> Any | None:
-        # Project-bound chats must never feed their turn summaries into the
-        # global history, even when the project's canonical root happens to be
-        # the runtime workspace itself (the desktop app's common case).
-        if isinstance(session.metadata.get("project_id"), str):
-            return None
-        if msg is not None:
-            scope = self.workspace_scopes.for_message(msg, session.metadata)
-        else:
-            channel = session.key.split(":", 1)[0] if ":" in session.key else None
-            scope = self.workspace_scopes.for_turn(
-                channel=channel,
-                message_metadata=None,
-                session_metadata=session.metadata,
-            )
-        runtime_root = self.workspace.expanduser().resolve(strict=False)
-        active_root = scope.project_path.expanduser().resolve(strict=False)
-        return self.context.memory if active_root == runtime_root else None
-
     def _consolidator_for_session(
         self,
         session: Session,
         msg: InboundMessage | None = None,
     ) -> Consolidator | None:
-        store = self._memory_store_for_session(session, msg)
-        if store is self.context.memory:
-            return self.consolidator
+        # Project scope controls files and tools, not whether direct user profile
+        # evidence may be considered. All sessions use the continuity summarizer;
+        # its profile_store side channel applies source-aware filtering separately.
         return self.session_consolidator
 
     async def _dispatch_command_inline(
@@ -3479,7 +3458,9 @@ class AgentLoop:
             include_memory_recent_history=not ctx.ephemeral,
         )
         ctx.user_persisted_early = self._persist_user_message_early(
-            ctx.msg, ctx.session
+            ctx.msg,
+            ctx.session,
+            record_profile_candidate=not ctx.ephemeral,
         )
 
         if ctx.on_progress is None:

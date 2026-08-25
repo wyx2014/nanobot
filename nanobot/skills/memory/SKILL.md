@@ -1,6 +1,6 @@
 ---
 name: memory
-description: 具有 Dream 维护机制的双层知识库记忆系统。
+description: 由 Dream 维护的全局用户画像与会话候选记忆系统。
 always: true
 ---
 
@@ -10,12 +10,23 @@ always: true
 
 - `SOUL.md` — Bot personality and communication style. **Managed by Dream.** Do NOT edit.
 - `USER.md` — User profile and preferences. **Managed by Dream.** Do NOT edit.
-- `memory/MEMORY.md` — Long-term facts (project context, important events). **Managed by Dream.** Do NOT edit.
-- `memory/history.jsonl` — append-only JSONL, not loaded into context. Prefer the built-in `grep` tool to search it.
+- `memory/MEMORY.md` — Read-only legacy/restore compatibility; it is not normal chat context and Dream cannot write it. Do NOT edit.
+- `memory/history.jsonl` — append-only Dream input. It contains unreviewed direct-user profile candidates and legacy archive entries; candidates are not confirmed memory and are not injected into normal chat context.
+
+Project facts, decisions, generated research, file paths, and workflow state belong in project files
+or the current session summary, not in the global user profile.
 
 ## Search Past Events
 
-`memory/history.jsonl` is JSONL format — each line is a JSON object with `cursor`, `timestamp`, `content`.
+`memory/history.jsonl` is JSONL format — each line is a JSON object with `cursor`, `timestamp`,
+`content`, and optional source metadata such as `kind`, `source`, and `session_key`.
+
+Entries tagged `[source: user-profile-candidate]` are staging evidence. Do not treat a candidate as a
+known user fact until Dream has curated it into `USER.md` or `SOUL.md`. Expert-team candidates are
+also tagged `[source: expert-team]`; team roles, rubrics, report formats, delegation mechanics, and
+project facts must not be generalized into global memory.
+
+Slash commands and structured interactive-prompt answers are workflow control, not profile evidence.
 
 - For broad searches, start with `grep(..., path="memory", glob="*.jsonl", output_mode="count")` or the default `files_with_matches` mode before expanding to full content
 - Use `output_mode="content"` plus `context_before` / `context_after` when you need the exact matching lines
@@ -33,4 +44,5 @@ Examples (replace `keyword`):
 
 - **Do NOT edit SOUL.md, USER.md, or MEMORY.md.** They are automatically managed by Dream.
 - If you notice outdated information, it will be corrected when Dream runs next.
+- Keep project-specific continuity in project files and session history; do not promote it to global memory.
 - Users can view Dream's activity with the `/dream-log` command.

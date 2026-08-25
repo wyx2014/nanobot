@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,9 @@ if TYPE_CHECKING:
 
 EXPERT_TEAM_TURN_KEY = "_expert_team_turn"
 EXPERT_TEAM_HISTORY_SOURCE = "[source: expert-team]"
+PROFILE_CANDIDATE_KIND = "user_profile_candidate"
+PROFILE_CANDIDATE_SOURCE = "[source: user-profile-candidate]"
+PROFILE_CANDIDATE_RECORDED_KEY = "_user_profile_candidate_recorded"
 _LEGACY_EXPERT_TEAM_MEMORY_MARKERS = (
     "四维度分析框架",
     "四角色并行",
@@ -260,12 +264,16 @@ class MemoryStore:
     def write_user(self, content: str) -> None:
         self.user_file.write_text(content, encoding="utf-8")
 
-    # -- context injection (used by context.py) ------------------------------
+    # -- legacy context formatting -------------------------------------------
 
     def get_memory_context(self) -> str:
+        """Format legacy MEMORY.md for compatibility callers.
+
+        Normal conversation prompts no longer call this method.
+        """
         long_term = self.read_memory()
         long_term = truncate_text_to_tokens(long_term, 3_000)
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        return f"## Legacy Memory\n{long_term}" if long_term else ""
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
@@ -275,6 +283,9 @@ class MemoryStore:
         *,
         max_chars: int | None = None,
         session_key: str | None = None,
+        kind: str | None = None,
+        source: str | None = None,
+        candidate_id: str | None = None,
     ) -> int:
         """Append *entry* to history.jsonl and return its auto-incrementing cursor.
 
@@ -307,6 +318,10 @@ class MemoryStore:
         # Cursor allocation and the append must be atomic: concurrent writers
         # could otherwise read the same current cursor and emit duplicates.
         with self._append_lock:
+            if candidate_id:
+                for existing, existing_cursor in self._iter_valid_entries():
+                    if existing.get("candidate_id") == candidate_id:
+                        return existing_cursor
             cursor = self._next_cursor()
             if raw and not content:
                 logger.debug(
@@ -317,10 +332,107 @@ class MemoryStore:
             record = {"cursor": cursor, "timestamp": ts, "content": content}
             if session_key:
                 record["session_key"] = session_key
+            if kind:
+                record["kind"] = kind
+            if source:
+                record["source"] = source
+            if candidate_id:
+                record["candidate_id"] = candidate_id
             with open(self.history_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             self._cursor_file.write_text(str(cursor), encoding="utf-8")
         return cursor
+
+    @staticmethod
+    def _profile_candidate_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        parts = [
+            block["text"].strip()
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and block["text"].strip()
+        ]
+        return "\n".join(parts)
+
+    def append_profile_candidates(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        session_key: str | None,
+    ) -> int:
+        """Persist unreviewed user-authored profile evidence for Dream.
+
+        This path deliberately keeps assistant, tool, subagent, cron, and channel-delivery
+        content out of global memory. Project and expert-team chats remain eligible sources,
+        but their user messages are tagged as candidates rather than injected into runtime
+        context. Dream performs the final fact-level scope and persistence decision.
+        """
+        if self._is_internal_history_session(session_key):
+            for message in messages:
+                if message.get("role") == "user":
+                    message[PROFILE_CANDIDATE_RECORDED_KEY] = True
+            return 0
+
+        recorded = 0
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            if message.get(PROFILE_CANDIDATE_RECORDED_KEY):
+                continue
+            if (
+                message.get("_cron_turn")
+                or message.get("_channel_delivery")
+                or message.get("_command")
+                or message.get("interactive_prompt_answer")
+                or message.get("injected_event")
+            ):
+                message[PROFILE_CANDIDATE_RECORDED_KEY] = True
+                continue
+
+            content = self._profile_candidate_text(message.get("content"))
+            if not content:
+                message[PROFILE_CANDIDATE_RECORDED_KEY] = True
+                continue
+
+            expert_team = bool(message.get(EXPERT_TEAM_TURN_KEY))
+            timestamp = str(message.get("timestamp") or "?")[:32]
+            source = "expert-team" if expert_team else "user"
+            headers = (
+                [EXPERT_TEAM_HISTORY_SOURCE, PROFILE_CANDIDATE_SOURCE]
+                if expert_team
+                else [PROFILE_CANDIDATE_SOURCE]
+            )
+            candidate_content = "\n".join([
+                *headers,
+                f"[{timestamp}] USER: {truncate_text(content, _PROFILE_CANDIDATE_MAX_CHARS)}",
+            ])
+            fingerprint = json.dumps(
+                {
+                    "session_key": session_key,
+                    "timestamp": timestamp,
+                    "content": content,
+                    "source": source,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            candidate_id = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+            self.append_history(
+                candidate_content,
+                max_chars=_PROFILE_CANDIDATE_MAX_CHARS + 256,
+                session_key=session_key,
+                kind=PROFILE_CANDIDATE_KIND,
+                source=source,
+                candidate_id=candidate_id,
+            )
+            message[PROFILE_CANDIDATE_RECORDED_KEY] = True
+            recorded += 1
+        return recorded
 
     @staticmethod
     def _valid_cursor(value: Any) -> int | None:
@@ -367,7 +479,12 @@ class MemoryStore:
         if not isinstance(entry.get("content"), str):
             return False
         session_key = entry.get("session_key")
-        return session_key is None or isinstance(session_key, str)
+        if session_key is not None and not isinstance(session_key, str):
+            return False
+        for key in ("kind", "source", "candidate_id"):
+            if entry.get(key) is not None and not isinstance(entry[key], str):
+                return False
+        return True
 
     def _read_cursor_counter(self) -> int | None:
         """Return the persisted cursor counter when it is usable."""
@@ -418,7 +535,11 @@ class MemoryStore:
         unified_session: bool = False,
     ) -> list[dict[str, Any]]:
         """Return unprocessed history entries safe to inject into a turn prompt."""
-        entries = self.read_unprocessed_history(since_cursor=since_cursor)
+        entries = [
+            entry
+            for entry in self.read_unprocessed_history(since_cursor=since_cursor)
+            if entry.get("kind") != PROFILE_CANDIDATE_KIND
+        ]
         if session_key is None:
             return entries
         if not unified_session:
@@ -532,7 +653,12 @@ class MemoryStore:
                 and any(marker in content for marker in _LEGACY_EXPERT_TEAM_MEMORY_MARKERS)
             ):
                 content = f"{EXPERT_TEAM_HISTORY_SOURCE}\n{content}"
-            return f"[{entry['timestamp']}] {truncate_text(content, 500)}"
+            limit = (
+                _DREAM_PROFILE_CANDIDATE_MAX_CHARS
+                if entry.get("kind") == PROFILE_CANDIDATE_KIND
+                else _DREAM_LEGACY_ENTRY_MAX_CHARS
+            )
+            return f"[{entry['timestamp']}] {truncate_text(content, limit)}"
 
         history_text = "\n".join(_dream_entry_text(entry) for entry in batch)
         skill_creator_path = str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md")
@@ -557,7 +683,7 @@ class MemoryStore:
         skills_dir.mkdir(parents=True, exist_ok=True)
 
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
-        editable_files = [self.memory_file, self.soul_file, self.user_file]
+        editable_files = [self.soul_file, self.user_file]
 
         tools.register(ReadFileTool(
             workspace=workspace,
@@ -676,10 +802,18 @@ class MemoryStore:
 _RAW_ARCHIVE_MAX_CHARS = 16_000       # fallback dump (LLM failed)
 _ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced consolidation summary
 _HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
+_PROFILE_CANDIDATE_MAX_CHARS = 4_000  # unreviewed direct user evidence for Dream
+_DREAM_LEGACY_ENTRY_MAX_CHARS = 500
+_DREAM_PROFILE_CANDIDATE_MAX_CHARS = 2_000
 
 
 class Consolidator:
-    """Lightweight consolidation: summarizes evicted messages into history.jsonl."""
+    """Preserve session continuity and emit user-profile candidates for Dream.
+
+    ``store`` remains available for legacy archive callers. The runtime uses a
+    session-only consolidator (``store=None``) and sends only direct-user
+    candidates through ``profile_store``.
+    """
 
     _MAX_CONSOLIDATION_ROUNDS = 5
 
@@ -697,6 +831,7 @@ class Consolidator:
         max_completion_tokens: int = 4096,
         consolidation_ratio: float = 0.5,
         unified_session: bool = False,
+        profile_store: MemoryStore | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -706,6 +841,7 @@ class Consolidator:
         self.max_completion_tokens = max_completion_tokens
         self.consolidation_ratio = consolidation_ratio
         self.unified_session = unified_session
+        self.profile_store = profile_store
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
@@ -882,7 +1018,7 @@ class Consolidator:
         session_key: str | None = None,
         summary_messages: list[dict] | None = None,
     ) -> str | None:
-        """Summarize messages via LLM and append to history.jsonl.
+        """Summarize messages via LLM and optionally append a legacy archive.
 
         ``messages`` are the messages being archived (removed from the live
         session); they are what gets raw-dumped if the LLM call fails.
@@ -894,6 +1030,7 @@ class Consolidator:
         if not messages:
             return None
         messages_to_summarize = summary_messages if summary_messages is not None else messages
+        self.record_profile_candidates(messages_to_summarize, session_key=session_key)
         expert_team_derived = any(
             message.get(EXPERT_TEAM_TURN_KEY)
             for message in [*messages, *messages_to_summarize]
@@ -913,9 +1050,11 @@ class Consolidator:
                 archive_contract += (
                     "\n\n## Expert-team memory boundary\n"
                     "This chunk was produced with an explicitly selected expert team. "
-                    "Preserve only explicit user preferences and non-public project facts. "
+                    "Preserve only direct user-authored identity facts or explicitly global "
+                    "cross-session preferences. "
                     "Mark team roles, named analysis frameworks, parallel-work workflows, "
-                    "report structure, scoring rubrics, and output formatting as [skip]. "
+                    "report structure, scoring rubrics, output formatting, and project facts "
+                    "as [skip]. "
                     "Selecting a team is not evidence that the user wants its methodology "
                     "in unrelated or future conversations."
                 )
@@ -953,6 +1092,27 @@ class Consolidator:
             else:
                 logger.warning("Session-only consolidation LLM call failed")
             return None
+
+    def record_profile_candidates(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        session_key: str | None,
+    ) -> int:
+        """Best-effort side channel from any interactive session into Dream input."""
+        if self.profile_store is None or not messages:
+            return 0
+        try:
+            return self.profile_store.append_profile_candidates(
+                messages,
+                session_key=session_key,
+            )
+        except Exception:
+            logger.exception(
+                "Profile candidate archival failed for {}",
+                session_key or "(unknown session)",
+            )
+            return 0
 
     async def maybe_consolidate_by_tokens(
         self,
@@ -1089,6 +1249,11 @@ class Consolidator:
                 session.updated_at = datetime.now()
                 self.sessions.save(session)
                 return ""
+
+            self.record_profile_candidates(
+                messages_to_summarize,
+                session_key=session_key,
+            )
 
             probe = Session(
                 key=session.key,

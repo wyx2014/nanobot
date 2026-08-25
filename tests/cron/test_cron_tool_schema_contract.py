@@ -94,6 +94,12 @@ class TestSchemaSelfDescribesRequirements:
         desc = tool.parameters["properties"]["job_id"]["description"]
         assert "REQUIRED" in desc and "action='remove'" in desc
 
+    def test_at_description_protects_one_time_semantics(self) -> None:
+        tool = CronTool(_SvcStub())
+        desc = tool.parameters["properties"]["at"]["description"]
+        assert "specific date/time" in desc
+        assert "do not turn" in desc
+
     def test_top_level_required_stays_narrow(self) -> None:
         # If 'message' or 'job_id' ever creep back into top-level required,
         # list/remove start failing schema validation (the bug PR #3163 v1

@@ -3,13 +3,14 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from websockets.datastructures import Headers
 from websockets.http11 import Request, Response
 
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronRunRecord, CronSchedule
+from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronRunRecord, CronSchedule
 from nanobot.storage.state import StateStore, StateStoreError
-from nanobot.webui.schedule_routes import WebUIScheduleRouter, _schedule_from_query
+from nanobot.webui.schedule_routes import WebUIScheduleRouter, _schedule_from_query, _task_payload
 
 
 def _json_response(payload: dict) -> Response:
@@ -104,6 +105,82 @@ def test_monthly_schedule_query_clamps_day_to_valid_cron_range() -> None:
 
     assert schedule.expr == "0 9 31 * *"
     assert metadata["dayOfMonth"] == 31
+
+
+def test_once_schedule_query_builds_at_schedule() -> None:
+    schedule, enabled, metadata = _schedule_from_query(
+        {
+            "frequency": ["once"],
+            "at": ["2099-08-30T01:15:00Z"],
+            "timezone": ["Asia/Shanghai"],
+        }
+    )
+
+    assert enabled is True
+    assert schedule.kind == "at"
+    assert schedule.at_ms == 4091735700000
+    assert metadata == {
+        "frequency": "once",
+        "at": "2099-08-30T01:15:00Z",
+        "timezone": "Asia/Shanghai",
+    }
+
+
+def test_once_schedule_requires_an_execution_time() -> None:
+    with pytest.raises(ValueError, match="at is required"):
+        _schedule_from_query({"frequency": ["once"]})
+
+
+def test_chat_created_once_job_is_not_serialized_as_daily() -> None:
+    job = CronJob(
+        id="once-1",
+        name="One-time reminder",
+        schedule=CronSchedule(kind="at", at_ms=4091735700000),
+        payload=CronPayload(message="提醒我提交材料"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    payload = _task_payload(job)
+
+    assert payload["schedule"] == {
+        "frequency": "once",
+        "at": "2099-08-30T01:15:00Z",
+    }
+
+
+def test_finished_once_job_is_serialized_as_completed() -> None:
+    job = CronJob(
+        id="once-completed",
+        name="Completed reminder",
+        enabled=False,
+        schedule=CronSchedule(kind="at", at_ms=4091735700000),
+        payload=CronPayload(message="提醒我提交材料"),
+        state=CronJobState(last_run_at_ms=4091735700000),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    assert _task_payload(job)["status"] == "completed"
+
+
+def test_unrecognized_recurring_job_is_serialized_as_custom_not_daily() -> None:
+    job = CronJob(
+        id="custom-1",
+        name="Custom schedule",
+        schedule=CronSchedule(kind="cron", expr="*/15 8-18 * * 1-5", tz="Asia/Shanghai"),
+        payload=CronPayload(message="检查状态"),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    payload = _task_payload(job)
+
+    assert payload["schedule"] == {
+        "frequency": "custom",
+        "cronExpression": "*/15 8-18 * * 1-5",
+        "timezone": "Asia/Shanghai",
+    }
 
 
 async def test_create_schedule_persists_registered_workspace_scope(tmp_path: Path) -> None:

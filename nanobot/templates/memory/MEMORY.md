@@ -1,23 +1,12 @@
-# Long-term Memory
+# Legacy Memory
 
-This file stores important information that should persist across sessions.
+This file is retained for read/restore compatibility with older nanobot workspaces.
 
-## User Information
-
-(Important facts about the user)
-
-## Preferences
-
-(User preferences learned over time)
-
-## Project Context
-
-(Information about ongoing projects)
-
-## Important Notes
-
-(Things to remember)
+- Durable user identity and preferences belong in `USER.md`.
+- Global agent style and behavior belong in `SOUL.md`.
+- Project facts and workflow state belong in project files or `AGENTS.md`.
+- Do not add new conversation, project, or session facts here.
 
 ---
 
-*This file is automatically updated by nanobot when important information should be remembered.*
+*Dream leaves this file unchanged; use memory version restore when historical recovery is needed.*

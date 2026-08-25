@@ -3,8 +3,9 @@
 
 ## Workspace
 Your workspace is at: {{ workspace_path }}
-- Long-term memory: {{ workspace_path }}/memory/MEMORY.md (automatically managed by Dream — do not edit directly)
-- History log: {{ workspace_path }}/memory/history.jsonl (append-only JSONL; prefer built-in `grep` for search).
+- Global user profile: {{ profile_workspace_path }}/USER.md and {{ profile_workspace_path }}/SOUL.md (managed by Dream — do not edit directly).
+- Profile candidate log: {{ profile_workspace_path }}/memory/history.jsonl (append-only Dream input; candidates are not confirmed memory).
+- Legacy memory: {{ profile_workspace_path }}/memory/MEMORY.md (read/restore compatibility only; do not add project or session facts).
 - Custom skills: {{ workspace_path }}/skills/{% raw %}{skill-name}{% endraw %}/SKILL.md
 
 {{ platform_policy }}

@@ -383,18 +383,17 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
 
 def _format_dream_no_input_message() -> str:
     return "\n".join([
-        "Dream has no conversation history to process yet.",
+        "Dream has no new user-profile candidates to process yet.",
         "",
         "Dream reads new entries from `memory/history.jsonl` after the current Dream cursor.",
         (
-            "Short chats only reach that file after token compaction or idle auto-compact, "
-            "so a fresh or short WebUI chat may leave Dream with no input."
+            "Direct user messages from ordinary and project chats are recorded as candidates; "
+            "assistant output, tools, scheduled jobs, and expert-team process details are excluded."
         ),
         "",
         "Next steps:",
-        "- Enable `agents.defaults.idleCompactAfterMinutes` so completed chats become Dream input automatically.",
-        "- Compact the current chat into memory once that manual action is available.",
-        "- If you expected history to exist, check whether `memory/history.jsonl` has new entries after the Dream cursor.",
+        "- Send a normal message containing a durable fact or global preference, then run `/dream` again.",
+        "- If you expected candidates to exist, compare `memory/history.jsonl` with the Dream cursor.",
     ])
 
 
@@ -476,7 +475,8 @@ async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
     Default: diff of the latest commit (HEAD~1 vs HEAD).
     With /dream-log <sha>: diff of that specific commit.
     """
-    store = ctx.loop.consolidator.store
+    context = getattr(ctx.loop, "context", None)
+    store = getattr(context, "memory", None) or ctx.loop.consolidator.store
     git = store.git
 
     if not git.is_initialized():
@@ -527,7 +527,8 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
         /dream-restore          — list recent commits
         /dream-restore <sha>    — revert a specific commit
     """
-    store = ctx.loop.consolidator.store
+    context = getattr(ctx.loop, "context", None)
+    store = getattr(context, "memory", None) or ctx.loop.consolidator.store
     git = store.git
     if not git.is_initialized():
         return OutboundMessage(

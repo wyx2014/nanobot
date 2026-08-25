@@ -305,9 +305,12 @@ class ContextBuilder:
         turn_metadata: Mapping[str, Any] | None = None,
         project_id: str | None = None,
     ) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        """Build the prompt from identity, project guidance, global profile, and skills."""
         root = workspace or self.workspace
-        memory_store = (
+        # Legacy history entries may still help the same non-project session.
+        # New user-profile candidates are filtered by MemoryStore and are never
+        # injected here; project sessions rely on their own session summaries.
+        history_store = (
             self.memory
             if project_id is None
             and root.expanduser().resolve(strict=False)
@@ -318,7 +321,15 @@ class ContextBuilder:
         disallowed_markers = self._disallowed_workspace_skill_markers(allowed_workspace_skills)
         parts = [self._get_identity(channel=channel, workspace=root)]
 
-        bootstrap = self._load_bootstrap_files(root)
+        # Workspace instructions are project-scoped. User identity, preferences,
+        # and agent style are global and must follow the user into every project.
+        bootstrap = "\n\n".join(filter(None, [
+            self._load_bootstrap_files(root, filenames=("AGENTS.md",)),
+            self._load_bootstrap_files(
+                self.workspace,
+                filenames=("SOUL.md", "USER.md"),
+            ),
+        ]))
         if bootstrap:
             parts.append(bootstrap)
 
@@ -327,20 +338,6 @@ class ContextBuilder:
             workspace_path=str(root.expanduser().resolve(strict=False)),
         ))
         parts.append(render_template("agent/tool_contract.md"))
-
-        if memory_store is not None:
-            memory = memory_store.get_memory_context()
-            if memory and not self._is_template_content(memory_store.read_memory(), "memory/MEMORY.md"):
-                memory = _filter_disallowed_skill_text(memory, disallowed_markers)
-            if memory:
-                parts.append(f"# Memory\n\n{memory}")
-                record_pending_context_item(
-                    item_kind="semantic_memory",
-                    source_id="global",
-                    source_locator=str(memory_store.memory_file),
-                    content=memory,
-                    selected_reason="active_memory_context",
-                )
 
         skill_entries = self.skills.list_skills(
             allowed_workspace_skills=allowed_workspace_skills,
@@ -384,9 +381,9 @@ class ContextBuilder:
         if team_prompt:
             parts.append(team_prompt)
 
-        if include_memory_recent_history and memory_store is not None:
-            entries = memory_store.read_recent_history_for_prompt(
-                since_cursor=memory_store.get_last_dream_cursor(),
+        if include_memory_recent_history and history_store is not None:
+            entries = history_store.read_recent_history_for_prompt(
+                since_cursor=history_store.get_last_dream_cursor(),
                 session_key=session_key,
                 unified_session=unified_session,
             )
@@ -523,6 +520,7 @@ class ContextBuilder:
         return render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
+            profile_workspace_path=str(self.workspace.expanduser().resolve()),
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
@@ -560,12 +558,17 @@ class ContextBuilder:
 
         return _to_blocks(left) + _to_blocks(right)
 
-    def _load_bootstrap_files(self, workspace: Path | None = None) -> str:
+    def _load_bootstrap_files(
+        self,
+        workspace: Path | None = None,
+        *,
+        filenames: Sequence[str] | None = None,
+    ) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
         root = workspace or self.workspace
 
-        for filename in self.BOOTSTRAP_FILES:
+        for filename in filenames or self.BOOTSTRAP_FILES:
             file_path = root / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")

@@ -104,11 +104,11 @@ async def test_dream_no_history_explains_how_to_create_input(tmp_path) -> None:
     assert immediate.content == "Dreaming..."
     assert len(bus.outbound) == 1
     content = bus.outbound[0].content
-    assert "Dream has no conversation history to process yet." in content
+    assert "Dream has no new user-profile candidates to process yet." in content
     assert "`memory/history.jsonl`" in content
-    assert "idle auto-compact" in content
+    assert "Direct user messages" in content
+    assert "expert-team process details are excluded" in content
     assert "Dream cursor" in content
-    assert "agents.defaults.idleCompactAfterMinutes" in content
 
 
 @pytest.mark.asyncio

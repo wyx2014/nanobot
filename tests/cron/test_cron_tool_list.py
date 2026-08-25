@@ -338,12 +338,45 @@ def test_add_at_job_uses_default_timezone_for_naive_datetime(tmp_path) -> None:
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
     )
 
-    result = tool._add_job(None, "Morning reminder", None, None, None, "2026-03-25T08:00:00")
+    result = tool._add_job(None, "Morning reminder", None, None, None, "2099-03-25T08:00:00")
 
     assert result.startswith("Created job")
+    assert "schedule: at 2099-03-25T08:00:00" in result
     job = tool._cron.list_jobs()[0]
-    expected = int(datetime(2026, 3, 25, 0, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    expected = int(datetime(2099, 3, 25, 0, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
     assert job.schedule.at_ms == expected
+    assert job.delete_after_run is False
+
+
+def test_add_at_job_rejects_past_datetime(tmp_path) -> None:
+    tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+    tool.set_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    )
+
+    result = tool._add_job(None, "Old reminder", None, None, None, "2020-03-25T08:00:00")
+
+    assert result == "Error: one-time schedule must be in the future"
+    assert tool._cron.list_jobs() == []
+
+
+def test_add_job_rejects_ambiguous_schedule_modes(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    )
+
+    result = tool._add_job(
+        None,
+        "Ambiguous reminder",
+        None,
+        "0 9 * * *",
+        None,
+        "2099-03-25T08:00:00",
+    )
+
+    assert result == "Error: provide exactly one of every_seconds, cron_expr, or at"
+    assert tool._cron.list_jobs() == []
 
 
 def test_add_job_binds_current_session_key(tmp_path) -> None:

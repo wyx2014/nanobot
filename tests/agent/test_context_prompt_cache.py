@@ -439,8 +439,8 @@ def test_template_memory_md_is_skipped(tmp_path) -> None:
     assert "This file is automatically updated by nanobot" not in prompt
 
 
-def test_customized_memory_md_is_injected(tmp_path) -> None:
-    """A Dream-populated MEMORY.md should be injected normally."""
+def test_customized_legacy_memory_md_is_not_injected(tmp_path) -> None:
+    """Legacy MEMORY.md remains on disk but is not normal conversation context."""
     workspace = _make_workspace(tmp_path)
     from nanobot.utils.helpers import sync_workspace_templates
     sync_workspace_templates(workspace, silent=True)
@@ -452,5 +452,5 @@ def test_customized_memory_md_is_injected(tmp_path) -> None:
     builder = ContextBuilder(workspace)
     prompt = builder.build_system_prompt()
 
-    assert "# Memory\n\n## Long-term Memory" in prompt
-    assert "User prefers dark mode" in prompt
+    assert "# Memory\n\n## Long-term Memory" not in prompt
+    assert "User prefers dark mode" not in prompt

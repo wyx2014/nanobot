@@ -624,8 +624,8 @@ class TestAutoCompactEdgeCases:
         await loop.close_mcp()
 
     @pytest.mark.asyncio
-    async def test_auto_compact_archive_failure_still_keeps_recent_suffix(self, tmp_path):
-        """Auto-new should keep the recent suffix even if LLM archive falls back to raw dump."""
+    async def test_auto_compact_archive_failure_keeps_live_session_intact(self, tmp_path):
+        """Session-only compaction must not drop context when its summary fails."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
         session = loop.sessions.get_or_create("cli:test")
         _add_turns(session, 6, prefix="important")
@@ -638,7 +638,8 @@ class TestAutoCompactEdgeCases:
         await loop.auto_compact._archive("cli:test")
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(session_after.messages) == 12
+        assert "cli:test" not in loop.auto_compact._summaries
 
         await loop.close_mcp()
 

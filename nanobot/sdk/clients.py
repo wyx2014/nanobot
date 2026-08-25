@@ -107,17 +107,17 @@ class SessionClient:
 
 
 class MemoryClient:
-    """Long-term memory helpers exposed through ``bot.memory``."""
+    """Legacy memory and candidate-history helpers exposed through ``bot.memory``."""
 
     def __init__(self, loop: AgentLoop) -> None:
         self._loop = loop
 
     def read(self) -> str:
-        """Read ``memory/MEMORY.md``."""
+        """Read the legacy-compatible ``memory/MEMORY.md`` file."""
         return self._loop.context.memory.read_memory()
 
     def write(self, text: str) -> None:
-        """Overwrite ``memory/MEMORY.md``."""
+        """Overwrite legacy ``memory/MEMORY.md`` for API compatibility."""
         self._loop.context.memory.write_memory(text)
 
     def append_history(self, text: str, *, session_key: str | None = None) -> int:
@@ -151,7 +151,10 @@ class RuntimeClient:
     async def compact_session(self, session_key: str) -> SessionSnapshot:
         """Run token/replay-window consolidation for one session."""
         session = self._loop.sessions.get_or_create(session_key)
-        await self._loop.consolidator.maybe_consolidate_by_tokens(
+        consolidator = self._loop._consolidator_for_session(session)
+        if consolidator is None:
+            return snapshot_from_session(session)
+        await consolidator.maybe_consolidate_by_tokens(
             session,
             replay_max_messages=self._loop._max_messages,
         )
@@ -159,7 +162,11 @@ class RuntimeClient:
 
     async def compact_idle_session(self, session_key: str, *, max_suffix: int = 8) -> str | None:
         """Run idle-session compaction for one session and return the summary."""
-        return await self._loop.consolidator.compact_idle_session(
+        session = self._loop.sessions.get_or_create(session_key)
+        consolidator = self._loop._consolidator_for_session(session)
+        if consolidator is None:
+            return None
+        return await consolidator.compact_idle_session(
             session_key,
             max_suffix=max_suffix,
         )
