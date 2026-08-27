@@ -55,6 +55,75 @@ class ProjectionBindingRecovery:
     mismatch_count: int = 0
 
 
+def reconcile_relocated_session_projects(
+    state: StateStore,
+    *,
+    session_manager: Any | None,
+    logger: Any = default_logger,
+) -> int:
+    """Repair project roots after an external directory migration.
+
+    Session JSONL metadata is durable while ``state.sqlite`` is a projection.
+    Desktop upgrades may move a workspace and rewrite that durable metadata
+    before the gateway starts.  When the old projected root is gone, the new
+    durable root exists, and both records carry the same stable project id, the
+    move is unambiguous and can be applied without rebinding any session.
+
+    An existing projected root always wins.  This preserves the explicit
+    project-relocate flow, where SQLite may intentionally be newer than older
+    session metadata.
+    """
+    if session_manager is None:
+        return 0
+
+    relocated_project_ids: set[str] = set()
+    for state_session in state.list_sessions(include_archived=True):
+        project = state.get_project(state_session.project_id)
+        if (
+            project is None
+            or project.id in relocated_project_ids
+            or project.kind != "workspace"
+            or project.status == "archived"
+        ):
+            continue
+
+        projected_root = Path(project.canonical_root_path).expanduser()
+        if projected_root.is_dir():
+            continue
+
+        metadata_record = session_manager.read_session_metadata(
+            state_session.session_key
+        )
+        metadata = (
+            metadata_record.get("metadata")
+            if isinstance(metadata_record, dict)
+            else None
+        )
+        if not isinstance(metadata, dict) or metadata.get("project_id") != project.id:
+            continue
+        scope = metadata.get("workspace_scope")
+        durable_path = scope.get("project_path") if isinstance(scope, dict) else None
+        if not isinstance(durable_path, str) or not durable_path.strip() or "\0" in durable_path:
+            continue
+
+        durable_root = Path(durable_path).expanduser()
+        try:
+            if not durable_root.is_absolute() or not durable_root.is_dir():
+                continue
+            state.relocate_project(project.id, durable_root)
+        except (OSError, ValueError, RuntimeError):
+            logger.exception(
+                "failed to reconcile relocated project id={} old={} new={}",
+                project.id,
+                projected_root,
+                durable_root,
+            )
+            continue
+        relocated_project_ids.add(project.id)
+
+    return len(relocated_project_ids)
+
+
 def _canonical_root(value: str | Path) -> str:
     return os.path.normcase(
         os.path.normpath(str(Path(value).expanduser().resolve(strict=False)))
@@ -221,6 +290,16 @@ def build_gateway_services(
         or binding_recovery.backup_dir is not None
     )
     state.reconcile_default_workspace_project()
+    relocated_projects = reconcile_relocated_session_projects(
+        state,
+        session_manager=session_manager,
+        logger=logger,
+    )
+    if relocated_projects:
+        logger.info(
+            "reconciled externally relocated session projects count={}",
+            relocated_projects,
+        )
     lifecycle = LifecycleRegistry(
         workspace_path / ".nanobot" / "lifecycle.jsonl"
     )
