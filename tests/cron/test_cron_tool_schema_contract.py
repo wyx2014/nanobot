@@ -62,9 +62,23 @@ class TestSchemaContract:
 
     def test_add_with_message_accepted(self, registry: ToolRegistry) -> None:
         _, _, err = registry.prepare_call(
-            "cron", {"action": "add", "message": "ping", "at": "2030-01-01T00:00:00"}
+            "cron", {
+                "action": "add",
+                "message": "ping",
+                "mode": "reminder",
+                "at": "2030-01-01T00:00:00",
+            }
         )
         assert err is None
+
+    def test_add_without_mode_rejects_ambiguous_result_behavior(
+        self, registry: ToolRegistry
+    ) -> None:
+        _, _, err = registry.prepare_call(
+            "cron", {"action": "add", "message": "ping", "at": "2030-01-01T00:00:00"}
+        )
+        assert err is not None
+        assert "mode" in err
 
     def test_add_without_message_surfaces_actionable_runtime_error(
         self, registry: ToolRegistry
@@ -99,6 +113,13 @@ class TestSchemaSelfDescribesRequirements:
         desc = tool.parameters["properties"]["at"]["description"]
         assert "specific date/time" in desc
         assert "do not turn" in desc
+
+    def test_mode_description_distinguishes_reminders_from_agent_tasks(self) -> None:
+        tool = CronTool(_SvcStub())
+        desc = tool.parameters["properties"]["mode"]["description"]
+        assert "REQUIRED" in desc
+        assert "reminder" in desc
+        assert "reasoning" in desc
 
     def test_top_level_required_stays_narrow(self) -> None:
         # If 'message' or 'job_id' ever creep back into top-level required,

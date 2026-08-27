@@ -1210,6 +1210,41 @@ def test_provider_models_payload_fetches_dynamic_custom_provider_models(
     assert payload["models"][0]["id"] == "custom-gpt"
 
 
+def test_provider_models_payload_uses_saved_key_when_probe_omits_api_key(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config.model_validate(
+        {
+            "providers": {
+                "asset-deepseek": {
+                    "apiBase": "https://asset-deepseek.test/v1",
+                    "apiKey": "saved-key",
+                }
+            }
+        }
+    )
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    def fake_get(url: str, **kwargs):
+        assert url == "https://asset-deepseek.test/v1/models"
+        assert kwargs["headers"]["Authorization"] == "Bearer saved-key"
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "deepseek-chat"}]},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("nanobot.webui.settings_api.httpx.get", fake_get)
+
+    payload = provider_models_payload({"provider": ["asset-deepseek"]})
+
+    assert payload["status"] == "available"
+    assert payload["models"][0]["id"] == "deepseek-chat"
+
+
 def test_provider_models_payload_detects_stepfun_and_audio_capabilities(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

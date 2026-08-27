@@ -38,6 +38,28 @@ def session_automation_jobs(
     )
 
 
+def is_terminal_one_time_automation(job: CronJob) -> bool:
+    """Return whether a one-time automation has finished and cannot fire again."""
+    return (
+        job.schedule.kind == "at"
+        and job.state.last_run_at_ms is not None
+        and job.state.last_status in {"ok", "error", "skipped"}
+    )
+
+
+def session_archive_blocking_jobs(
+    cron_service: _CronServiceLike | None,
+    session_key: str,
+) -> list[CronJob]:
+    """Return attached jobs that still require the source session."""
+    return [
+        job
+        for job in session_automation_jobs(cron_service, session_key)
+        if job.payload.result_type == "conversation"
+        and not is_terminal_one_time_automation(job)
+    ]
+
+
 def session_automations_payload(
     cron_service: _CronServiceLike | None,
     session_key: str,

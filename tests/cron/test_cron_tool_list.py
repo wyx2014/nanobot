@@ -348,6 +348,43 @@ def test_add_at_job_uses_default_timezone_for_naive_datetime(tmp_path) -> None:
     assert job.delete_after_run is False
 
 
+def test_add_reminder_job_records_no_conversation_result(tmp_path) -> None:
+    tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+    tool.set_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    )
+
+    result = tool._add_job(
+        None,
+        "Morning reminder",
+        None,
+        None,
+        None,
+        "2099-03-25T08:00:00",
+        "reminder",
+    )
+
+    assert result.startswith("Created job")
+    assert tool._cron.list_jobs()[0].payload.result_type == "none"
+
+
+def test_add_job_rejects_an_unknown_result_mode(tmp_path) -> None:
+    tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+
+    result = tool._add_job(
+        None,
+        "Morning reminder",
+        None,
+        None,
+        None,
+        "2099-03-25T08:00:00",
+        "unknown",
+    )
+
+    assert result == "Error: mode must be 'reminder' or 'task' when action='add'"
+    assert tool._cron.list_jobs() == []
+
+
 def test_add_at_job_rejects_past_datetime(tmp_path) -> None:
     tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
     tool.set_context(

@@ -277,12 +277,19 @@ def _message(prompt: str, skill_name: str) -> str:
 def _run_payload(job: CronJob, run: CronRunRecord) -> dict[str, Any]:
     status = "running" if run.status == "running" else "error" if run.status == "error" else "completed"
     completed_at = run.run_at_ms + max(0, run.duration_ms or 0)
-    session_key = run.session_key or ("" if status == "running" else f"cron:{job.id}")
+    session_key = run.session_key or ""
+    expects_conversation = job.payload.result_type == "conversation"
+    conversation_available = expects_conversation and bool(session_key)
     return {
         "id": run.run_id or f"{job.id}:{run.run_at_ms}",
         "scheduledTaskId": job.id,
-        "conversationId": session_key,
-        "sessionKey": session_key,
+        "conversationId": session_key if expects_conversation else "",
+        "sessionKey": session_key if expects_conversation else "",
+        "resultType": "conversation" if conversation_available else "none",
+        "conversationAvailable": conversation_available,
+        **({
+            "unavailableReason": "missing" if status == "running" else "legacy"
+        } if expects_conversation and not conversation_available else {}),
         "runId": run.run_id,
         "startedAt": run.run_at_ms,
         "completedAt": completed_at,
@@ -527,6 +534,19 @@ class WebUIScheduleRouter:
         run_id = _first(query, "run_id").strip()
         if not job_id or not run_id:
             return self._error_response(400, "task_id and run_id are required")
+        job = self.cron.get_job(job_id)
+        record = self.cron.get_run_record(job_id, run_id)
+        if (
+            job is not None
+            and record is not None
+            and record.status != "running"
+            and job.schedule.kind == "at"
+            and job.payload.result_type == "none"
+        ):
+            if self.cron.remove_job(job_id) != "removed":
+                return self._error_response(404, "run not found")
+            self._sync_state()
+            return self._json_response(_payload(self.cron))
         if not self.cron.mark_run_viewed(job_id, run_id):
             return self._error_response(404, "run not found")
         return self._json_response(_payload(self.cron))

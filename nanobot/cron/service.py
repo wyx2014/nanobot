@@ -180,9 +180,12 @@ class CronService:
         self.on_job = on_job
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
+        self._dispatch_task: asyncio.Task | None = None
+        self._dispatch_pending = False
         self._running = False
         self._timer_active = False
         self._executing_jobs = 0
+        self._running_job_ids: set[str] = set()
         self.max_sleep_ms = max_sleep_ms
 
     def _is_unbound_agent_job(self, job: CronJob) -> bool:
@@ -257,6 +260,7 @@ class CronService:
                         ),
                         payload=CronPayload(
                             kind=j["payload"].get("kind", "agent_turn"),
+                            result_type=j["payload"].get("resultType", "conversation"),
                             message=j["payload"].get("message", ""),
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
@@ -480,6 +484,7 @@ class CronService:
                     },
                     "payload": {
                         "kind": j.payload.kind,
+                        "resultType": j.payload.result_type,
                         "message": j.payload.message,
                         "deliver": j.payload.deliver,
                         "channel": j.payload.channel,
@@ -620,9 +625,13 @@ class CronService:
     def stop(self) -> None:
         """Stop the cron service."""
         self._running = False
+        self._dispatch_pending = False
         if self._timer_task:
             self._timer_task.cancel()
             self._timer_task = None
+        if self._dispatch_task:
+            self._dispatch_task.cancel()
+            self._dispatch_task = None
 
     def _recompute_next_runs(self) -> None:
         """Recompute next run times for all enabled jobs."""
@@ -640,13 +649,14 @@ class CronService:
         if not self._store:
             return None
         times = [j.state.next_run_at_ms for j in self._store.jobs
-                 if j.enabled and j.state.next_run_at_ms]
+                 if j.enabled and j.state.next_run_at_ms and j.id not in self._running_job_ids]
         return min(times) if times else None
 
     def _arm_timer(self) -> None:
-        """Schedule the next timer tick."""
+        """Schedule the next wake without owning job execution."""
         if self._timer_task:
             self._timer_task.cancel()
+            self._timer_task = None
 
         if not self._running:
             return
@@ -658,12 +668,44 @@ class CronService:
             delay_ms = min(self.max_sleep_ms, max(0, next_wake - _now_ms()))
         delay_s = delay_ms / 1000
 
-        async def tick():
-            await asyncio.sleep(delay_s)
+        async def wake():
+            try:
+                await asyncio.sleep(delay_s)
+            finally:
+                current = asyncio.current_task()
+                if self._timer_task is current:
+                    self._timer_task = None
             if self._running:
-                await self._on_timer()
+                self._start_dispatch()
 
-        self._timer_task = asyncio.create_task(tick())
+        self._timer_task = asyncio.create_task(wake())
+
+    def _start_dispatch(self) -> None:
+        """Run due jobs separately from the cancellable wake timer."""
+        if not self._running:
+            return
+        if self._dispatch_task and not self._dispatch_task.done():
+            self._dispatch_pending = True
+            return
+
+        self._dispatch_pending = False
+
+        async def dispatch() -> None:
+            try:
+                await self._on_timer()
+            finally:
+                current = asyncio.current_task()
+                if self._dispatch_task is current:
+                    self._dispatch_task = None
+                if not self._running:
+                    return
+                if self._dispatch_pending:
+                    self._dispatch_pending = False
+                    self._start_dispatch()
+                else:
+                    self._arm_timer()
+
+        self._dispatch_task = asyncio.create_task(dispatch())
 
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
@@ -672,7 +714,6 @@ class CronService:
         # still hold the previous, known-good in-memory snapshot.  Keep using
         # it rather than crashing the timer or wiping live jobs.
         if not self._store:
-            self._arm_timer()
             return
 
         self._timer_active = True
@@ -689,13 +730,17 @@ class CronService:
             self._save_store()
         finally:
             self._timer_active = False
-        self._arm_timer()
 
-    async def _execute_job(self, job: CronJob) -> None:
+    async def _execute_job(self, job: CronJob) -> bool:
         """Execute a single job."""
+        if job.id in self._running_job_ids:
+            logger.warning("Cron: job '{}' ({}) is already running; skipping duplicate", job.name, job.id)
+            return False
+
+        self._running_job_ids.add(job.id)
         self._executing_jobs += 1
         start_ms = _now_ms()
-        is_bound_run = is_bound_cron_job(job)
+        is_bound_run = is_bound_cron_job(job) and job.payload.result_type == "conversation"
         initial_run_id = (
             f"{start_ms}:{uuid.uuid4().hex[:8]}"
             if is_bound_run
@@ -779,8 +824,10 @@ class CronService:
                 # Compute next run
                 job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
             self._save_store()
+            return True
         finally:
             self._executing_jobs = max(0, self._executing_jobs - 1)
+            self._running_job_ids.discard(job.id)
 
     def _append_action(self, action: Literal["add", "del", "update"], params: dict):
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -827,6 +874,7 @@ class CronService:
         origin_metadata: dict | None = None,
         project_id: str | None = None,
         created_session_id: str | None = None,
+        result_type: Literal["conversation", "none"] = "conversation",
     ) -> CronJob:
         """Add a new job."""
         _validate_schedule_for_add(schedule)
@@ -839,6 +887,7 @@ class CronService:
             schedule=schedule,
             payload=CronPayload(
                 kind="agent_turn",
+                result_type=result_type,
                 message=message,
                 deliver=deliver,
                 channel=channel,
@@ -1008,9 +1057,10 @@ class CronService:
                         return False
                     if not force and not job.enabled:
                         return False
-                    await self._execute_job(job)
-                    self._save_store()
-                    return True
+                    executed = await self._execute_job(job)
+                    if executed:
+                        self._save_store()
+                    return executed
             return False
         finally:
             self._running = was_running

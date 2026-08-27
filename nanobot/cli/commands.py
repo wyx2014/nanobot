@@ -1185,6 +1185,24 @@ def _run_gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
+        if job.payload.result_type == "none":
+            from nanobot.cron.session_delivery import (
+                origin_delivery_context,
+                should_deliver_direct_reminder,
+            )
+
+            channel, chat_id, _ = origin_delivery_context(job)
+            if should_deliver_direct_reminder(job):
+                await _deliver_to_channel(
+                    OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content=job.payload.message,
+                    ),
+                    record=False,
+                )
+            return job.payload.message
+
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
             from nanobot.agent.memory import MemoryStore

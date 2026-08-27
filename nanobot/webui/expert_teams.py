@@ -449,6 +449,23 @@ def _workflows(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _entry_workflows(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return only workflows the runtime can actually start for this team."""
+
+    entry_id = str(manifest.get("entry_workflow") or "").strip()
+    if not entry_id:
+        return []
+    workflow = next(
+        (
+            item
+            for item in _workflows(manifest.get("workflows"))
+            if item["id"] == entry_id
+        ),
+        None,
+    )
+    return [workflow] if workflow is not None else []
+
+
 def _data_sources(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
@@ -705,7 +722,7 @@ def _availability(team_root: Path, manifest: Mapping[str, Any]) -> tuple[bool, s
 def _summary(team_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
     source_root = _safe_child(team_root, str(manifest.get("source_root") or ""))
     members = _members(manifest.get("members"), source_root)
-    workflows = _workflows(manifest.get("workflows"))
+    workflows = _entry_workflows(manifest)
     available, reason = _availability(team_root, manifest)
     runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
     return {
@@ -718,6 +735,7 @@ def _summary(team_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
         "unavailable_reason": reason,
         "cover": str(manifest.get("cover") or ""),
         "member_count": len(members),
+        "entry_workflow": workflows[0]["id"] if workflows else "",
         "workflow_count": len(workflows),
         "data_source_count": len(_data_sources(manifest.get("data_sources"))),
         "mcp_preset_count": len(_mcp_presets(manifest.get("mcp_presets"))),
@@ -761,7 +779,7 @@ def expert_team_detail_payload(team_id: str) -> dict[str, Any]:
     return {
         **summary,
         "members": _members(manifest.get("members")),
-        "workflows": _workflows(manifest.get("workflows")),
+        "workflows": _entry_workflows(manifest),
         "data_sources": _data_sources(manifest.get("data_sources")),
         "mcp_presets": _mcp_presets(manifest.get("mcp_presets")),
         "optional_dependencies": optional,
@@ -849,10 +867,10 @@ def expert_team_system_prompt(
         runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
         adapter_path = _safe_child(team_root, str(runtime.get("adapter") or ""))
         source_root = _safe_child(team_root, str(manifest.get("source_root") or ""))
-        workflow_id = str(manifest.get("entry_workflow") or "")
-        workflow = next((item for item in _workflows(manifest.get("workflows")) if item["id"] == workflow_id), None)
-        if workflow is None:
+        workflows = _entry_workflows(manifest)
+        if not workflows:
             return ""
+        workflow = workflows[0]
         workflow_path = _safe_child(source_root, workflow["source"])
         adapter = adapter_path.read_text(encoding="utf-8")
         workflow_text = workflow_path.read_text(encoding="utf-8")

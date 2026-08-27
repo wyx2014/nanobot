@@ -181,6 +181,7 @@ members:
   - { id: business-analyst, name: 商业分析师, phase: research, phase_label: 第一阶段, playbook: playbooks/business-analyst.md }
 workflows:
   - { id: investment-team, name: 团队深度投研, source: skills/investment-team.md, mode: team, featured: true }
+  - { id: reference-only, name: 上游参考能力, source: skills/reference-only.md, mode: lead, featured: true }
 """.strip(),
         encoding="utf-8",
     )
@@ -195,6 +196,8 @@ def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> 
     payload = expert_teams.expert_teams_payload()
     assert payload["teams"][0]["id"] == "asset-research-team"
     assert payload["teams"][0]["requested_concurrency"] == 4
+    assert payload["teams"][0]["entry_workflow"] == "investment-team"
+    assert payload["teams"][0]["workflow_count"] == 1
 
     binding = expert_teams.normalize_expert_team_binding({"id": "asset-research-team"})
     assert binding is not None
@@ -234,6 +237,7 @@ def test_expert_team_catalog_binding_and_prompt(tmp_path: Path, monkeypatch) -> 
         "members": {"business-analyst": {"max_iterations": 16}},
     }
     detail = expert_teams.expert_team_detail_payload("asset-research-team")
+    assert [workflow["id"] for workflow in detail["workflows"]] == ["investment-team"]
     assert detail["data_sources"][0]["priority"] == "primary"
     assert detail["mcp_presets"][0]["configured"] is True
 

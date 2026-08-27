@@ -22,6 +22,7 @@ class CronSchedule:
 class CronPayload:
     """What to do when the job runs."""
     kind: Literal["system_event", "agent_turn"] = "agent_turn"
+    result_type: Literal["conversation", "none"] = "conversation"
     message: str = ""
     # Legacy delivery fields used by pre-session-bound cron jobs.
     deliver: bool = False

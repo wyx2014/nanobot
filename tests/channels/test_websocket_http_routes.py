@@ -2064,6 +2064,110 @@ async def test_session_delete_blocks_when_bound_automation_exists(
 
 
 @pytest.mark.asyncio
+async def test_session_archive_allows_reminder_and_keeps_it_scheduled(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    sm = _seed_session(tmp_path, key="websocket:reminder-chat")
+    cron = CronService(tmp_path / "cron" / "jobs.json")
+    reminder = cron.add_job(
+        name="找wanghongjun",
+        schedule=CronSchedule(kind="at", at_ms=4_091_735_700_000),
+        message="提醒我找wanghongjun",
+        result_type="none",
+        session_key="websocket:reminder-chat",
+        origin_channel="websocket",
+        origin_chat_id="reminder-chat",
+    )
+    channel = _ch(bus, session_manager=sm, cron_service=cron, port=29919)
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get("http://127.0.0.1:29919/webui/bootstrap")
+        token = boot.json()["token"]
+        auth = {"Authorization": f"Bearer {token}"}
+
+        resp = await _http_get(
+            "http://127.0.0.1:29919/api/sessions/websocket:reminder-chat/archive",
+            headers=auth,
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is True
+        assert cron.get_job(reminder.id) is not None
+        managed = await _http_get(
+            "http://127.0.0.1:29919/api/data-management/archives",
+            headers=auth,
+        )
+        assert managed.status_code == 200
+        assert [row["session_key"] for row in managed.json()["archived_sessions"]] == [
+            "websocket:reminder-chat"
+        ]
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_session_archive_and_purge_ignore_completed_one_time_conversation_job(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    sm = _seed_session(tmp_path, key="websocket:legacy-reminder-chat")
+    cron = CronService(tmp_path / "cron" / "jobs.json")
+    cron._running = True
+    created = cron.add_job(
+        name="合并代码提醒",
+        schedule=CronSchedule(kind="at", at_ms=4_091_735_700_000),
+        message="提醒用户：合并代码",
+        session_key="websocket:legacy-reminder-chat",
+        origin_channel="websocket",
+        origin_chat_id="legacy-reminder-chat",
+    )
+    completed = cron.get_job(created.id)
+    assert completed is not None
+    completed.enabled = False
+    completed.state.next_run_at_ms = None
+    completed.state.last_run_at_ms = 1_700_000_000_000
+    completed.state.last_status = "ok"
+    completed.state.run_history.append(CronRunRecord(
+        run_at_ms=1_700_000_000_000,
+        status="ok",
+        run_id="completed-run",
+    ))
+    cron._save_store()
+    port = _free_port()
+    channel = _ch(bus, session_manager=sm, cron_service=cron, port=port)
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get(f"http://127.0.0.1:{port}/webui/bootstrap")
+        token = boot.json()["token"]
+        auth = {"Authorization": f"Bearer {token}"}
+
+        resp = await _http_get(
+            f"http://127.0.0.1:{port}/api/sessions/websocket:legacy-reminder-chat/archive",
+            headers=auth,
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is True
+        assert cron.get_job(completed.id) is not None
+
+        purged = await _http_get(
+            f"http://127.0.0.1:{port}/api/sessions/websocket:legacy-reminder-chat/purge",
+            headers=auth,
+        )
+
+        assert purged.status_code == 200
+        assert purged.json()["purged"] is True
+        assert cron.get_job(completed.id) is None
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
 async def test_session_delete_can_cascade_bound_automations(
     bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -164,6 +164,78 @@ def test_finished_once_job_is_serialized_as_completed() -> None:
     assert _task_payload(job)["status"] == "completed"
 
 
+def test_legacy_run_does_not_fabricate_a_conversation_session() -> None:
+    job = CronJob(
+        id="legacy-job",
+        name="Legacy reminder",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(message="remind me"),
+        state=CronJobState(run_history=[CronRunRecord(
+            run_at_ms=1_700_000_000_000,
+            status="ok",
+            run_id="legacy-run",
+        )]),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    [run] = _task_payload(job)["runs"]
+
+    assert run["conversationId"] == ""
+    assert run["sessionKey"] == ""
+    assert run["resultType"] == "none"
+    assert run["conversationAvailable"] is False
+    assert run["unavailableReason"] == "legacy"
+
+
+def test_run_with_session_exposes_conversation_availability() -> None:
+    job = CronJob(
+        id="current-job",
+        name="Current task",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(message="run"),
+        state=CronJobState(run_history=[CronRunRecord(
+            run_at_ms=1_700_000_000_000,
+            status="ok",
+            run_id="current-run",
+            session_key="cron:current-job:current-run",
+        )]),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    [run] = _task_payload(job)["runs"]
+
+    assert run["conversationAvailable"] is True
+    assert run["resultType"] == "conversation"
+    assert "unavailableReason" not in run
+
+
+def test_reminder_run_never_exposes_an_internal_conversation_session() -> None:
+    job = CronJob(
+        id="reminder-job",
+        name="Simple reminder",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        payload=CronPayload(result_type="none", message="drink water"),
+        state=CronJobState(run_history=[CronRunRecord(
+            run_at_ms=1_700_000_000_000,
+            status="ok",
+            run_id="reminder-run",
+            session_key="cron:reminder-job:reminder-run",
+        )]),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+
+    [run] = _task_payload(job)["runs"]
+
+    assert run["conversationId"] == ""
+    assert run["sessionKey"] == ""
+    assert run["resultType"] == "none"
+    assert run["conversationAvailable"] is False
+    assert "unavailableReason" not in run
+
+
 def test_unrecognized_recurring_job_is_serialized_as_custom_not_daily() -> None:
     job = CronJob(
         id="custom-1",
@@ -226,6 +298,42 @@ async def test_delete_run_route_removes_completed_record(tmp_path) -> None:
     assert response is not None
     assert response.status_code == 200
     assert service.get_job(job_id).state.run_history == []
+
+
+async def test_confirming_completed_one_time_reminder_physically_deletes_job(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    created = service.add_job(
+        name="A股开市提醒",
+        schedule=CronSchedule(kind="at", at_ms=4_091_735_700_000),
+        message="提醒我关注A股开市",
+        result_type="none",
+        session_key="websocket:source",
+        origin_channel="websocket",
+        origin_chat_id="source",
+    )
+    service._running = True
+    job = service.get_job(created.id)
+    assert job is not None
+    job.enabled = False
+    job.state.last_run_at_ms = 1_700_000_000_000
+    job.state.run_history.append(CronRunRecord(
+        run_at_ms=1_700_000_000_000,
+        status="ok",
+        run_id="reminder-run",
+    ))
+    service._save_store()
+    request = Request(
+        f"/api/schedule/runs/viewed?task_id={job.id}&run_id=reminder-run",
+        Headers(),
+    )
+
+    response = await _router(service).dispatch(request, "/api/schedule/runs/viewed")
+
+    assert response is not None
+    assert response.status_code == 200
+    assert service.get_job(job.id) is None
+    assert json.loads(response.body)["tasks"] == []
 
 
 async def test_delete_run_route_rejects_running_record(tmp_path) -> None:

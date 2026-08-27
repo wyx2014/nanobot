@@ -92,7 +92,9 @@ from nanobot.webui.session_artifacts import (
 )
 from nanobot.webui.session_automations import (
     all_automations_payload,
+    is_terminal_one_time_automation,
     serialize_automation_jobs,
+    session_archive_blocking_jobs,
     session_automation_jobs,
     session_automations_payload,
 )
@@ -1847,15 +1849,20 @@ class GatewayHTTPHandler:
         query = _parse_query(request.path)
         delete_automations = (_query_first(query, "delete_automations") or "").lower()
         automation_jobs = session_automation_jobs(self.cron_service, decoded_key)
-        if automation_jobs and delete_automations not in {"1", "true", "yes"}:
+        blocking_jobs = session_archive_blocking_jobs(self.cron_service, decoded_key)
+        if blocking_jobs and delete_automations not in {"1", "true", "yes"}:
             return _http_json_response(
                 {
                     "deleted": False,
                     "blocked_by_automations": True,
-                    "automations": serialize_automation_jobs(automation_jobs),
+                    "automations": serialize_automation_jobs(blocking_jobs),
                 }
             )
-        if automation_jobs and self.cron_service is not None:
+        if (
+            automation_jobs
+            and delete_automations in {"1", "true", "yes"}
+            and self.cron_service is not None
+        ):
             for job in automation_jobs:
                 self.cron_service.remove_job(job.id)
         state_session = self.state.get_session(decoded_key)
@@ -1952,12 +1959,13 @@ class GatewayHTTPHandler:
         if self.state.active_turn_id(decoded_key) is not None:
             return _http_error(409, "session has an active turn; stop it before deletion")
         automation_jobs = session_automation_jobs(self.cron_service, decoded_key)
-        if automation_jobs:
+        blocking_jobs = session_archive_blocking_jobs(self.cron_service, decoded_key)
+        if blocking_jobs:
             return _http_json_response(
                 {
                     "purged": False,
                     "blocked_by_automations": True,
-                    "automations": serialize_automation_jobs(automation_jobs),
+                    "automations": serialize_automation_jobs(blocking_jobs),
                 },
                 status=409,
             )
@@ -1968,6 +1976,10 @@ class GatewayHTTPHandler:
             title=state_session.title,
         )
         result = self._purge_session_data(decoded_key, state_session.id)
+        if self.cron_service is not None:
+            for job in automation_jobs:
+                if is_terminal_one_time_automation(job):
+                    self.cron_service.remove_job(job.id)
         return _http_json_response(result)
 
     def _purge_schedule_run_session(self, session_key: str) -> dict[str, Any]:

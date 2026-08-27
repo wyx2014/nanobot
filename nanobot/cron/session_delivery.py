@@ -7,6 +7,11 @@ from typing import Any
 from nanobot.cron.types import CronJob
 
 
+def should_deliver_direct_reminder(job: CronJob) -> bool:
+    """Return whether a reminder should be sent through its origin channel."""
+    return job.payload.origin_channel != "websocket"
+
+
 def origin_delivery_context(job: CronJob) -> tuple[str, str, dict[str, Any]]:
     """Return ``(channel, chat_id, metadata)`` for a session-bound cron job."""
     payload = job.payload

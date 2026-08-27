@@ -389,6 +389,41 @@ async def test_execute_job_persists_running_record_before_completion(tmp_path) -
     assert loaded.state.run_history[0].status == "ok"
 
 
+@pytest.mark.asyncio
+async def test_reminder_run_does_not_allocate_a_conversation_session(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    release = asyncio.Event()
+
+    async def run(_):
+        await release.wait()
+        return "remember this"
+
+    service = CronService(store_path, on_job=run)
+    job = service.add_job(
+        name="reminder",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="remember this",
+        result_type="none",
+        **_bound_chat(),
+    )
+
+    task = asyncio.create_task(service.run_job(job.id))
+    await _wait_until(lambda: CronService(store_path).get_job(job.id).state.run_history)
+
+    running = CronService(store_path).get_job(job.id)
+    assert running is not None
+    assert running.payload.result_type == "none"
+    assert running.state.run_history[0].session_key is None
+
+    release.set()
+    await task
+
+    completed = CronService(store_path).get_job(job.id)
+    assert completed is not None
+    assert completed.state.run_history[0].status == "ok"
+    assert completed.state.run_history[0].session_key is None
+
+
 def test_stale_running_run_history_is_marked_error_on_load(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
     old_ms = int(time.time() * 1000) - 2 * 24 * 60 * 60 * 1000
@@ -965,6 +1000,96 @@ async def test_external_update_preserves_run_history_records(tmp_path):
 
 
 # ── timer race regression tests ──
+
+
+@pytest.mark.asyncio
+async def test_adding_job_does_not_cancel_or_restart_active_timer_job(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls: list[str] = []
+
+    async def on_job(job) -> None:
+        calls.append(job.id)
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    service = CronService(store_path, on_job=on_job, max_sleep_ms=5_000)
+    active_job = service.add_job(
+        name="active",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="run",
+        **_bound_chat("active"),
+    )
+    await service.start()
+    try:
+        active_job = next(job for job in service._store.jobs if job.id == active_job.id)
+        active_job.state.next_run_at_ms = int(time.time() * 1000) - 1
+        service._save_store()
+        service._arm_timer()
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        service.add_job(
+            name="new reminder",
+            schedule=CronSchedule(kind="every", every_ms=60_000),
+            message="later",
+            **_bound_chat("new-reminder"),
+        )
+        await asyncio.sleep(0.05)
+
+        assert cancelled.is_set() is False
+        assert calls == [active_job.id]
+
+        release.set()
+        await _wait_until(
+            lambda: service.get_job(active_job.id).state.last_status == "ok",
+            timeout=1,
+        )
+        assert calls == [active_job.id]
+    finally:
+        release.set()
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_job_skips_duplicate_for_same_job_id(tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def on_job(job) -> None:
+        calls.append(job.id)
+        started.set()
+        await release.wait()
+
+    service = CronService(store_path, on_job=on_job)
+    job = service.add_job(
+        name="single flight",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="run",
+        **_bound_chat(),
+    )
+    await service.start()
+    try:
+        first_run = asyncio.create_task(service.run_job(job.id, force=True))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        assert await service.run_job(job.id, force=True) is False
+        assert calls == [job.id]
+        assert len(service.get_job(job.id).state.run_history) == 1
+
+        release.set()
+        assert await first_run is True
+        assert calls == [job.id]
+    finally:
+        release.set()
+        service.stop()
 
 
 @pytest.mark.asyncio

@@ -29,6 +29,12 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). "
         "Not used for action='list' or action='remove'."
     ),
+    mode=StringSchema(
+        "REQUIRED when action='add'. Use 'reminder' only when the job should directly repeat "
+        "the reminder text and requires no reasoning, tools, research, or generated result. "
+        "Use 'task' whenever the agent must do work and preserve a result conversation.",
+        enum=["reminder", "task"],
+    ),
     every_seconds=IntegerSchema(0, description="Interval in seconds (for recurring tasks)"),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
     tz=StringSchema(
@@ -44,7 +50,7 @@ _CRON_PARAMETERS = tool_parameters_schema(
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     required=["action"],
     description=(
-        "Action-specific parameters: add requires a non-empty message plus one schedule "
+        "Action-specific parameters: add requires a non-empty message, a mode, and one schedule "
         "(every_seconds, cron_expr, or at); remove requires job_id; list only needs action. "
         "Per-action requirements are enforced at runtime (see field descriptions) so the "
         "top-level schema stays compatible with providers (e.g. OpenAI Codex/Responses) that "
@@ -134,6 +140,8 @@ class CronTool(Tool, ContextAware):
         action = params.get("action")
         if action == "add" and not str(params.get("message") or "").strip():
             errors.append("message is required when action='add'")
+        if action == "add" and params.get("mode") not in {"reminder", "task"}:
+            errors.append("mode must be 'reminder' or 'task' when action='add'")
         if action == "remove" and not str(params.get("job_id") or "").strip():
             errors.append("job_id is required when action='remove'")
         return errors
@@ -143,6 +151,7 @@ class CronTool(Tool, ContextAware):
         action: str,
         name: str | None = None,
         message: str = "",
+        mode: str = "task",
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         tz: str | None = None,
@@ -154,7 +163,7 @@ class CronTool(Tool, ContextAware):
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at)
+            return self._add_job(name, message, every_seconds, cron_expr, tz, at, mode)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -169,6 +178,7 @@ class CronTool(Tool, ContextAware):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        mode: str = "task",
     ) -> str:
         if not message:
             return (
@@ -176,6 +186,8 @@ class CronTool(Tool, ContextAware):
                 "describing what to do when the job triggers "
                 "(e.g. the reminder text). Retry including message=\"...\"."
             )
+        if mode not in {"reminder", "task"}:
+            return "Error: mode must be 'reminder' or 'task' when action='add'"
         session_key = self._session_key.get()
         if not session_key:
             return "Error: scheduled cron jobs must be created from a chat session"
@@ -243,6 +255,7 @@ class CronTool(Tool, ContextAware):
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
             origin_metadata=origin_metadata,
+            result_type="none" if mode == "reminder" else "conversation",
         )
         return (
             f"Created job '{job.name}' (id: {job.id}); "
