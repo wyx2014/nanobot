@@ -807,6 +807,72 @@ def test_speech_model_configuration_and_default_are_independent_from_text(
     assert payload["model_defaults"]["speech_to_text"] == speech_preset["name"]
 
 
+def test_provider_declared_capability_source_survives_config_reload(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.providers.stepfun.api_key = "step-test"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    payload = create_model_configuration(
+        {
+            "label": ["Opaque Step ASR"],
+            "provider": ["stepfun"],
+            "model": ["opaque-model-id"],
+            "capabilities": ["speech_to_text"],
+            "capability_source": ["provider"],
+        }
+    )
+
+    preset = next(
+        row for row in payload["model_presets"] if row["label"] == "Opaque Step ASR"
+    )
+    assert preset["capabilities"] == ["speech_to_text"]
+    assert preset["capability_source"] == "provider"
+
+    saved = load_config(config_path)
+    assert saved.model_presets[preset["name"]].capability_source == "provider"
+    assert ensure_model_capability_defaults(saved) is True
+    assert saved.model_presets[preset["name"]].capabilities == ["speech_to_text"]
+    assert ensure_model_capability_defaults(saved) is False
+
+
+@pytest.mark.parametrize("action", ["create", "update"])
+def test_model_configuration_rejects_capability_source_without_capabilities(
+    action: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.providers.stepfun.api_key = "step-test"
+    if action == "update":
+        config.model_presets["opaque"] = ModelPresetConfig(
+            label="Opaque",
+            provider="stepfun",
+            model="opaque-model-id",
+        )
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    query = {
+        "name": ["opaque"],
+        "label": ["Opaque"],
+        "provider": ["stepfun"],
+        "model": ["opaque-model-id"],
+        "capability_source": ["provider"],
+    }
+
+    with pytest.raises(WebUISettingsError, match="source requires capabilities"):
+        if action == "create":
+            create_model_configuration(query)
+        else:
+            update_model_configuration(query)
+
+
 def test_capability_default_migration_removes_retired_model_purposes() -> None:
     config = Config()
     config.transcription.provider = "stepfun"
@@ -834,6 +900,22 @@ def test_capability_default_migration_removes_retired_model_purposes() -> None:
     assert config.model_defaults.image_generation is None
     assert config.model_presets["legacy-multimodal"].capabilities == ["text"]
     assert ensure_model_capability_defaults(config) is False
+
+
+def test_capability_normalization_preserves_provider_declared_purpose() -> None:
+    config = Config()
+    config.model_presets["provider-declared"] = ModelPresetConfig(
+        model="opaque-model-id",
+        provider="stepfun",
+        capabilities=["speech_to_text"],
+        capability_source="provider",
+    )
+
+    assert ensure_model_capability_defaults(config) is True
+    assert config.model_presets["provider-declared"].capabilities == [
+        "speech_to_text"
+    ]
+    assert config.model_presets["provider-declared"].capability_source == "provider"
 
 
 def test_disabled_transcription_does_not_create_a_fallback_speech_model() -> None:
@@ -1263,6 +1345,7 @@ def test_provider_models_payload_detects_stepfun_and_audio_capabilities(
                     {"id": "step-3.7-flash"},
                     {"id": "stepaudio-2.5-asr"},
                     {"id": "stepaudio-2.5-tts"},
+                    {"id": "stepaudio-2.5"},
                 ]
             },
             request=httpx.Request("GET", url),
@@ -1283,7 +1366,90 @@ def test_provider_models_payload_detects_stepfun_and_audio_capabilities(
         ["text"],
         ["speech_to_text"],
         ["text_to_speech"],
+        [],
     ]
+    assert {row["capability_source"] for row in payload["models"]} == {
+        "heuristic"
+    }
+
+
+def test_provider_models_payload_prefers_declared_tasks_and_modalities(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    save_config(Config(), config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    def fake_get(url: str, **kwargs):
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "deepseek-r1", "type": "chat"},
+                    {"id": "proxy/deepseek-r1"},
+                    {"id": "misleading-chat-name", "type": "image_generation"},
+                    {
+                        "id": "opaque-a",
+                        "architecture": {
+                            "input_modalities": ["audio"],
+                            "output_modalities": ["text"],
+                        },
+                    },
+                    {
+                        "id": "opaque-b",
+                        "modalities": {"input": ["text"], "output": ["audio"]},
+                    },
+                    {
+                        "id": "opaque-c",
+                        "capabilities": {"chat_completions": True, "audio": True},
+                    },
+                    {"id": "opaque-d", "task": "embedding"},
+                    {
+                        "id": "opaque-e",
+                        "type": "chat",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["audio"],
+                    },
+                    {"id": "opaque-f", "modalities": ["image"]},
+                ]
+            },
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("nanobot.webui.settings_api.httpx.get", fake_get)
+
+    payload = provider_models_payload(
+        {
+            "provider": ["custom"],
+            "apiBase": ["https://api.stepfun.com/step_plan/v1"],
+            "apiKey": ["step-test"],
+        }
+    )
+
+    assert [row["capabilities"] for row in payload["models"]] == [
+        [],
+        ["speech_to_text"],
+        ["text_to_speech"],
+        ["text"],
+        [],
+        ["text_to_speech"],
+        [],
+    ]
+    assert [row["model_type"] for row in payload["models"]] == [
+        "image_generation",
+        "speech_to_text",
+        "text_to_speech",
+        "text",
+        "embedding",
+        "text_to_speech",
+        "image",
+    ]
+    assert {row["capability_source"] for row in payload["models"]} == {
+        "provider"
+    }
+    assert "deepseek-r1" not in {row["id"] for row in payload["models"]}
+    assert "proxy/deepseek-r1" not in {row["id"] for row in payload["models"]}
 
 
 @pytest.mark.parametrize(
@@ -1329,6 +1495,8 @@ def test_provider_models_payload_fetches_minimax_anthropic_models(
             "owned_by": None,
             "context_window": None,
             "capabilities": ["text"],
+            "model_type": "text",
+            "capability_source": "heuristic",
         }
     ]
 

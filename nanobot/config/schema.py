@@ -101,6 +101,7 @@ ModelCapability = Literal[
     "vision",
     "image_generation",
 ]
+ModelCapabilitySource = Literal["manual", "provider", "heuristic"]
 
 
 class ModelPresetConfig(Base):
@@ -114,6 +115,7 @@ class ModelPresetConfig(Base):
     temperature: float = 0.1
     reasoning_effort: str | None = None
     capabilities: list[ModelCapability] = Field(default_factory=lambda: ["text"])
+    capability_source: ModelCapabilitySource | None = None
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings

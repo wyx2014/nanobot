@@ -10,7 +10,7 @@ import os
 import re
 import time
 from contextlib import suppress
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -26,7 +26,12 @@ from nanobot.audio.transcription_registry import (
     transcription_provider_names,
 )
 from nanobot.config.loader import get_config_path, load_config, save_config
-from nanobot.config.schema import ModelCapability, ModelPresetConfig, ProviderConfig
+from nanobot.config.schema import (
+    ModelCapability,
+    ModelCapabilitySource,
+    ModelPresetConfig,
+    ProviderConfig,
+)
 from nanobot.providers.image_generation import (
     get_image_gen_provider,
     image_gen_provider_names,
@@ -46,6 +51,12 @@ MODEL_CAPABILITIES: tuple[ModelCapability, ...] = (
     "speech_to_text",
     "text_to_speech",
 )
+MODEL_CAPABILITY_SOURCES: tuple[ModelCapabilitySource, ...] = (
+    "manual",
+    "provider",
+    "heuristic",
+)
+_EXCLUDED_DISCOVERED_MODEL_IDS = frozenset({"deepseek-r1"})
 _STORED_MODEL_CAPABILITIES: tuple[ModelCapability, ...] = (
     *MODEL_CAPABILITIES,
     "text_to_speech",
@@ -560,9 +571,187 @@ def _model_context_window(row: Any) -> int | None:
     return None
 
 
+def _is_excluded_discovered_model_id(model_id: str) -> bool:
+    normalized = model_id.strip().lower()
+    return normalized.rsplit("/", 1)[-1] in _EXCLUDED_DISCOVERED_MODEL_IDS
+
+
+def _normalized_metadata_terms(value: Any) -> set[str]:
+    """Normalize structured provider metadata without inspecting the model id."""
+    terms: set[str] = set()
+    if isinstance(value, str):
+        normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+        if normalized:
+            terms.add(normalized)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            terms.update(_normalized_metadata_terms(item))
+    elif isinstance(value, dict):
+        for key, enabled in value.items():
+            if enabled is True:
+                terms.update(_normalized_metadata_terms(key))
+            elif enabled is not False and enabled is not None:
+                terms.update(_normalized_metadata_terms(enabled))
+    return terms
+
+
+def _row_metadata_terms(row: dict[str, Any], *fields: str) -> set[str]:
+    terms: set[str] = set()
+    for field in fields:
+        terms.update(_normalized_metadata_terms(row.get(field)))
+    for container_name in (
+        "architecture",
+        "metadata",
+        "model_info",
+        "modelInfo",
+        "modalities",
+    ):
+        container = row.get(container_name)
+        if not isinstance(container, dict):
+            continue
+        for field in fields:
+            terms.update(_normalized_metadata_terms(container.get(field)))
+    return terms
+
+
+def _task_profile(terms: set[str]) -> tuple[list[ModelCapability], str] | None:
+    profiles: tuple[tuple[set[str], list[ModelCapability], str], ...] = (
+        (
+            {
+                "speech_to_text",
+                "audio_transcription",
+                "transcription",
+                "transcribe",
+                "asr",
+                "speech_recognition",
+            },
+            ["speech_to_text"],
+            "speech_to_text",
+        ),
+        (
+            {"text_to_speech", "speech_synthesis", "tts", "voice_synthesis"},
+            ["text_to_speech"],
+            "text_to_speech",
+        ),
+        (
+            {"image_generation", "text_to_image", "image_synthesis", "image_gen"},
+            [],
+            "image_generation",
+        ),
+        ({"embedding", "embeddings", "text_embedding", "vectorization"}, [], "embedding"),
+        ({"rerank", "reranking", "ranking"}, [], "rerank"),
+        ({"moderation", "safety", "content_moderation"}, [], "moderation"),
+        (
+            {
+                "chat",
+                "chat_completion",
+                "chat_completions",
+                "completion",
+                "completions",
+                "text_generation",
+                "language_model",
+                "llm",
+                "vision",
+                "multimodal",
+                "responses",
+            },
+            ["text"],
+            "text",
+        ),
+    )
+    for markers, capabilities, model_type in profiles:
+        if terms & markers:
+            return list(capabilities), model_type
+    return None
+
+
+def _provider_declared_model_profile(
+    row: dict[str, Any],
+) -> tuple[list[ModelCapability], str] | None:
+    """Resolve capabilities from provider-declared task and modality fields."""
+    task_terms = _row_metadata_terms(
+        row,
+        "type",
+        "model_type",
+        "modelType",
+        "task",
+        "tasks",
+        "purpose",
+        "category",
+    )
+    task_profile = _task_profile(task_terms)
+    if task_profile is not None and task_profile[1] != "text":
+        return task_profile
+
+    input_modalities = _row_metadata_terms(
+        row,
+        "input_modalities",
+        "inputModalities",
+        "input_types",
+        "inputTypes",
+        "input",
+        "inputs",
+    )
+    output_modalities = _row_metadata_terms(
+        row,
+        "output_modalities",
+        "outputModalities",
+        "output_types",
+        "outputTypes",
+        "output",
+        "outputs",
+    )
+    if output_modalities & {"embedding", "embeddings", "vector", "vectors"}:
+        return [], "embedding"
+    if "image" in output_modalities and "text" not in output_modalities:
+        return [], "image_generation"
+    if "audio" in output_modalities and "text" not in output_modalities:
+        if not input_modalities or "text" in input_modalities:
+            return ["text_to_speech"], "text_to_speech"
+        return [], "audio"
+    if "audio" in input_modalities and output_modalities == {"text"}:
+        return ["speech_to_text"], "speech_to_text"
+    if "text" in output_modalities:
+        if "audio" in output_modalities:
+            return [], "realtime_audio"
+        return ["text"], "text"
+
+    undirected_modalities = _row_metadata_terms(row, "modality", "modalities")
+    if undirected_modalities:
+        if "text" in undirected_modalities:
+            return ["text"], "text"
+        if undirected_modalities & {"image", "images"}:
+            return [], "image"
+        if undirected_modalities & {"audio", "speech"}:
+            return [], "audio"
+
+    if task_profile is not None:
+        return task_profile
+
+    capability_terms = _row_metadata_terms(
+        row,
+        "capability",
+        "capabilities",
+        "feature",
+        "features",
+        "supported_features",
+        "supportedFeatures",
+    )
+    capability_profile = _task_profile(capability_terms)
+    if capability_profile is not None:
+        return capability_profile
+    if "text" in capability_terms:
+        return ["text"], "text"
+    if capability_terms & {"audio", "speech", "realtime"}:
+        return [], "audio"
+    if capability_terms & {"image", "images"}:
+        return [], "image"
+    return None
+
+
 def _model_row_payload(row: Any) -> dict[str, Any] | None:
     model_id = _model_id_from_row(row)
-    if not model_id:
+    if not model_id or _is_excluded_discovered_model_id(model_id):
         return None
     label: str | None = None
     owned_by: str | None = None
@@ -573,11 +762,15 @@ def _model_row_payload(row: Any) -> dict[str, Any] | None:
         raw_owner = row.get("owned_by") or row.get("owner") or row.get("organization")
         if isinstance(raw_owner, str) and raw_owner.strip():
             owned_by = raw_owner.strip()
+    declared_profile = _provider_declared_model_profile(row) if isinstance(row, dict) else None
     return {
         "id": model_id,
         "label": label,
         "owned_by": owned_by,
         "context_window": _model_context_window(row),
+        "capabilities": declared_profile[0] if declared_profile is not None else None,
+        "model_type": declared_profile[1] if declared_profile is not None else None,
+        "capability_source": "provider" if declared_profile is not None else None,
     }
 
 
@@ -714,7 +907,13 @@ def provider_models_payload(query: QueryParams) -> dict[str, Any]:
 
     detected_provider = _canonical_provider_name_for_api_base(api_base) or provider_key
     for row in rows:
-        row["capabilities"] = _infer_model_capabilities(detected_provider, row["id"])
+        if row["capabilities"] is None:
+            capabilities, model_type = _infer_model_profile(
+                detected_provider, row["id"]
+            )
+            row["capabilities"] = capabilities
+            row["model_type"] = model_type
+            row["capability_source"] = "heuristic"
 
     return {
         **base_payload,
@@ -770,22 +969,44 @@ def _parse_model_capabilities(
     return list(dict.fromkeys(raw)) or list(default or ["text"])
 
 
-def _infer_model_capabilities(provider: str, model: str) -> list[ModelCapability]:
-    """Infer the user-facing purpose from stable provider/model identifiers.
+def _parse_model_capability_source(
+    value: str | None,
+    *,
+    default: ModelCapabilitySource,
+) -> ModelCapabilitySource:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized not in MODEL_CAPABILITY_SOURCES:
+        raise WebUISettingsError("unknown model capability source")
+    return cast(ModelCapabilitySource, normalized)
 
-    Model-list APIs rarely return portable capability metadata.  Audio model
-    names are, however, explicit enough to make the normal setup flow
-    automatic while keeping the existing explicit capabilities parameter as
-    an advanced override.
-    """
+
+def _infer_model_profile(provider: str, model: str) -> tuple[list[ModelCapability], str]:
     normalized = model.strip().lower()
     synthesis_markers = ("text-to-speech", "text_to_speech", "-tts", "_tts")
     if normalized == "tts" or any(marker in normalized for marker in synthesis_markers):
-        return ["text_to_speech"]
+        return ["text_to_speech"], "text_to_speech"
     speech_markers = ("whisper", "transcribe", "transcription", "-asr", "_asr", "sensevoice")
     if any(marker in normalized for marker in speech_markers):
-        return ["speech_to_text"]
-    return ["text"]
+        return ["speech_to_text"], "speech_to_text"
+    if "audio" in normalized:
+        return [], "audio"
+    image_markers = ("dall-e", "gpt-image", "image-generation", "image_generation", "text-to-image")
+    if any(marker in normalized for marker in image_markers):
+        return [], "image_generation"
+    embedding_markers = ("embedding", "embed-")
+    if any(marker in normalized for marker in embedding_markers):
+        return [], "embedding"
+    rerank_markers = ("rerank", "re-rank")
+    if any(marker in normalized for marker in rerank_markers):
+        return [], "rerank"
+    return ["text"], "text"
+
+
+def _infer_model_capabilities(provider: str, model: str) -> list[ModelCapability]:
+    """Compatibility fallback when a provider does not declare model metadata."""
+    return _infer_model_profile(provider, model)[0]
 
 
 def _matching_capability_preset(
@@ -837,6 +1058,7 @@ def _ensure_capability_preset(
         temperature=base.temperature,
         reasoning_effort=base.reasoning_effort,
         capabilities=[capability],
+        capability_source="manual",
     )
     return name, True
 
@@ -849,16 +1071,26 @@ def ensure_model_capability_defaults(config: Any) -> bool:
             setattr(config.model_defaults, capability, None)
             changed = True
     for preset in config.model_presets.values():
+        original_capabilities = list(preset.capabilities)
         capabilities = [
             capability
             for capability in preset.capabilities
             if capability not in _REMOVED_MODEL_CAPABILITIES
         ]
-        inferred = _infer_model_capabilities(preset.provider, preset.model)
-        # Existing configurations created before automatic detection are
-        # normalized here as well, so users do not need to reclassify them.
-        if capabilities != inferred:
-            capabilities = inferred
+        if preset.capability_source is None:
+            # Preserve pre-existing explicit non-text classifications. Legacy
+            # default-text rows still receive the compatibility inference once.
+            if capabilities == ["text"] or any(
+                capability in _REMOVED_MODEL_CAPABILITIES
+                for capability in original_capabilities
+            ):
+                capabilities = _infer_model_capabilities(preset.provider, preset.model)
+                preset.capability_source = "heuristic"
+            else:
+                preset.capability_source = "manual"
+            changed = True
+        elif preset.capability_source == "heuristic":
+            capabilities = _infer_model_capabilities(preset.provider, preset.model)
         if preset.capabilities != capabilities:
             preset.capabilities = capabilities
             changed = True
@@ -1121,6 +1353,7 @@ def settings_payload(
                     for capability in preset.capabilities
                     if capability in MODEL_CAPABILITIES
                 ],
+                "capability_source": preset.capability_source or "heuristic",
             }
         )
 
@@ -1365,6 +1598,9 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
     model = (_query_first(query, "model") or "").strip()
     provider = (_query_first(query, "provider") or "").strip()
     raw_capabilities = _query_first(query, "capabilities")
+    raw_capability_source = _query_first_alias(
+        query, "capability_source", "capabilitySource"
+    )
 
     if not label:
         label = raw_name
@@ -1372,11 +1608,17 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
         raise WebUISettingsError("model is required")
     if not provider:
         raise WebUISettingsError("provider is required")
+    if raw_capability_source is not None and raw_capabilities is None:
+        raise WebUISettingsError("model capability source requires capabilities")
 
     capabilities = (
         _parse_model_capabilities(raw_capabilities)
         if raw_capabilities is not None
         else _infer_model_capabilities(provider, model)
+    )
+    capability_source = _parse_model_capability_source(
+        raw_capability_source,
+        default="manual" if raw_capabilities is not None else "heuristic",
     )
 
     name = _model_configuration_slug(raw_name or label)
@@ -1398,6 +1640,7 @@ def create_model_configuration(query: QueryParams) -> dict[str, Any]:
         temperature=base.temperature,
         reasoning_effort=base.reasoning_effort,
         capabilities=capabilities,
+        capability_source=capability_source,
     )
     if "text" in capabilities and not config.model_defaults.text:
         config.agents.defaults.model_preset = name
@@ -1445,7 +1688,13 @@ def update_model_configuration(query: QueryParams) -> dict[str, Any]:
             raise WebUISettingsError("provider is required")
 
     capabilities_raw = _query_first(query, "capabilities")
+    capability_source_raw = _query_first_alias(
+        query, "capability_source", "capabilitySource"
+    )
+    if capability_source_raw is not None and capabilities_raw is None:
+        raise WebUISettingsError("model capability source requires capabilities")
     proposed_capabilities = list(preset.capabilities)
+    proposed_capability_source = preset.capability_source
     if capabilities_raw is not None:
         proposed_capabilities = _parse_model_capabilities(
             capabilities_raw,
@@ -1459,6 +1708,10 @@ def update_model_configuration(query: QueryParams) -> dict[str, Any]:
                 raise WebUISettingsError(
                     f"cannot remove {capability} while this model is its default"
                 )
+        proposed_capability_source = _parse_model_capability_source(
+            capability_source_raw,
+            default="manual",
+        )
 
     if provider_raw is not None or capabilities_raw is not None:
         _validate_provider_for_capabilities(
@@ -1471,6 +1724,9 @@ def update_model_configuration(query: QueryParams) -> dict[str, Any]:
         changed = True
     if preset.capabilities != proposed_capabilities:
         preset.capabilities = proposed_capabilities
+        changed = True
+    if preset.capability_source != proposed_capability_source:
+        preset.capability_source = proposed_capability_source
         changed = True
 
     context_window_tokens = _parse_context_window_tokens(
