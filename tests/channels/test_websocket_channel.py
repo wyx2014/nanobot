@@ -607,7 +607,7 @@ async def test_webui_message_envelope_appends_user_transcript_with_attached_tool
         lambda value: list(value or []),
     )
     channel = _ch(bus)
-    conn = MagicMock()
+    conn = AsyncMock()
     conn.remote_address = ("127.0.0.1", 50123)
 
     await channel._dispatch_envelope(
@@ -639,6 +639,133 @@ async def test_webui_message_envelope_appends_user_transcript_with_attached_tool
     }
     assert isinstance(line.get("turn_id"), str)
     assert line.get("schema_version") == 3
+
+
+@pytest.mark.asyncio
+async def test_webui_mcp_attachment_persists_for_follow_up_turn(
+    bus: MagicMock,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nanobot.channels.websocket.normalize_mcp_preset_mentions",
+        lambda value: [dict(item) for item in (value or []) if isinstance(item, dict)],
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions = SessionManager(tmp_path / "sessions")
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"},
+        bus,
+        gateway=_basic_handler(
+            bus,
+            session_manager=sessions,
+            workspace_path=workspace,
+        ),
+    )
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "message",
+            "chat_id": "beer-research",
+            "content": "帮我分析青岛啤酒",
+            "webui": True,
+            "mcp_presets": [{"name": "juyuan", "display_name": "聚源金融数据"}],
+        },
+    )
+    first = bus.publish_inbound.await_args.args[0]
+    assert first.metadata["mcp_presets"] == [
+        {"name": "juyuan", "display_name": "聚源金融数据"},
+    ]
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "message",
+            "chat_id": "beer-research",
+            "content": "接着分析重庆啤酒",
+            "webui": True,
+        },
+    )
+
+    follow_up = bus.publish_inbound.await_args.args[0]
+    assert follow_up.metadata["mcp_presets"] == [
+        {"name": "juyuan", "display_name": "聚源金融数据"},
+    ]
+    saved = sessions.read_session_file("websocket:beer-research")
+    assert saved["metadata"]["mcp_presets"] == [
+        {"name": "juyuan", "display_name": "聚源金融数据"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_webui_clear_mcp_binding_uses_empty_tombstone(
+    bus: MagicMock,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nanobot.channels.websocket.normalize_mcp_preset_mentions",
+        lambda value: [dict(item) for item in (value or []) if isinstance(item, dict)],
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions = SessionManager(tmp_path / "sessions")
+    session = sessions.get_or_create("websocket:beer-research")
+    session.messages.append({
+        "role": "user",
+        "content": "分析青岛啤酒",
+        "mcp_presets": [{"name": "juyuan"}],
+    })
+    sessions.save(session)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"},
+        bus,
+        gateway=_basic_handler(
+            bus,
+            session_manager=sessions,
+            workspace_path=workspace,
+        ),
+    )
+    conn = AsyncMock()
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "set_mcp_presets",
+            "chat_id": "beer-research",
+            "mcp_presets": [],
+        },
+    )
+
+    payload = json.loads(conn.send.await_args.args[0])
+    assert payload == {
+        "event": "session_updated",
+        "chat_id": "beer-research",
+        "scope": "metadata",
+        "mcp_presets": [],
+    }
+    saved = sessions.read_session_file("websocket:beer-research")
+    assert saved["metadata"]["mcp_presets"] == []
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {
+            "type": "message",
+            "chat_id": "beer-research",
+            "content": "普通追问",
+            "webui": True,
+        },
+    )
+    follow_up = bus.publish_inbound.await_args.args[0]
+    assert "mcp_presets" not in follow_up.metadata
 
 
 @pytest.mark.asyncio
@@ -683,7 +810,7 @@ async def test_expert_team_auto_attaches_configured_mcp_preset(
         bus,
         gateway=_basic_handler(bus, expert_team_turn_router=router),
     )
-    conn = MagicMock()
+    conn = AsyncMock()
     conn.remote_address = ("127.0.0.1", 50123)
 
     await channel._dispatch_envelope(
@@ -4327,6 +4454,8 @@ def test_sessions_list_includes_active_run_started_at(monkeypatch, tmp_path) -> 
         "key": "websocket:chat-1",
         "title": "Running",
         "preview": "work",
+        "status": "active",
+        "mcp_presets": [],
         "run_started_at": 1_700_000_000.0,
     }
 

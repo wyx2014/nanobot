@@ -96,7 +96,12 @@ from nanobot.webui.interactive_prompt import (
     normalize_interactive_prompt,
     normalize_interactive_prompt_answer,
 )
-from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
+from nanobot.webui.mcp_presets_api import (
+    MCP_PRESETS_SESSION_KEY,
+    normalize_mcp_preset_mentions,
+    public_mcp_preset_mentions,
+    session_mcp_preset_mentions,
+)
 from nanobot.webui.media_cache import (
     DEFAULT_MEDIA_CACHE_CLEANUP_INTERVAL_S,
     DEFAULT_MEDIA_CACHE_MAX_BYTES,
@@ -522,6 +527,43 @@ class WebSocketChannel(BaseChannel):
         if not isinstance(metadata, dict):
             return None
         return public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
+
+    def _session_mcp_presets(self, chat_id: str) -> list[dict[str, Any]]:
+        if self.gateway.session_manager is None:
+            return []
+        session_key = webui_session_key_for_chat_id(chat_id)
+        row = self.gateway.session_manager.read_session_file(session_key)
+        presets = session_mcp_preset_mentions(row)
+        metadata = row.get("metadata") if isinstance(row, dict) else None
+        if isinstance(metadata, dict) and MCP_PRESETS_SESSION_KEY in metadata:
+            return presets
+        if presets:
+            session = self.gateway.session_manager.get_or_create(session_key)
+            session.metadata[MCP_PRESETS_SESSION_KEY] = presets
+            self.gateway.session_manager.save(session)
+        return presets
+
+    def _set_mcp_presets(self, chat_id: str, raw: Any) -> list[dict[str, Any]]:
+        presets = normalize_mcp_preset_mentions(raw)
+        if self.gateway.session_manager is None:
+            return presets
+        session = self.gateway.session_manager.get_or_create(
+            webui_session_key_for_chat_id(chat_id)
+        )
+        if session.metadata.get(MCP_PRESETS_SESSION_KEY) != presets:
+            # Keep an explicit empty list as a tombstone so cleared legacy
+            # attachments are not inferred again on the next turn.
+            session.metadata[MCP_PRESETS_SESSION_KEY] = presets
+            self.gateway.session_manager.save(session)
+        return presets
+
+    def _bind_mcp_presets(self, chat_id: str, raw: Any) -> list[dict[str, Any]]:
+        existing = self._session_mcp_presets(chat_id)
+        requested = normalize_mcp_preset_mentions(raw)
+        if not requested:
+            return existing
+        merged = normalize_mcp_preset_mentions([*existing, *requested])
+        return self._set_mcp_presets(chat_id, merged)
 
     def _bind_expert_team(
         self,
@@ -1465,6 +1507,29 @@ class WebSocketChannel(BaseChannel):
                 expert_team=public_expert_team_binding(expert_team),
             )
             return
+        if t == "set_mcp_presets":
+            cid = envelope.get("chat_id")
+            if not _is_valid_chat_id(cid):
+                await self._send_event(connection, "error", detail="invalid_chat_id")
+                return
+            if websocket_turn_wall_started_at(cid) is not None:
+                await self._send_event(
+                    connection,
+                    "error",
+                    chat_id=cid,
+                    detail="mcp_presets_rejected",
+                    reason="chat_running",
+                )
+                return
+            presets = self._set_mcp_presets(cid, envelope.get("mcp_presets"))
+            await self._send_event(
+                connection,
+                "session_updated",
+                chat_id=cid,
+                scope="metadata",
+                mcp_presets=presets,
+            )
+            return
         if t == "set_workspace_scope":
             cid = envelope.get("chat_id")
             if not _is_valid_chat_id(cid):
@@ -1684,14 +1749,17 @@ class WebSocketChannel(BaseChannel):
             cli_apps = normalize_cli_app_mentions(envelope.get("cli_apps"))
             if cli_apps:
                 metadata["cli_apps"] = cli_apps
-            requested_mcp_presets = normalize_mcp_preset_mentions(envelope.get("mcp_presets"))
+            previous_mcp_presets = self._session_mcp_presets(cid)
+            bound_mcp_presets = self._bind_mcp_presets(cid, envelope.get("mcp_presets"))
+            if bound_mcp_presets != previous_mcp_presets:
+                await self.send_session_updated(cid, scope="metadata")
             team_mcp_presets = (
                 expert_team_mcp_attachments(expert_team)
                 if is_team_run and expert_team is not None
                 else []
             )
             mcp_presets = normalize_mcp_preset_mentions([
-                *requested_mcp_presets,
+                *bound_mcp_presets,
                 *team_mcp_presets,
             ])
             if mcp_presets:
@@ -3007,6 +3075,15 @@ class WebSocketChannel(BaseChannel):
         expert_team = self._session_expert_team(chat_id)
         if expert_team is not None:
             body["expert_team"] = expert_team
+        if self.gateway.session_manager is not None:
+            row = self.gateway.session_manager.read_session_file(
+                webui_session_key_for_chat_id(chat_id)
+            )
+            metadata = row.get("metadata") if isinstance(row, dict) else None
+            if isinstance(metadata, dict) and MCP_PRESETS_SESSION_KEY in metadata:
+                body["mcp_presets"] = public_mcp_preset_mentions(
+                    metadata.get(MCP_PRESETS_SESSION_KEY)
+                )
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" session_updated ")

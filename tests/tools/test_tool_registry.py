@@ -72,6 +72,21 @@ def test_prepare_call_rejects_near_miss_tool_name_with_suggestion() -> None:
     assert "must match exactly" in error
 
 
+def test_prepare_call_for_missing_mcp_tool_does_not_expose_registry() -> None:
+    registry = _registry_with_names(["read_file", "web_search"])
+
+    tool, params, error = registry.prepare_call(
+        "mcp_juyuan_CompanyBasicInfo",
+        {"query": "重庆啤酒"},
+    )
+
+    assert tool is None
+    assert params == {"query": "重庆啤酒"}
+    assert error is not None
+    assert "MCP tool 'mcp_juyuan_CompanyBasicInfo' is not available" in error
+    assert "Available:" not in error
+
+
 def test_suggest_name_handles_canonical_tool_name_variants() -> None:
     registry = _registry_with_names(["read_file"])
     expected = {

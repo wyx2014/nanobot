@@ -97,6 +97,12 @@ class ToolRegistry:
         """Resolve, cast, and validate one tool call."""
         tool = self._tools.get(name)
         if not tool:
+            if str(name).startswith("mcp_"):
+                return None, params, (
+                    f"Error: MCP tool '{name}' is not available in this conversation. "
+                    "The connector may have been removed or may be temporarily offline. "
+                    "Do not retry this tool unless the connector is reattached."
+                )
             suggestion = self._suggest_name(str(name))
             hint = f" Did you mean '{suggestion}'? Tool names must match exactly." if suggestion else ""
             return None, params, (

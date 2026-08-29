@@ -382,6 +382,59 @@ def normalize_mcp_preset_mentions(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+MCP_PRESETS_SESSION_KEY = "mcp_presets"
+
+
+def public_mcp_preset_mentions(raw: Any) -> list[dict[str, Any]]:
+    """Sanitize persisted MCP bindings without requiring the server to remain configured."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw[:8]:
+        if not isinstance(item, dict):
+            continue
+        name = _clip_ws_string(item.get("name"), 64)
+        if not name or _MCP_PRESET_NAME_RE.match(name) is None:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        row: dict[str, Any] = {"name": key}
+        for field_name in _MCP_ATTACHMENT_KEYS[1:]:
+            value = item.get(field_name)
+            if isinstance(value, bool):
+                row[field_name] = value
+                continue
+            limit = 512 if field_name == "logo_url" else 160
+            text = _clip_ws_string(value, limit)
+            if text:
+                row[field_name] = text
+        out.append(row)
+    return out
+
+
+def session_mcp_preset_mentions(session_data: Any) -> list[dict[str, Any]]:
+    """Read a session binding, falling back to the latest legacy message attachment."""
+    if not isinstance(session_data, dict):
+        return []
+    metadata = session_data.get("metadata")
+    if isinstance(metadata, dict) and MCP_PRESETS_SESSION_KEY in metadata:
+        return public_mcp_preset_mentions(metadata.get(MCP_PRESETS_SESSION_KEY))
+
+    messages = session_data.get("messages")
+    if not isinstance(messages, list):
+        return []
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        presets = public_mcp_preset_mentions(message.get("mcp_presets"))
+        if presets:
+            return presets
+    return []
+
+
 def _clone_server(server: MCPServerConfig) -> MCPServerConfig:
     return MCPServerConfig.model_validate(server.model_dump(mode="json"))
 

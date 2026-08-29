@@ -17,6 +17,7 @@ from nanobot.webui.mcp_presets_api import (
     mcp_presets_test_action,
     normalize_mcp_preset_mentions,
     prune_retired_desktop_mcp_presets,
+    session_mcp_preset_mentions,
 )
 
 mcp_module = importlib.import_module("nanobot.agent.tools.mcp")
@@ -33,6 +34,23 @@ EXPECTED_FINANCE_AND_SEARCH_PRESETS = {
     "hexin-ifind-ds-index-mcp",
     "anysearch",
 }
+
+
+def test_session_mcp_presets_fall_back_to_latest_legacy_attachment() -> None:
+    session = {
+        "metadata": {},
+        "messages": [
+            {"role": "user", "content": "first", "mcp_presets": [{"name": "browser"}]},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "second", "mcp_presets": [{"name": "juyuan"}]},
+            {"role": "user", "content": "follow up"},
+        ],
+    }
+
+    assert session_mcp_preset_mentions(session) == [{"name": "juyuan"}]
+
+    session["metadata"]["mcp_presets"] = []
+    assert session_mcp_preset_mentions(session) == []
 
 
 def _use_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

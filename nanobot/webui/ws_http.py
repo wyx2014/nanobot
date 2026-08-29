@@ -81,6 +81,11 @@ from nanobot.webui.http_utils import (
 from nanobot.webui.http_utils import (
     safe_host_header as _safe_host_header,
 )
+from nanobot.webui.mcp_presets_api import (
+    MCP_PRESETS_SESSION_KEY,
+    public_mcp_preset_mentions,
+    session_mcp_preset_mentions,
+)
 from nanobot.webui.media_gateway import WebUIMediaGateway
 from nanobot.webui.session_artifacts import (
     SessionArtifactError,
@@ -943,6 +948,7 @@ class GatewayHTTPHandler:
         }
         if expert_team is not None:
             payload["expert_team"] = expert_team
+        payload["mcp_presets"] = session_mcp_preset_mentions(session_data)
         return _http_json_response(payload)
 
     async def _handle_session_runtime_snapshot(
@@ -1487,6 +1493,11 @@ class GatewayHTTPHandler:
                 if isinstance(metadata_data, dict)
                 else None
             )
+            listed_mcp_presets = (
+                public_mcp_preset_mentions(metadata.get(MCP_PRESETS_SESSION_KEY))
+                if isinstance(metadata, dict) and MCP_PRESETS_SESSION_KEY in metadata
+                else []
+            )
             state_project = (
                 projects_by_id.get(existing_state.project_id)
                 if existing_state is not None
@@ -1536,6 +1547,17 @@ class GatewayHTTPHandler:
                 session_data = self.session_manager.read_session_file(key)
                 if not isinstance(session_data, dict):
                     continue
+                listed_mcp_presets = session_mcp_preset_mentions(session_data)
+                if (
+                    listed_mcp_presets
+                    and (
+                        not isinstance(metadata, dict)
+                        or MCP_PRESETS_SESSION_KEY not in metadata
+                    )
+                ):
+                    migrated = self.session_manager.get_or_create(key)
+                    migrated.metadata[MCP_PRESETS_SESSION_KEY] = listed_mcp_presets
+                    self.session_manager.save(migrated)
                 projection_data = session_data
                 if project_lifecycle is not None and not metadata_project_id:
                     projection_metadata = (
@@ -1603,6 +1625,7 @@ class GatewayHTTPHandler:
                 expert_team = public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
                 if expert_team is not None:
                     row["expert_team"] = expert_team
+            row["mcp_presets"] = listed_mcp_presets
             if state_session.status != "archived":
                 chat_id = key if key.startswith("cron:") else key.split(":", 1)[1]
                 started_at = websocket_turn_wall_started_at(chat_id)
@@ -1705,6 +1728,7 @@ class GatewayHTTPHandler:
                 )
                 if expert_team is not None:
                     row["expert_team"] = expert_team
+            row["mcp_presets"] = session_mcp_preset_mentions(session_data)
             cleaned.append(row)
         cleaned.sort(
             key=lambda row: str(row.get("updated_at") or ""),
@@ -1791,6 +1815,7 @@ class GatewayHTTPHandler:
             expert_team = public_expert_team_binding(metadata.get(EXPERT_TEAM_SESSION_KEY))
             if expert_team is not None:
                 data["expert_team"] = expert_team
+        data["mcp_presets"] = session_mcp_preset_mentions(session_data)
         return _http_json_response(data)
 
     def _handle_file_preview(self, request: WsRequest, key: str) -> Response:
