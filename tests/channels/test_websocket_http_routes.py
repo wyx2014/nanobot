@@ -127,6 +127,127 @@ async def _http_get(
     )
 
 
+@pytest.mark.asyncio
+async def test_security_policy_updates_over_gateway_compatible_get(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    port = _free_port()
+    channel = _ch(bus, workspace_path=tmp_path, port=port)
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get(f"http://127.0.0.1:{port}/webui/bootstrap")
+        headers = {
+            "Authorization": f"Bearer {boot.json()['token']}",
+            "X-Nanobot-Security-Values": json.dumps({"file_allow_paths": []}),
+        }
+
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/security/policy/update",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["file_allow_paths"] == []
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_security_audit_hides_internal_and_targetless_records(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    port = _free_port()
+    channel = _ch(bus, workspace_path=tmp_path, port=port)
+    logs = channel.gateway.http.logs
+    logs.begin_security_event(
+        category="file",
+        action="write",
+        decision="allow",
+        result="succeeded",
+        risk="normal",
+        summary="internal progress update",
+    )
+    logs.begin_security_event(
+        category="mcp",
+        action="call",
+        decision="allow",
+        result="succeeded",
+        risk="normal",
+        summary="internal MCP event",
+        target="mcp_internal",
+    )
+    visible_id = logs.begin_security_event(
+        category="network",
+        action="fetch",
+        decision="allow",
+        result="succeeded",
+        risk="normal",
+        summary="通过 Web 工具访问网络",
+        target="https://example.com/report",
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get(f"http://127.0.0.1:{port}/webui/bootstrap")
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/security/audit",
+            headers={"Authorization": f"Bearer {boot.json()['token']}"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 1
+        assert [event["id"] for event in payload["events"]] == [visible_id]
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_security_audit_cursor_page_skips_recounting(
+    bus: MagicMock,
+    tmp_path: Path,
+) -> None:
+    port = _free_port()
+    channel = _ch(bus, workspace_path=tmp_path, port=port)
+    logs = channel.gateway.http.logs
+    for index in range(2):
+        logs.begin_security_event(
+            category="command",
+            action="execute",
+            decision="allow",
+            result="succeeded",
+            risk="normal",
+            summary="执行命令",
+            target=f"echo page-{index}",
+        )
+    logs.count_security_events = MagicMock(
+        side_effect=AssertionError("cursor pages must not recount all records")
+    )
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+    try:
+        boot = await _http_get(f"http://127.0.0.1:{port}/webui/bootstrap")
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/security/audit?limit=1&include_total=0",
+            headers={"Authorization": f"Bearer {boot.json()['token']}"},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] is None
+        assert len(payload["events"]) == 1
+        assert payload["next_cursor"] is not None
+        logs.count_security_events.assert_not_called()
+    finally:
+        await channel.stop()
+        await server_task
+
+
 def _seed_session(workspace: Path, key: str = "websocket:test") -> SessionManager:
     sm = SessionManager(workspace)
     s = Session(key=key)

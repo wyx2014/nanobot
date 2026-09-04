@@ -587,6 +587,12 @@ class AgentLoop:
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
         self.runner = AgentRunner(provider, trace_collector=self.trace_collector)
+        if performance_log_store is not None:
+            from nanobot.security.protection import get_security_service
+
+            self.security_service = get_security_service(performance_log_store, workspace)
+        else:
+            self.security_service = None
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -601,6 +607,7 @@ class AgentLoop:
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
             parent_tools=self.tools,
             trace_collector=self.trace_collector,
+            security_service=self.security_service,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -1676,6 +1683,22 @@ class AgentLoop:
             return "\n\n".join(guards) or None
 
         try:
+            async def _request_security_approval(payload: dict[str, Any]) -> None:
+                approval_metadata = dict(metadata or {})
+                approval_metadata["_security_approval"] = payload
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content="",
+                    metadata=approval_metadata,
+                ))
+
+            security_interactive = bool(
+                channel == "websocket"
+                and (metadata or {}).get("webui") is True
+                and not is_cron_turn(metadata)
+                and not ephemeral
+            )
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
                 tools=tools if tools is not None else self.tools,
@@ -1716,6 +1739,17 @@ class AgentLoop:
                     )
                     or bool((metadata or {}).get("_enforce_finance_source_priority"))
                 ),
+                security_service=self.security_service,
+                security_approval_callback=(
+                    _request_security_approval if security_interactive else None
+                ),
+                security_interactive=security_interactive,
+                security_chat_id=chat_id if security_interactive else None,
+                security_turn_id=str(
+                    (metadata or {}).get("_runtime_turn_id")
+                    or (metadata or {}).get(WEBUI_TURN_METADATA_KEY)
+                    or ""
+                ).strip() or None,
                 finalize_on_max_iterations=turn_continuation.should_finalize_on_max_iterations(
                     pending_queue_available=(
                         pending_queue is not None and session is not None

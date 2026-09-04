@@ -97,6 +97,46 @@ async def test_websocket_progress_hook_publishes_live_and_exact_usage() -> None:
     }, False)
 
 
+@pytest.mark.asyncio
+async def test_progress_hook_does_not_stream_serialized_internal_tool_markup() -> None:
+    streamed: list[str] = []
+
+    async def on_stream(delta: str) -> None:
+        streamed.append(delta)
+
+    hook = AgentProgressHook(on_stream=on_stream, channel="websocket")
+    context = AgentHookContext(iteration=0, messages=[])
+    for chunk in (
+        "<tool",
+        "_call>\n<function=update_task_progress>",
+        "<parameter=current_step_id>2</parameter></function></tool_call>",
+    ):
+        await hook.on_stream(context, chunk)
+
+    assert streamed == []
+
+
+@pytest.mark.asyncio
+async def test_progress_hook_stops_before_tool_markup_appended_to_narration() -> None:
+    streamed: list[str] = []
+
+    async def on_stream(delta: str) -> None:
+        streamed.append(delta)
+
+    hook = AgentProgressHook(on_stream=on_stream, channel="websocket")
+    context = AgentHookContext(iteration=0, messages=[])
+    narration = "我将使用已有证据完成演示文稿。"
+    for chunk in (
+        narration,
+        "<tool",
+        "_call>\n<function=exec>",
+        "<parameter=command>mkdir demo</parameter></function></tool_call>",
+    ):
+        await hook.on_stream(context, chunk)
+
+    assert streamed == [narration]
+
+
 class TestToolEventProgress:
     """_run_agent_loop emits structured tool_events via on_progress."""
 

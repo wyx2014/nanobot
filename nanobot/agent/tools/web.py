@@ -939,6 +939,11 @@ class WebFetchTool(Tool):
     async def _fetch_jina(self, url: str, max_chars: int) -> str | None:
         """Try fetching via Jina Reader API. Returns None on failure."""
         try:
+            from nanobot.security.network import validate_configured_network_target
+
+            policy_ok, _ = validate_configured_network_target("https://r.jina.ai")
+            if not policy_ok:
+                return None
             headers = {"Accept": "application/json", "User-Agent": self.user_agent}
             jina_key = os.environ.get("JINA_API_KEY", "")
             if jina_key:
@@ -1017,10 +1022,10 @@ class WebFetchTool(Tool):
                 "untrusted": True, "text": text,
             }, ensure_ascii=False)
         except httpx.ProxyError as e:
-            logger.exception("WebFetch proxy error for {}", url)
+            logger.warning("WebFetch proxy error for {}: {}", url, e)
             return json.dumps({"error": f"Proxy error: {e}", "url": url}, ensure_ascii=False)
         except Exception as e:
-            logger.exception("WebFetch error for {}", url)
+            logger.warning("WebFetch error for {}: {}", url, e)
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
 
     def _extract_readable_html(self, html_content: str, extract_mode: str) -> str:

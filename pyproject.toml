@@ -166,8 +166,12 @@ include = [
     "nanobot/**/*.py",
     "nanobot/templates/**/*.md",
     "nanobot/skills/**/*.md",
+    "nanobot/skills/**/*.json",
     "nanobot/skills/**/*.js",
+    "nanobot/skills/**/*.pptx",
     "nanobot/skills/**/*.sh",
+    "nanobot/skills/**/*.yaml",
+    "nanobot/skills/**/*.yml",
     "nanobot/web/dist/**/*",
 ]
 # nanobot/web/dist/ is produced by `cd webui && bun run build` and is

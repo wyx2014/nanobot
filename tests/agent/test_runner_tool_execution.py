@@ -532,15 +532,28 @@ async def test_runner_blocks_repeated_external_fetches():
 
 
 @pytest.mark.asyncio
-async def test_runner_finalizes_after_consecutive_repeated_lookup_blocks():
+async def test_runner_disables_external_lookups_and_continues_local_artifact_work():
     provider = MagicMock()
     normal_calls = {"n": 0}
+    filtered_tool_names: list[str] = []
 
     async def chat_with_retry(*, messages, tools=None, **kwargs):
-        if tools is None:
-            assert "circuit breaker" in messages[-1]["content"]
+        if messages[-1].get("role") == "user" and "has disabled further" in messages[-1]["content"]:
+            filtered_tool_names.extend(
+                schema["function"]["name"] for schema in (tools or [])
+            )
             return LLMResponse(
-                content="Final report using already collected evidence.",
+                content="creating the local artifact",
+                tool_calls=[ToolCallRequest(
+                    id="create_local_artifact",
+                    name="exec",
+                    arguments={"command": "create artifact"},
+                )],
+                usage={},
+            )
+        if messages[-1].get("role") == "tool" and messages[-1].get("name") == "exec":
+            return LLMResponse(
+                content="Artifact created using already collected evidence.",
                 tool_calls=[],
                 usage={},
             )
@@ -557,7 +570,10 @@ async def test_runner_finalizes_after_consecutive_repeated_lookup_blocks():
 
     provider.chat_with_retry = chat_with_retry
     tools = MagicMock()
-    tools.get_definitions.return_value = []
+    tools.get_definitions.return_value = [
+        {"type": "function", "function": {"name": "web_search", "parameters": {}}},
+        {"type": "function", "function": {"name": "exec", "parameters": {}}},
+    ]
     tools.execute = AsyncMock(return_value="search result")
 
     result = await AgentRunner(provider).run(AgentRunSpec(
@@ -568,10 +584,67 @@ async def test_runner_finalizes_after_consecutive_repeated_lookup_blocks():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert result.stop_reason == "repeated_external_lookup"
-    assert result.final_content == "Final report using already collected evidence."
+    assert result.stop_reason == "completed"
+    assert result.final_content == "Artifact created using already collected evidence."
     assert normal_calls["n"] == 5
-    assert tools.execute.await_count == 2
+    assert filtered_tool_names == ["exec"]
+    assert tools.execute.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_runner_never_returns_serialized_tool_markup_after_lookup_circuit_breaker():
+    provider = MagicMock()
+    normal_calls = {"n": 0}
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        if (
+            tools is None
+            or (
+                messages[-1].get("role") == "user"
+                and "has disabled further" in messages[-1]["content"]
+            )
+        ):
+            return LLMResponse(
+                content=(
+                    "I will create the artifact now.<tool_call>\n"
+                    "<function=exec>\n"
+                    "<parameter=command>mkdir demo</parameter>\n"
+                    "</function>\n"
+                    "</tool_call>"
+                ),
+                tool_calls=[],
+                usage={},
+            )
+        normal_calls["n"] += 1
+        return LLMResponse(
+            content="still searching",
+            tool_calls=[ToolCallRequest(
+                id=f"repeat_markup_{normal_calls['n']}",
+                name="web_search",
+                arguments={"query": "same query forever"},
+            )],
+            usage={},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = [
+        {"type": "function", "function": {"name": "web_search", "parameters": {}}},
+        {"type": "function", "function": {"name": "exec", "parameters": {}}},
+    ]
+    tools.execute = AsyncMock(return_value="search result")
+
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "research task"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=20,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content is not None
+    assert "<tool_call>" not in result.final_content
+    assert result.stop_reason == "empty_final_response"
 
 
 @pytest.mark.asyncio

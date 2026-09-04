@@ -89,3 +89,74 @@ def test_structured_log_store_migrates_pre_trace_schema_before_indexing(
     assert record.trace_id == "trace-a"
     assert record.run_id == "run-a"
     assert record.span_id == "span-a"
+
+
+def test_security_audit_supports_completion_filtering_and_clear(tmp_path: Path) -> None:
+    store = StructuredLogStore(tmp_path / "logs.sqlite")
+    event_id = store.begin_security_event(
+        category="command",
+        action="execute",
+        decision="require_approval",
+        risk="high",
+        rule_id="command.destructive_git",
+        summary="destructive git",
+        tool_name="exec",
+        target="git reset --hard",
+        details={"Authorization": "Bearer secret"},
+    )
+    store.complete_security_event(event_id, result="approved", duration_ms=12)
+
+    [record] = store.query_security_events(category="command", result="approved")
+    assert record.id == event_id
+    assert record.duration_ms == 12
+    assert record.details["Authorization"] == "[REDACTED]"
+    assert store.count_security_events(search="reset") == 1
+    assert store.clear_security_events() == 1
+    assert store.count_security_events() == 0
+
+
+def test_security_audit_can_limit_results_to_user_facing_safety_categories(
+    tmp_path: Path,
+) -> None:
+    store = StructuredLogStore(tmp_path / "logs.sqlite")
+    for category in ("file", "command", "network", "mcp", "settings"):
+        store.begin_security_event(
+            category=category,
+            action="test",
+            decision="allow",
+            result="succeeded",
+            risk="normal",
+            summary=f"{category} event",
+        )
+
+    visible = ("file", "command", "network")
+    records = store.query_security_events(categories=visible)
+
+    assert {record.category for record in records} == set(visible)
+    assert store.count_security_events(categories=visible) == 3
+
+
+def test_security_audit_can_hide_targetless_internal_records(tmp_path: Path) -> None:
+    store = StructuredLogStore(tmp_path / "logs.sqlite")
+    store.begin_security_event(
+        category="file",
+        action="write",
+        decision="allow",
+        result="succeeded",
+        risk="normal",
+        summary="internal progress update",
+    )
+    visible_id = store.begin_security_event(
+        category="file",
+        action="write",
+        decision="allow",
+        result="succeeded",
+        risk="normal",
+        summary="write file",
+        target="/tmp/report.md",
+    )
+
+    records = store.query_security_events(require_target=True)
+
+    assert [record.id for record in records] == [visible_id]
+    assert store.count_security_events(require_target=True) == 1

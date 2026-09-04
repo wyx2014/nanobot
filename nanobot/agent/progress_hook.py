@@ -21,6 +21,7 @@ from nanobot.utils.progress_events import (
     invoke_on_progress,
     on_progress_accepts_tool_events,
 )
+from nanobot.utils.runtime import is_internal_tool_call_stream_prefix
 from nanobot.utils.tool_hints import format_tool_hints
 
 
@@ -55,6 +56,7 @@ class AgentProgressHook(AgentHook):
         self._set_tool_context = set_tool_context
         self._on_iteration = on_iteration
         self._stream_buf = ""
+        self._visible_stream_chars = 0
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
         self._pending_stream_end = False
@@ -96,10 +98,13 @@ class AgentProgressHook(AgentHook):
         return name in sig.parameters
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-        prev_clean = strip_think(self._stream_buf)
         self._stream_buf += delta
         new_clean = strip_think(self._stream_buf)
-        incremental = new_clean[len(prev_clean) :]
+        if is_internal_tool_call_stream_prefix(new_clean):
+            incremental = ""
+        else:
+            incremental = new_clean[self._visible_stream_chars :]
+            self._visible_stream_chars = len(new_clean)
 
         if await self._think_extractor.feed(self._stream_buf, self.emit_reasoning):
             context.streamed_reasoning = True
@@ -225,6 +230,7 @@ class AgentProgressHook(AgentHook):
             self._pending_stream_end = False
             await self._emit_stream_end(resuming=False, stream_kind="answer")
         self._stream_buf = ""
+        self._visible_stream_chars = 0
         self._think_extractor.reset()
 
     async def before_iteration(self, context: AgentHookContext) -> None:

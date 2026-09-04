@@ -248,6 +248,7 @@ class SubagentManager:
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         parent_tools: ToolRegistry | None = None,
         trace_collector: "TraceCollector | None" = None,
+        security_service: Any | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -270,6 +271,7 @@ class SubagentManager:
         )
         self.runner = AgentRunner(provider, trace_collector=trace_collector)
         self.trace_collector = trace_collector
+        self.security_service = security_service
         self.parent_tools = parent_tools
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -693,6 +695,10 @@ class SubagentManager:
                         isinstance(expert_team, dict)
                         and expert_team.get("id") == "asset-research-team"
                     ),
+                    security_service=self.security_service,
+                    security_interactive=False,
+                    security_chat_id=None,
+                    security_turn_id=origin_message_id,
                 )
                 result = (
                     await asyncio.wait_for(

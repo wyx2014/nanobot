@@ -42,6 +42,8 @@ BUDGET_EXHAUSTED_FINALIZATION_PROMPT = (
     "done, what remains, and the best next step if anything is incomplete."
 )
 
+_INTERNAL_TOOL_CALL_OPEN = "<tool_call>"
+
 LENGTH_RECOVERY_PROMPT = (
     "Output limit reached. Continue exactly where you left off "
     "— no recap, no apology. Break remaining work into smaller steps if needed."
@@ -105,6 +107,40 @@ def normalize_tool_message_content(tool_name: str, content: Any) -> str | list[d
 def is_blank_text(content: str | None) -> bool:
     """True when *content* is missing or only whitespace."""
     return content is None or not content.strip()
+
+
+def is_internal_tool_call_markup(content: str | None) -> bool:
+    """Detect a serialized internal tool call misreported as assistant prose.
+
+    Some OpenAI-compatible models occasionally emit their tool template as XML
+    text even when the request has tools disabled. Treat leading markup and
+    markup appended after public narration as leaks when the internal marker is
+    followed by a function tag. A plain-text mention of ``<tool_call>`` remains
+    untouched.
+    """
+    if not content:
+        return False
+    normalized = content.lower()
+    marker_index = normalized.find(_INTERNAL_TOOL_CALL_OPEN)
+    if marker_index < 0:
+        return False
+    return normalized.find("<function=", marker_index + len(_INTERNAL_TOOL_CALL_OPEN)) >= 0
+
+
+def is_internal_tool_call_stream_prefix(content: str | None) -> bool:
+    """Return True once a stream contains or may be entering tool-call markup."""
+    if content is None:
+        return False
+    normalized = content.lower()
+    if not normalized:
+        return True
+    if _INTERNAL_TOOL_CALL_OPEN in normalized:
+        return True
+    max_prefix = min(len(normalized), len(_INTERNAL_TOOL_CALL_OPEN) - 1)
+    return any(
+        normalized.endswith(_INTERNAL_TOOL_CALL_OPEN[:prefix_length])
+        for prefix_length in range(1, max_prefix + 1)
+    )
 
 
 def build_finalization_retry_message() -> dict[str, str]:

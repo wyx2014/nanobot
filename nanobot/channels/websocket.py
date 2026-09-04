@@ -480,6 +480,7 @@ class WebSocketChannel(BaseChannel):
             subs.discard(connection)
             if not subs:
                 self._subs.pop(cid, None)
+                self.gateway.http.security.approvals.cancel_chat(cid)
         self._conn_default.pop(connection, None)
 
     async def _maybe_push_active_goal_state(self, chat_id: str) -> None:
@@ -1423,6 +1424,33 @@ class WebSocketChannel(BaseChannel):
     ) -> None:
         """Route one typed inbound WebUI envelope."""
         t = envelope.get("type")
+        if t == "security_approval_response":
+            cid = envelope.get("chat_id")
+            approval_id = envelope.get("approval_id")
+            decision = envelope.get("decision")
+            if not _is_valid_chat_id(cid) or not isinstance(approval_id, str):
+                await self._send_event(connection, "error", detail="invalid_security_approval")
+                return
+            if decision not in {"allow_turn", "deny"}:
+                await self._send_event(connection, "error", chat_id=cid, detail="invalid_security_decision")
+                return
+            resolved = self.gateway.http.security.approvals.resolve(
+                approval_id,
+                decision,
+                chat_id=cid,
+            )
+            raw = json.dumps({
+                "event": "security_approval_resolved",
+                "chat_id": cid,
+                "approval_id": approval_id,
+                "decision": decision,
+                "accepted": resolved,
+            }, ensure_ascii=False)
+            recipients = set(self._subs.get(cid, set()))
+            recipients.add(connection)
+            for recipient in recipients:
+                await self._safe_send_to(recipient, raw, label=" security approval resolved ")
+            return
         if t == "new_chat":
             new_id = str(uuid.uuid4())
             try:
@@ -2106,6 +2134,17 @@ class WebSocketChannel(BaseChannel):
                     msg.chat_id,
                     scope=scope if isinstance(scope, str) else None,
                 )
+            return
+        if msg.metadata.get("_security_approval"):
+            approval = msg.metadata.get("_security_approval")
+            if isinstance(approval, dict):
+                raw = json.dumps({
+                    "event": "security_approval_required",
+                    "chat_id": msg.chat_id,
+                    "approval": approval,
+                }, ensure_ascii=False)
+                for connection in conns:
+                    await self._safe_send_to(connection, raw, label=" security approval ")
             return
         if msg.metadata.get("_file_edit_events"):
             edits = msg.metadata.get("_file_edit_events")

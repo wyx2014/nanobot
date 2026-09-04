@@ -34,7 +34,7 @@ from nanobot.cron.types import CronJob, CronSchedule
 from nanobot.observability.trace_store import TraceStore
 from nanobot.session.manager import _metadata_title
 from nanobot.storage.lifecycle import LifecycleRegistry
-from nanobot.storage.logs import StructuredLogRecord, StructuredLogStore
+from nanobot.storage.logs import SecurityAuditRecord, StructuredLogRecord, StructuredLogStore
 from nanobot.storage.session_events import SessionEventFileStore, SessionEventService
 from nanobot.storage.state import (
     SessionProjectMismatch,
@@ -119,6 +119,8 @@ from nanobot.webui.workspaces import WebUIWorkspaceController
 _SLOW_WEBUI_HTTP_LOG_MS = 1_000
 _SLOW_WEBUI_STAGE_LOG_MS = 500
 _AUTOMATION_VALUES_HEADER = "X-Nanobot-Automation-Values"
+_SECURITY_VALUES_HEADER = "X-Nanobot-Security-Values"
+_SECURITY_VALUES_HEADER_MAX_BYTES = 64 * 1024
 
 if TYPE_CHECKING:
     from nanobot.bus.queue import MessageBus
@@ -251,6 +253,10 @@ class GatewayHTTPHandler:
         self.thread_runtime_registry = thread_runtime_registry
         self._log = log
         self._runtime_surface = runtime_surface
+
+        from nanobot.security.protection import get_security_service
+
+        self.security = get_security_service(logs_store, skills_workspace_path)
 
         from nanobot.webui.schedule_routes import WebUIScheduleRouter
         from nanobot.webui.settings_api import runtime_capabilities as _rc
@@ -2372,6 +2378,20 @@ class GatewayHTTPHandler:
             return await self._handle_project_sessions(request, m.group(1))
         if got == "/api/diagnostics/logs":
             return await self._handle_diagnostic_logs(request)
+        if got == "/api/security/policy":
+            return self._handle_security_policy(request)
+        if got == "/api/security/policy/update":
+            return self._handle_security_policy_update(request)
+        if got == "/api/security/policy/reset":
+            return self._handle_security_policy_reset(request)
+        if got == "/api/security/audit":
+            if str(getattr(request, "method", "GET")).upper() == "DELETE":
+                return await self._handle_security_audit_clear(request)
+            return await self._handle_security_audit(request)
+        if got == "/api/security/audit/export":
+            return await self._handle_security_audit_export(request)
+        if got == "/api/security/audit/clear":
+            return await self._handle_security_audit_clear(request)
         if got == "/api/traces":
             return await self._handle_traces_list(request)
         m = re.match(r"^/api/traces/(trc_[A-Za-z0-9_-]+)/spans$", got)
@@ -3070,6 +3090,185 @@ class GatewayHTTPHandler:
         return _http_json_response(
             {"logs": [self._structured_log_payload(record) for record in records]}
         )
+
+    def _handle_security_policy(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        method = str(getattr(request, "method", "GET")).upper()
+        if method == "GET":
+            return _http_json_response(self.security.policy_payload())
+        return self._handle_security_policy_update(request)
+
+    def _handle_security_policy_update(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() not in {"GET", "POST", "PUT"}:
+            return _http_error(405, "unsupported method")
+        raw = _case_insensitive_header(request.headers, _SECURITY_VALUES_HEADER)
+        if not raw:
+            return _http_error(400, "missing security policy payload")
+        if len(raw.encode("utf-8")) > _SECURITY_VALUES_HEADER_MAX_BYTES:
+            return _http_error(413, "security policy payload is too large")
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("security policy payload must be an object")
+            result = self.security.update_policy(payload)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return _http_error(400, str(exc))
+        return _http_json_response(result)
+
+    def _handle_security_policy_reset(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() not in {"GET", "POST", "PUT"}:
+            return _http_error(405, "unsupported method")
+        return _http_json_response(self.security.reset_policy())
+
+    @staticmethod
+    def _security_audit_filters(request: WsRequest) -> dict[str, Any]:
+        query = _parse_query(request.path)
+        category = (_query_first(query, "category") or "").strip() or None
+        visible_categories = ("file", "command", "network")
+        if category is not None and category not in visible_categories:
+            raise ValueError("invalid audit category")
+
+        def integer(key: str) -> int | None:
+            raw = _query_first(query, key)
+            if raw is None or raw == "":
+                return None
+            return int(raw)
+
+        return {
+            "search": (_query_first(query, "search") or "").strip() or None,
+            "category": category,
+            "categories": None if category else visible_categories,
+            "require_target": True,
+            "result": (_query_first(query, "result") or "").strip() or None,
+            "start_ms": integer("start_ms"),
+            "end_ms": integer("end_ms"),
+        }
+
+    async def _handle_security_audit(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        try:
+            filters = self._security_audit_filters(request)
+            query = _parse_query(request.path)
+            limit = max(1, min(int(_query_first(query, "limit") or 100), 500))
+            cursor_raw = _query_first(query, "cursor")
+            cursor = int(cursor_raw) if cursor_raw else None
+            include_total = (_query_first(query, "include_total") or "1") != "0"
+        except ValueError:
+            return _http_error(400, "invalid audit query")
+        records_task = asyncio.to_thread(
+            self.logs.query_security_events,
+            **filters,
+            cursor=cursor,
+            limit=limit + 1,
+        )
+        if include_total:
+            records, total = await asyncio.gather(
+                records_task,
+                asyncio.to_thread(self.logs.count_security_events, **filters),
+            )
+        else:
+            records = await records_task
+            total = None
+        has_more = len(records) > limit
+        records = records[:limit]
+        return _http_json_response({
+            "events": [self._security_audit_payload(record) for record in records],
+            "total": total,
+            "loaded": len(records),
+            "next_cursor": records[-1].id if has_more and records else None,
+        })
+
+    async def _handle_security_audit_export(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        try:
+            filters = self._security_audit_filters(request)
+        except ValueError:
+            return _http_error(400, "invalid audit query")
+        body = await asyncio.to_thread(self._security_audit_export_body, filters)
+        return _http_response(
+            body,
+            content_type="application/x-ndjson; charset=utf-8",
+            extra_headers=[
+                ("Content-Disposition", 'attachment; filename="nanobot-security-audit.jsonl"'),
+            ],
+        )
+
+    def _security_audit_export_body(self, filters: dict[str, Any]) -> bytes:
+        output = io.BytesIO()
+        cursor: int | None = None
+        exported = 0
+        page_size = 1_000
+        while exported < 100_000:
+            records = self.logs.query_security_events(
+                **filters,
+                cursor=cursor,
+                limit=min(page_size, 100_000 - exported),
+            )
+            if not records:
+                break
+            for record in records:
+                output.write(
+                    (
+                        json.dumps(
+                            self._security_audit_payload(record),
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+            exported += len(records)
+            if len(records) < page_size:
+                break
+            cursor = records[-1].id
+        return output.getvalue()
+
+    async def _handle_security_audit_clear(self, request: WsRequest) -> Response:
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() not in {"GET", "DELETE", "POST"}:
+            return _http_error(405, "unsupported method")
+        deleted = await asyncio.to_thread(self.logs.clear_security_events)
+        await asyncio.to_thread(
+            self.logs.begin_security_event,
+            category="settings",
+            action="clear_audit",
+            decision="allow",
+            result="succeeded",
+            risk="normal",
+            rule_id="security.audit_cleared",
+            summary="安全审计记录已由用户清空",
+            details={"deleted_count": deleted},
+        )
+        return _http_json_response({"deleted": deleted})
+
+    @staticmethod
+    def _security_audit_payload(record: SecurityAuditRecord) -> dict[str, Any]:
+        return {
+            "id": record.id,
+            "timestamp": record.timestamp,
+            "category": record.category,
+            "action": record.action,
+            "decision": record.decision,
+            "result": record.result,
+            "risk": record.risk,
+            "rule_id": record.rule_id,
+            "project_id": record.project_id,
+            "session_id": record.session_id,
+            "turn_id": record.turn_id,
+            "tool_call_id": record.tool_call_id,
+            "tool_name": record.tool_name,
+            "target": record.target,
+            "summary": record.summary,
+            "duration_ms": record.duration_ms,
+            "details": record.details,
+        }
 
     @staticmethod
     def _structured_log_payload(record: StructuredLogRecord) -> dict[str, Any]:

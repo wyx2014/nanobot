@@ -186,10 +186,8 @@ class ExecTool(Tool):
         self.timeout = timeout
         self.working_dir = working_dir
         self.sandbox = sandbox
-        self.deny_patterns = (deny_patterns or []) + [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
+        self._configured_deny_patterns = list(deny_patterns or [])
+        self._core_deny_patterns = [
             r"(?:^|[;&|]\s*)format(?!=)\b",   # format (as standalone command only)
             r"\b(mkfs|diskpart)\b",          # disk operations
             r"\bdd\s+if=",                   # dd
@@ -205,6 +203,8 @@ class ExecTool(Tool):
             r"\bdd\b[^|;&<>]*\bof=\S*(?:history\.jsonl|\.dream_cursor)",  # dd of=
             r"\bsed\s+-i[^|;&<>]*(?:history\.jsonl|\.dream_cursor)",  # sed -i
         ]
+        # Keep the public attribute compatible for diagnostics and extensions.
+        self.deny_patterns = [*self._configured_deny_patterns, *self._core_deny_patterns]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         if allow_local_preview_access is not None:
@@ -612,14 +612,18 @@ class ExecTool(Tool):
         cmd = command.strip()
         lower = cmd.lower()
 
-        # allow_patterns take priority over deny_patterns so that users can
-        # exempt specific commands (e.g. "rm -rf" inside a build directory)
-        # from the hardcoded deny list via configuration.
+        # Core protection is immutable. Configured allow patterns may only
+        # override configured deny patterns; they cannot bypass disk, system,
+        # or nanobot-state safeguards.
+        for pattern in self._core_deny_patterns:
+            if re.search(pattern, lower):
+                return "Error: Command blocked by core safety protection (deny pattern filter)"
+
         explicitly_allowed = bool(self.allow_patterns) and any(
             re.search(p, lower) for p in self.allow_patterns
         )
         if not explicitly_allowed:
-            for pattern in self.deny_patterns:
+            for pattern in self._configured_deny_patterns:
                 if re.search(pattern, lower):
                     return "Error: Command blocked by deny pattern filter"
 

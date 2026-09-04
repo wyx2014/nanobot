@@ -138,9 +138,13 @@ def test_loader_registers_exec_with_real_tools_config(tmp_path):
 
     assert "exec" in registered
     assert "create_docx" in registered
+    assert "create_presentation" in registered
+    assert "import_presentation_asset" in registered
     assert "create_research_chart" in registered
     assert registry.has("exec")
     assert registry.has("create_docx")
+    assert registry.has("create_presentation")
+    assert registry.has("import_presentation_asset")
     assert registry.has("create_research_chart")
 
 

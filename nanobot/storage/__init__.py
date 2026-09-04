@@ -6,7 +6,7 @@ from nanobot.storage.session_events import (
     SessionEventFileStore,
     SessionEventService,
 )
-from nanobot.storage.logs import StructuredLogRecord, StructuredLogStore
+from nanobot.storage.logs import SecurityAuditRecord, StructuredLogRecord, StructuredLogStore
 from nanobot.storage.state import (
     ArtifactRecord,
     EventProjectionError,
@@ -33,5 +33,6 @@ __all__ = [
     "StateStoreRecovery",
     "StructuredLogRecord",
     "StructuredLogStore",
+    "SecurityAuditRecord",
     "open_state_store_with_recovery",
 ]

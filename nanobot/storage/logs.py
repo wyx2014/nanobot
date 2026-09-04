@@ -34,6 +34,27 @@ class StructuredLogRecord:
     details: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SecurityAuditRecord:
+    id: int
+    timestamp: int
+    category: str
+    action: str
+    decision: str
+    result: str
+    risk: str
+    rule_id: str | None
+    project_id: str | None
+    session_id: str | None
+    turn_id: str | None
+    tool_call_id: str | None
+    tool_name: str | None
+    target: str | None
+    summary: str
+    duration_ms: int | None
+    details: dict[str, Any]
+
+
 _LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS logs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +85,42 @@ ON logs(artifact_id, timestamp DESC);
 
 CREATE INDEX IF NOT EXISTS logs_error_time
 ON logs(error_code, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS security_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       INTEGER NOT NULL,
+    category        TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    decision        TEXT NOT NULL,
+    result          TEXT NOT NULL,
+    risk            TEXT NOT NULL,
+    rule_id         TEXT,
+    project_id      TEXT,
+    session_id      TEXT,
+    turn_id         TEXT,
+    tool_call_id    TEXT,
+    tool_name       TEXT,
+    target          TEXT,
+    summary         TEXT NOT NULL,
+    duration_ms     INTEGER,
+    details_json    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS security_events_time
+ON security_events(timestamp DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS security_events_session_time
+ON security_events(session_id, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS security_events_category_result_time
+ON security_events(category, result, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS security_events_category_result_time_v2
+ON security_events(category, result, timestamp DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS security_events_visible_category_time
+ON security_events(category, timestamp DESC, id DESC)
+WHERE target IS NOT NULL AND target != '';
 
 """
 
@@ -227,6 +284,234 @@ class StructuredLogStore:
             connection.commit()
             return max(0, int(cursor.rowcount))
 
+    def begin_security_event(
+        self,
+        *,
+        category: str,
+        action: str,
+        decision: str,
+        risk: str,
+        summary: str,
+        rule_id: str | None = None,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        tool_call_id: str | None = None,
+        tool_name: str | None = None,
+        target: str | None = None,
+        result: str = "pending",
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        timestamp = time.time_ns() // 1_000_000
+        safe_details = self._redact(details or {})
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO security_events(
+                    timestamp, category, action, decision, result, risk,
+                    rule_id, project_id, session_id, turn_id, tool_call_id,
+                    tool_name, target, summary, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    category,
+                    action,
+                    decision,
+                    result,
+                    risk,
+                    rule_id,
+                    project_id,
+                    session_id,
+                    turn_id,
+                    tool_call_id,
+                    tool_name,
+                    target,
+                    summary,
+                    json.dumps(safe_details, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def complete_security_event(
+        self,
+        event_id: int,
+        *,
+        result: str,
+        decision: str | None = None,
+        duration_ms: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT details_json FROM security_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                current = json.loads(row["details_json"] or "{}")
+            except json.JSONDecodeError:
+                current = {}
+            if not isinstance(current, dict):
+                current = {}
+            current.update(self._redact(details or {}))
+            connection.execute(
+                """
+                UPDATE security_events
+                SET result = ?, decision = COALESCE(?, decision),
+                    duration_ms = ?, details_json = ?
+                WHERE id = ?
+                """,
+                (
+                    result,
+                    decision,
+                    duration_ms,
+                    json.dumps(current, ensure_ascii=False, sort_keys=True),
+                    event_id,
+                ),
+            )
+            connection.commit()
+
+    @staticmethod
+    def _security_filters(
+        *,
+        search: str | None,
+        category: str | None,
+        categories: list[str] | tuple[str, ...] | None,
+        require_target: bool,
+        result: str | None,
+        start_ms: int | None,
+        end_ms: int | None,
+        cursor: int | None,
+    ) -> tuple[list[str], list[Any]]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if search:
+            filters.append(
+                "(summary LIKE ? OR target LIKE ? OR tool_name LIKE ? OR rule_id LIKE ?)"
+            )
+            needle = f"%{search[:200]}%"
+            params.extend([needle, needle, needle, needle])
+        if category:
+            filters.append("category = ?")
+            params.append(category)
+        elif categories:
+            normalized_categories = [str(item) for item in categories if str(item)]
+            if normalized_categories:
+                placeholders = ", ".join("?" for _ in normalized_categories)
+                filters.append(f"category IN ({placeholders})")
+                params.extend(normalized_categories)
+        if require_target:
+            filters.append("target IS NOT NULL AND target != ''")
+        if result:
+            filters.append("result = ?")
+            params.append(result)
+        if start_ms is not None:
+            filters.append("timestamp >= ?")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            filters.append("timestamp <= ?")
+            params.append(int(end_ms))
+        if cursor is not None:
+            filters.append("id < ?")
+            params.append(int(cursor))
+        return filters, params
+
+    def query_security_events(
+        self,
+        *,
+        search: str | None = None,
+        category: str | None = None,
+        categories: list[str] | tuple[str, ...] | None = None,
+        require_target: bool = False,
+        result: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        cursor: int | None = None,
+        limit: int = 100,
+    ) -> list[SecurityAuditRecord]:
+        filters, params = self._security_filters(
+            search=search,
+            category=category,
+            categories=categories,
+            require_target=require_target,
+            result=result,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            cursor=cursor,
+        )
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.append(max(1, min(int(limit), 100_000)))
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM security_events
+                {where}
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._security_record(row) for row in rows]
+
+    def count_security_events(
+        self,
+        *,
+        search: str | None = None,
+        category: str | None = None,
+        categories: list[str] | tuple[str, ...] | None = None,
+        require_target: bool = False,
+        result: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> int:
+        filters, params = self._security_filters(
+            search=search,
+            category=category,
+            categories=categories,
+            require_target=require_target,
+            result=result,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            cursor=None,
+        )
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM security_events {where}",
+                params,
+            ).fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    def clear_security_events(self) -> int:
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute("DELETE FROM security_events")
+            connection.commit()
+            return max(0, int(cursor.rowcount))
+
+    def prune_security_events(
+        self,
+        *,
+        older_than_ms: int,
+        keep_latest: int = 100_000,
+    ) -> int:
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM security_events
+                WHERE timestamp < ?
+                   OR id NOT IN (
+                        SELECT id FROM security_events
+                        ORDER BY timestamp DESC, id DESC LIMIT ?
+                   )
+                """,
+                (int(older_than_ms), max(1, int(keep_latest))),
+            )
+            connection.commit()
+            return max(0, int(cursor.rowcount))
+
     @classmethod
     def _redact(cls, value: Any) -> Any:
         if isinstance(value, dict):
@@ -270,6 +555,32 @@ class StructuredLogStore:
             tool_call_id=str(row["tool_call_id"]) if row["tool_call_id"] else None,
             artifact_id=str(row["artifact_id"]) if row["artifact_id"] else None,
             error_code=str(row["error_code"]) if row["error_code"] else None,
+            duration_ms=int(row["duration_ms"]) if row["duration_ms"] is not None else None,
+            details=details if isinstance(details, dict) else {},
+        )
+
+    @staticmethod
+    def _security_record(row: sqlite3.Row) -> SecurityAuditRecord:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except json.JSONDecodeError:
+            details = {}
+        return SecurityAuditRecord(
+            id=int(row["id"]),
+            timestamp=int(row["timestamp"]),
+            category=str(row["category"]),
+            action=str(row["action"]),
+            decision=str(row["decision"]),
+            result=str(row["result"]),
+            risk=str(row["risk"]),
+            rule_id=str(row["rule_id"]) if row["rule_id"] else None,
+            project_id=str(row["project_id"]) if row["project_id"] else None,
+            session_id=str(row["session_id"]) if row["session_id"] else None,
+            turn_id=str(row["turn_id"]) if row["turn_id"] else None,
+            tool_call_id=str(row["tool_call_id"]) if row["tool_call_id"] else None,
+            tool_name=str(row["tool_name"]) if row["tool_name"] else None,
+            target=str(row["target"]) if row["target"] else None,
+            summary=str(row["summary"]),
             duration_ms=int(row["duration_ms"]) if row["duration_ms"] is not None else None,
             details=details if isinstance(details, dict) else {},
         )

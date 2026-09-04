@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tpcowork.local/schemas/corporate-deck-v1.json",
+  "title": "CorporateDeck",
+  "type": "object",
+  "required": ["version", "slides"],
+  "properties": {
+    "version": { "const": 1 },
+    "title": { "type": "string" },
+    "organization": { "type": "string" },
+    "author": { "type": "string" },
+    "date": { "type": "string" },
+    "footer": { "type": "string" },
+    "show_page_numbers": { "type": "boolean", "default": true },
+    "slides": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": { "$ref": "#/$defs/slide" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "strings": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "column": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "bullets": { "$ref": "#/$defs/strings" }
+      },
+      "additionalProperties": false
+    },
+    "metric": {
+      "type": "object",
+      "required": ["label", "value"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "value": { "type": "string", "minLength": 1 },
+        "change": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "image": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "caption": { "type": "string" },
+        "source": { "type": "string" },
+        "fit": { "enum": ["cover", "contain"] },
+        "focus_x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "focus_y": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "timelineEvent": {
+      "type": "object",
+      "required": ["period", "title"],
+      "properties": {
+        "period": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "highlight": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "processStep": {
+      "type": "object",
+      "required": ["title"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "highlight": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "chartSeries": {
+      "type": "object",
+      "required": ["name", "values"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "values": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 20,
+          "items": { "type": "number" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "slide": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "cover",
+            "title-body",
+            "section",
+            "two-column",
+            "comparison",
+            "image-text",
+            "image-grid",
+            "metrics",
+            "timeline",
+            "process",
+            "table",
+            "chart",
+            "full-image",
+            "closing"
+          ]
+        },
+        "title": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "organization": { "type": "string" },
+        "date": { "type": "string" },
+        "lead": { "type": "string" },
+        "body": { "type": "string" },
+        "bullets": { "$ref": "#/$defs/strings" },
+        "left": { "$ref": "#/$defs/column" },
+        "right": { "$ref": "#/$defs/column" },
+        "image": { "type": "string" },
+        "image_position": { "enum": ["left", "right"] },
+        "image_fit": { "enum": ["cover", "contain"] },
+        "image_focus_x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "image_focus_y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "images": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/image" }
+        },
+        "caption": { "type": "string" },
+        "source": { "type": "string" },
+        "metrics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/metric" }
+        },
+        "events": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/timelineEvent" }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/processStep" }
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "items": { "type": "string" }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {
+            "type": "array",
+            "items": { "type": ["string", "number", "boolean"] }
+          }
+        },
+        "column_widths": {
+          "type": "array",
+          "items": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "highlight_rows": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "chart_type": { "enum": ["column", "bar", "line", "pie", "doughnut"] },
+        "categories": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 20,
+          "items": { "type": ["string", "number"] }
+        },
+        "series": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/chartSeries" }
+        },
+        "unit": { "type": "string" },
+        "footer": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

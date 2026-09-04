@@ -5,27 +5,25 @@ from __future__ import annotations
 from nanobot.agent.tools.shell import ExecTool
 
 
-def test_deny_patterns_block_rm_rf():
-    """Baseline: rm -rf is blocked by default deny list."""
+def test_recursive_delete_is_delegated_to_the_gateway_policy():
+    """The shell guard no longer preempts the approval-capable policy engine."""
     tool = ExecTool()
     result = tool._guard_command("rm -rf /tmp/build", "/tmp")
-    assert result is not None
-    assert "deny pattern filter" in result.lower()
+    assert result is None
 
 
-def test_allow_patterns_bypass_deny():
-    """allow_patterns take priority: matching command skips deny check."""
+def test_allow_patterns_keep_recursive_delete_available_for_policy():
     tool = ExecTool(allow_patterns=[r"rm\s+-rf\s+/tmp/"])
     result = tool._guard_command("rm -rf /tmp/build", "/tmp")
     assert result is None
 
 
 def test_allow_patterns_must_match_to_bypass():
-    """Non-matching allow_patterns do NOT bypass deny."""
+    """Configured allowlists still restrict unmatched commands."""
     tool = ExecTool(allow_patterns=[r"rm\s+-rf\s+/opt/"])
     result = tool._guard_command("rm -rf /tmp/build", "/tmp")
     assert result is not None
-    assert "deny pattern filter" in result.lower()
+    assert "allowlist" in result.lower()
 
 
 def test_extra_deny_patterns_from_config():
@@ -33,8 +31,15 @@ def test_extra_deny_patterns_from_config():
     tool = ExecTool(deny_patterns=[r"\bping\b"])
     # ping is blocked by extra deny
     assert tool._guard_command("ping example.com", "/tmp") is not None
-    # rm -rf still blocked by built-in deny
-    assert tool._guard_command("rm -rf /tmp/x", "/tmp") is not None
+    # Recursive deletion is classified centrally rather than by this local guard.
+    assert tool._guard_command("rm -rf /tmp/x", "/tmp") is None
+
+
+def test_allow_patterns_cannot_bypass_core_protection():
+    tool = ExecTool(allow_patterns=[r"diskpart"])
+    result = tool._guard_command("diskpart", "/tmp")
+    assert result is not None
+    assert "core safety" in result.lower()
 
 
 def test_allow_patterns_bypass_extra_deny():

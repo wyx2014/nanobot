@@ -27,3 +27,4 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `clawhub` | 从如意Hub搜索并安装技能 |
 | `skill-creator` | Create new skills |
 | `long-goal` | Sustained objectives: `long_task`, `complete_goal`, idempotent goals, modular project work, early research |
+| `corporate-ppt` | 使用内置公司模板生成可编辑、可校验的 PowerPoint 演示文稿 |

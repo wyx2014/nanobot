@@ -6,6 +6,7 @@ import ipaddress
 import re
 import socket
 from contextlib import suppress
+from contextvars import ContextVar, Token
 from urllib.parse import urlparse
 
 _BLOCKED_NETWORKS = [
@@ -24,6 +25,53 @@ _BLOCKED_NETWORKS = [
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
 _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+_domain_policy: ContextVar[tuple[bool, tuple[str, ...], tuple[str, ...]] | None] = (
+    ContextVar("nanobot_network_domain_policy", default=None)
+)
+
+
+def set_network_policy(
+    *,
+    block_all: bool,
+    allow_domains: list[str],
+    deny_domains: list[str],
+) -> Token:
+    """Apply one tool call's domain policy without leaking it across tasks."""
+    return _domain_policy.set((block_all, tuple(allow_domains), tuple(deny_domains)))
+
+
+def reset_network_policy(token: Token) -> None:
+    _domain_policy.reset(token)
+
+
+def _domain_matches(hostname: str, rules: tuple[str, ...]) -> bool:
+    host = hostname.lower().rstrip(".")
+    for raw in rules:
+        rule = raw.lower().rstrip(".")
+        if rule.startswith("*."):
+            rule = rule[2:]
+            if host.endswith("." + rule):
+                return True
+            continue
+        if host == rule or host.endswith("." + rule):
+            return True
+    return False
+
+
+def validate_configured_network_target(url: str) -> tuple[bool, str]:
+    """Enforce the active application-level domain policy for a URL."""
+    policy = _domain_policy.get()
+    if policy is None:
+        return True, ""
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    if not hostname:
+        return True, ""
+    block_all, allow_domains, deny_domains = policy
+    if _domain_matches(hostname, deny_domains):
+        return False, f"Blocked by denied domain rule: {hostname}"
+    if block_all and not _domain_matches(hostname, allow_domains):
+        return False, f"Blocked by default network policy: {hostname}"
+    return True, ""
 
 
 def configure_ssrf_whitelist(cidrs: list[str]) -> None:
@@ -82,6 +130,10 @@ def validate_url_target(url: str, *, allow_loopback: bool = False) -> tuple[bool
     if not hostname:
         return False, "Missing hostname"
 
+    policy_ok, policy_error = validate_configured_network_target(url)
+    if not policy_ok:
+        return False, policy_error
+
     try:
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except socket.gaierror:
@@ -113,6 +165,10 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
     hostname = p.hostname
     if not hostname:
         return True, ""
+
+    policy_ok, policy_error = validate_configured_network_target(url)
+    if not policy_ok:
+        return False, policy_error
 
     try:
         addr = ipaddress.ip_address(hostname)

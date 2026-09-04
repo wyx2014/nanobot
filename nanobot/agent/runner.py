@@ -69,6 +69,7 @@ from nanobot.utils.runtime import (
     build_length_recovery_message,
     ensure_nonempty_tool_result,
     is_blank_text,
+    is_internal_tool_call_markup,
     mark_structured_finance_source_attempted,
     mark_structured_finance_source_failed,
     normalize_tool_message_content,
@@ -94,6 +95,22 @@ _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
 _MAX_CONSECUTIVE_REPEAT_LOOKUP_BLOCKS = 3
+_EXTERNAL_LOOKUP_TOOL_NAMES = frozenset({
+    "web_search",
+    "search_web",
+    "web_fetch",
+    "navigate",
+    "browser_navigate",
+    "mcp_playwright_browser_navigate",
+})
+_EXTERNAL_LOOKUP_TOOL_PREFIXES = (
+    "mcp_anysearch_",
+    "mcp_juyuan_",
+    "mcp_caihui_",
+    "mcp_caihui_mcp_",
+    "mcp_hexin-ifind-ds-",
+    "mcp_ifind_",
+)
 _SLOW_PROVIDER_TIMING_CALLBACK_MS = 500
 _SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
@@ -152,6 +169,12 @@ class AgentRunSpec:
     agent_kind: str = "main"
     agent_label: str | None = None
     enforce_finance_source_priority: bool = False
+    security_service: Any | None = None
+    security_approval_callback: Callable[[dict[str, Any]], Any] | None = None
+    security_interactive: bool = False
+    security_chat_id: str | None = None
+    security_turn_id: str | None = None
+    security_turn_grants: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -536,6 +559,7 @@ class AgentRunner:
         local_lookup_state: dict[str, Any] = {}
         consecutive_repeated_lookup_blocks = 0
         repeated_block_kind: str | None = None
+        external_lookup_circuit_open = False
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
@@ -607,6 +631,8 @@ class AgentRunner:
                 usage_tools = spec.tools.get_definitions()
             except Exception:
                 usage_tools = None
+            if external_lookup_circuit_open:
+                usage_tools = self._without_external_lookup_tools(usage_tools)
             prompt_estimate, _ = estimate_prompt_tokens_chain(
                 self.provider,
                 spec.model,
@@ -653,6 +679,7 @@ class AgentRunner:
                 hook,
                 context,
                 prompt_estimate=prompt_estimate,
+                tool_definitions=usage_tools,
             )
             context.response = response
             context.tool_calls = list(response.tool_calls)
@@ -839,11 +866,31 @@ class AgentRunner:
                     >= _MAX_CONSECUTIVE_REPEAT_LOOKUP_BLOCKS
                 ):
                     logger.warning(
-                        "Repeated external lookup circuit breaker triggered for {} "
+                        "Repeated {} lookup circuit breaker triggered for {} "
                         "after {} consecutive blocked iteration(s)",
+                        repeated_block_kind or "tool",
                         spec.session_key or "default",
                         consecutive_repeated_lookup_blocks,
                     )
+                    if repeated_block_kind == "external":
+                        external_lookup_circuit_open = True
+                        consecutive_repeated_lookup_blocks = 0
+                        repeated_block_kind = None
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "The external lookup circuit breaker has disabled further web, "
+                                "browser, and remote research tools for this turn. Do not retry, "
+                                "rename, or serialize those tool calls. Continue the original task "
+                                "now with evidence already collected and the non-network tools that "
+                                "remain available. If the task creates an artifact, finish it with "
+                                "local file and artifact tools; replace unavailable images with "
+                                "editable native exhibits and disclose evidence gaps. Never claim "
+                                "an artifact exists until its creation tool returns successfully."
+                            ),
+                        })
+                        await hook.after_iteration(context)
+                        continue
                     final_content = await self._try_finalize_after_repeated_lookup_loop(
                         spec,
                         hook,
@@ -873,7 +920,7 @@ class AgentRunner:
                     spec.session_key or "default",
                 )
 
-            clean = hook.finalize_content(context, response.content)
+            clean = self._finalize_model_content(hook, context, response.content)
             if response.finish_reason != "error" and is_blank_text(clean):
                 empty_content_retries += 1
                 if empty_content_retries < _MAX_EMPTY_RETRIES:
@@ -904,7 +951,7 @@ class AgentRunner:
                 context.response = response
                 context.usage = dict(raw_usage)
                 context.tool_calls = list(response.tool_calls)
-                clean = hook.finalize_content(context, response.content)
+                clean = self._finalize_model_content(hook, context, response.content)
 
             if response.finish_reason == "length" and not is_blank_text(clean):
                 length_recovery_count += 1
@@ -1081,6 +1128,7 @@ class AgentRunner:
         context: AgentHookContext,
         *,
         prompt_estimate: int | None = None,
+        tool_definitions: list[dict[str, Any]] | None = None,
     ):
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
@@ -1098,7 +1146,7 @@ class AgentRunner:
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=tool_definitions,
         )
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
@@ -1372,6 +1420,31 @@ class AgentRunner:
             await hook.emit_reasoning_end()
         return response
 
+    @staticmethod
+    def _without_external_lookup_tools(
+        definitions: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        if definitions is None:
+            return None
+
+        def tool_name(schema: dict[str, Any]) -> str:
+            function = schema.get("function")
+            raw_name = (
+                function.get("name")
+                if isinstance(function, dict)
+                else schema.get("name")
+            )
+            return str(raw_name or "").lower()
+
+        return [
+            schema
+            for schema in definitions
+            if (
+                tool_name(schema) not in _EXTERNAL_LOOKUP_TOOL_NAMES
+                and not tool_name(schema).startswith(_EXTERNAL_LOOKUP_TOOL_PREFIXES)
+            )
+        ]
+
     async def _request_finalization_retry(
         self,
         spec: AgentRunSpec,
@@ -1422,7 +1495,7 @@ class AgentRunner:
             usage=dict(raw_usage),
             session_key=spec.session_key,
         )
-        clean = hook.finalize_content(context, response.content)
+        clean = self._finalize_model_content(hook, context, response.content)
         if is_blank_text(clean):
             return None
         return clean
@@ -1443,7 +1516,9 @@ class AgentRunner:
                 "The repeated tool-call circuit breaker has stopped an identical lookup loop. "
                 "Do not call any tools. Complete the requested deliverable now using evidence "
                 "already present in the conversation. Clearly label any unresolved evidence gaps "
-                "instead of retrying, guessing, or claiming a blocked lookup succeeded."
+                "instead of retrying, guessing, or claiming a blocked lookup succeeded. Return "
+                "plain user-facing prose only; never output <tool_call>, <function=...>, or "
+                "<parameter=...> protocol markup."
             ),
         })
         try:
@@ -1465,8 +1540,23 @@ class AgentRunner:
             usage=dict(raw_usage),
             session_key=spec.session_key,
         )
-        clean = hook.finalize_content(final_context, response.content)
+        clean = self._finalize_model_content(hook, final_context, response.content)
         return None if is_blank_text(clean) else clean
+
+    @staticmethod
+    def _finalize_model_content(
+        hook: AgentHook,
+        context: AgentHookContext,
+        content: str | None,
+    ) -> str | None:
+        clean = hook.finalize_content(context, content)
+        if is_internal_tool_call_markup(clean):
+            logger.warning(
+                "Suppressing serialized internal tool call returned as final content for {}",
+                context.session_key or "default",
+            )
+            return None
+        return clean
 
     async def _request_no_tools(
         self,
@@ -1989,6 +2079,85 @@ class AgentRunner:
             return prep_error + hint, event, (
                 RuntimeError(prep_error) if spec.fail_on_tool_error else None
             )
+
+        security_assessment = None
+        security_audit = None
+        security = spec.security_service
+        if security is not None and isinstance(params, dict):
+            from nanobot.security.protection import AuditUnavailable
+
+            security_assessment = security.assess(
+                tool_name=tool_call.name,
+                params=params,
+                tool=tool,
+                workspace=spec.workspace,
+            )
+            try:
+                security_audit = security.begin_audit(
+                    security_assessment,
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    session_key=spec.session_key,
+                    turn_id=spec.security_turn_id,
+                )
+            except AuditUnavailable as exc:
+                if security_assessment.mutating:
+                    payload = "Error: Security audit is unavailable; modifying operations are blocked."
+                    event = {
+                        "name": tool_call.name,
+                        "status": "error",
+                        "detail": "security audit unavailable",
+                    }
+                    return payload, event, RuntimeError(payload) if spec.fail_on_tool_error else None
+                logger.error("Security audit unavailable for read-only tool: {}", exc)
+
+            allowed, security_result = await security.authorize(
+                security_assessment,
+                callback=spec.security_approval_callback,
+                chat_id=spec.security_chat_id,
+                turn_grants=spec.security_turn_grants,
+                interactive=spec.security_interactive,
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+            )
+            if not allowed:
+                security.complete_audit(
+                    security_audit,
+                    result=security_result,
+                    decision=security_assessment.decision,
+                )
+                payload = f"Error: Operation blocked by security protection: {security_assessment.summary}"
+                event = {
+                    "name": tool_call.name,
+                    "status": "error",
+                    "detail": security_result,
+                }
+                return payload, event, RuntimeError(payload) if spec.fail_on_tool_error else None
+            if security_result.startswith("approved"):
+                security.complete_audit(
+                    security_audit,
+                    result="approved",
+                    decision=security_result,
+                )
+                try:
+                    security_audit = security.begin_audit(
+                        security_assessment,
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        session_key=spec.session_key,
+                        turn_id=spec.security_turn_id,
+                    )
+                except AuditUnavailable as exc:
+                    if security_assessment.mutating:
+                        payload = "Error: Security audit is unavailable; modifying operations are blocked."
+                        event = {
+                            "name": tool_call.name,
+                            "status": "error",
+                            "detail": "security audit unavailable",
+                        }
+                        return payload, event, RuntimeError(payload) if spec.fail_on_tool_error else None
+                    logger.error("Security audit unavailable for approved read-only tool: {}", exc)
+                    security_audit = None
         if file_edit_trackers and progress_callback is not None:
             await invoke_file_edit_progress(
                 progress_callback,
@@ -1998,13 +2167,23 @@ class AgentRunner:
                 ) for file_edit_tracker in file_edit_trackers],
             )
         try:
-            if tool is not None:
+            if security is not None:
+                with security.network_context():
+                    if tool is not None:
+                        result = await tool.execute(**params)
+                    else:
+                        result = await spec.tools.execute(tool_call.name, params)
+            elif tool is not None:
                 result = await tool.execute(**params)
             else:
                 result = await spec.tools.execute(tool_call.name, params)
         except asyncio.CancelledError:
+            if security is not None:
+                security.complete_audit(security_audit, result="cancelled")
             raise
         except InteractivePromptRequested as exc:
+            if security is not None:
+                security.complete_audit(security_audit, result="waiting_for_input")
             event = {
                 "name": tool_call.name,
                 "status": "ok",
@@ -2012,6 +2191,12 @@ class AgentRunner:
             }
             return exc, event, None
         except BaseException as exc:
+            if security is not None:
+                security.complete_audit(
+                    security_audit,
+                    result="failed",
+                    details={"error": str(exc)},
+                )
             if finance_source is not None:
                 mark_structured_finance_source_attempted(
                     external_lookup_counts,
@@ -2061,6 +2246,12 @@ class AgentRunner:
             )
 
         if isinstance(result, str) and result.startswith("Error"):
+            if security is not None:
+                security.complete_audit(
+                    security_audit,
+                    result="failed",
+                    details={"error": result[:500]},
+                )
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(
                     progress_callback,
@@ -2100,6 +2291,8 @@ class AgentRunner:
             finance_source is not None
             and structured_finance_result_failed(finance_source, result)
         ):
+            if security is not None:
+                security.complete_audit(security_audit, result="failed")
             mark_structured_finance_source_failed(
                 external_lookup_counts,
                 finance_source,
@@ -2133,6 +2326,8 @@ class AgentRunner:
             detail = "(empty)"
         elif len(detail) > 120:
             detail = detail[:120] + "..."
+        if security is not None:
+            security.complete_audit(security_audit, result="succeeded")
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
 
     # SSRF is a hard security block at the tool boundary, but the agent turn

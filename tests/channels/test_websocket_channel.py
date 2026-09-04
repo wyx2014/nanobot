@@ -144,6 +144,47 @@ async def test_browser_control_envelope_routes_to_nanobot_browser_runtime(
     control.assert_awaited_once_with("chat-browser", "pause")
 
 
+@pytest.mark.asyncio
+async def test_security_approval_response_resumes_the_waiting_operation(tmp_path) -> None:
+    bus = MessageBus()
+    gateway = _basic_handler(bus, workspace_path=tmp_path)
+    channel = WebSocketChannel(WebSocketConfig(), bus, gateway=gateway)
+    connection = AsyncMock()
+    published = asyncio.Event()
+
+    async def publish(_payload: dict[str, Any]) -> None:
+        published.set()
+
+    waiting = asyncio.create_task(gateway.http.security.approvals.request(
+        {"approval_id": "sap_test"},
+        publish,
+        chat_id="chat-security",
+        timeout_s=2,
+    ))
+    await published.wait()
+
+    await channel._dispatch_envelope(
+        connection,
+        "desktop",
+        {
+            "type": "security_approval_response",
+            "chat_id": "chat-security",
+            "approval_id": "sap_test",
+            "decision": "allow_turn",
+        },
+    )
+
+    assert await waiting == "allow_turn"
+    response = json.loads(connection.send.await_args.args[0])
+    assert response == {
+        "event": "security_approval_resolved",
+        "chat_id": "chat-security",
+        "approval_id": "sap_test",
+        "decision": "allow_turn",
+        "accepted": True,
+    }
+
+
 @pytest.fixture()
 def bus() -> MagicMock:
     b = MagicMock()
