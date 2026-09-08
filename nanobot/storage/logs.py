@@ -279,16 +279,46 @@ class StructuredLogStore:
             connection.commit()
             return max(0, int(cursor.rowcount))
 
-    def prune_operations(self) -> None:
-        """Bound only operational rows; retain existing audit/Trace policies."""
+    def prune_operations(self, *, max_rows: int = 100_000, max_bytes: int = 128 * 1024 * 1024,
+                         partition_rows: int = 5000, partition_bytes: int = 8 * 1024 * 1024) -> None:
+        """Bound operational content globally and per session/process, with separate error budgets.
+
+        These are retained-content budgets, not a promise about SQLite/WAL file size.
+        Ordinary logs, audit and Trace retain their existing policies.
+        """
         with self._lock, self._connection() as connection:
             connection.execute(
                 """DELETE FROM logs WHERE component LIKE 'operations.%'
-                   AND (timestamp < ? OR id NOT IN (
-                       SELECT id FROM logs WHERE component LIKE 'operations.%'
-                       ORDER BY id DESC LIMIT 100000
-                   ))""",
+                   AND timestamp < ?""",
                 (time.time_ns() // 1_000_000 - 30 * 86400 * 1000,),
+            )
+            # Invalid historic JSON is its own process partition, never an export failure.
+            connection.execute(
+                """WITH sized AS (
+                    SELECT id, level,
+                        CASE WHEN session_id IS NOT NULL THEN 'session:' || session_id
+                             ELSE 'process:' || COALESCE(json_extract(
+                                 CASE WHEN json_valid(details_json) THEN details_json ELSE '{}' END,
+                                 '$.process_instance_id'), 'unknown') END AS partition_id,
+                        length(CAST(COALESCE(details_json, '') AS BLOB))
+                            + length(CAST(message AS BLOB)) + 256 AS bytes
+                    FROM logs WHERE component LIKE 'operations.%'
+                ), ranked AS (
+                    SELECT id,
+                        ROW_NUMBER() OVER (PARTITION BY partition_id, level = 'error' ORDER BY id DESC) AS n,
+                        SUM(bytes) OVER (PARTITION BY partition_id, level = 'error' ORDER BY id DESC) AS used
+                    FROM sized
+                ) DELETE FROM logs WHERE id IN (SELECT id FROM ranked WHERE n > ? OR used > ?)""",
+                (max(1, partition_rows), max(1, partition_bytes)),
+            )
+            connection.execute(
+                """WITH ranked AS (
+                    SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS n,
+                        SUM(length(CAST(COALESCE(details_json, '') AS BLOB))
+                            + length(CAST(message AS BLOB)) + 256) OVER (ORDER BY id DESC) AS used
+                    FROM logs WHERE component LIKE 'operations.%'
+                ) DELETE FROM logs WHERE id IN (SELECT id FROM ranked WHERE n > ? OR used > ?)""",
+                (max(1, max_rows), max(1, max_bytes)),
             )
             connection.commit()
 

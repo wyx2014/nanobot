@@ -1,5 +1,7 @@
 """Tests for multi-provider web search."""
 
+from datetime import date
+
 import httpx
 import pytest
 
@@ -328,6 +330,55 @@ async def test_volcengine_invalid_time_range_returns_error():
     result = await tool.execute(query="test", timeRange="Yesterday")
 
     assert "timeRange must be" in result
+
+
+@pytest.mark.asyncio
+async def test_recent_search_rejects_stale_explicit_month(monkeypatch):
+    monkeypatch.setattr(
+        "nanobot.agent.tools.web._today_in_timezone",
+        lambda timezone: date(2026, 9, 8),
+    )
+    tool = _tool(provider="volcengine", api_key="volc-key")
+
+    result = await tool.execute(
+        query="2025年9月 有趣新闻 科技 财经 股市",
+        timeRange="OneWeek",
+    )
+
+    assert "query date conflicts with timeRange=OneWeek" in result
+    assert "Current date is 2026-09-08" in result
+    assert "retry without a guessed year or month" in result
+
+
+@pytest.mark.asyncio
+async def test_historical_search_allows_explicit_old_month_without_recent_filter(monkeypatch):
+    async def mock_search(query, count):
+        return f"searched: {query} ({count})"
+
+    tool = _tool(provider="duckduckgo")
+    monkeypatch.setattr(tool, "_search_duckduckgo", mock_search)
+
+    result = await tool.execute(query="2025年9月 科技新闻", count=3)
+
+    assert result == "searched: 2025年9月 科技新闻 (3)"
+
+
+@pytest.mark.asyncio
+async def test_recent_search_allows_explicit_month_overlapping_filter(monkeypatch):
+    monkeypatch.setattr(
+        "nanobot.agent.tools.web._today_in_timezone",
+        lambda timezone: date(2026, 9, 8),
+    )
+
+    async def mock_search(query, count, **kwargs):
+        return f"searched: {query} ({kwargs['time_range']})"
+
+    tool = _tool(provider="volcengine", api_key="volc-key")
+    monkeypatch.setattr(tool, "_search_volcengine", mock_search)
+
+    result = await tool.execute(query="2026年9月 有趣新闻", timeRange="OneWeek")
+
+    assert result == "searched: 2026年9月 有趣新闻 (OneWeek)"
 
 
 @pytest.mark.asyncio

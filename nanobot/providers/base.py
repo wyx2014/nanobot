@@ -882,7 +882,8 @@ class LLMProvider(ABC):
                 response = await call(**kw)
                 observed.details.update({"status_code": response.error_status_code, "finish_reason": response.finish_reason})
                 if response.finish_reason == "error":
-                    observed.fail(response.error_kind or "LLM_ERROR")
+                    observed.fail(response.error_code or response.error_kind or "LLM_ERROR")
+                    observed.details["error_type"] = response.error_type
             if response.finish_reason != "error":
                 return response
             last_response = response
@@ -928,7 +929,8 @@ class LLMProvider(ABC):
                     with operation("llm.attempt", attempt=attempt, provider=type(self).__name__, model=retry_kw.get("model"), stage="image_fallback") as observed:
                         result = await call(**retry_kw)
                         if result.finish_reason == "error":
-                            observed.fail(result.error_kind or "LLM_ERROR")
+                            observed.fail(result.error_code or result.error_kind or "LLM_ERROR")
+                            observed.details["error_type"] = result.error_type
                     # Permanently strip images from the original messages so
                     # subsequent iterations do not repeat the error-retry cycle.
                     if result.finish_reason != "error":

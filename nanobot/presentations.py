@@ -185,6 +185,14 @@ class PresentationService:
         from nanobot.presentation_previews import previews_pending
         return {"templates": templates, "previews_pending": previews_pending(self.root / "previews")}
 
+    def diagnostic_availability(self) -> list[dict[str, Any]]:
+        """Check known resources without rendering previews or exposing source paths."""
+        result = []
+        for row in _CATALOG:
+            missing = self.availability(template_by_id(row[0]))
+            result.append({"id": row[0], "available": not missing, "missing": missing})
+        return result
+
     def previews(self, template: dict[str, Any]) -> list[str]:
         source = self.source(template["family"])
         if source is None:

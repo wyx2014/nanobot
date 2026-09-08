@@ -18,12 +18,32 @@ def test_read_only_projection_filters_scope_and_preserves_metadata(tmp_path):
         logs.write(level="error", component="operations.http", message="private response",
                    session_id=session, event_name="http.request", details={"input_tokens": 12, "body": "private body"})
     result = diagnostic_export.collect_database(path, now - 10000, now + 10000, "one")
-    assert len(result["tables"]["logs"]) == 2
-    assert {row["session_id"] for row in result["tables"]["logs"]} == {"one", None}
+    assert len(result["tables"]["logs"]) == 1
+    assert {row["session_id"] for row in result["tables"]["logs"]} == {"one"}
     assert "private" not in json.dumps(result)
     assert result["tables"]["logs"][0]["details"]["input_tokens"] == 12
     assert result["sources"]["logs"]["cutoff_rowid"] == 3
+    assert len(diagnostic_export.collect_database(path, now - 10000, now + 10000, None)["tables"]["logs"]) == 3
     assert diagnostic_export.collect_database(path, 0, 1, None)["tables"]["logs"] == []
+
+
+def test_session_export_includes_only_related_traces_and_security_events(tmp_path):
+    path = tmp_path / "logs.sqlite"
+    logs = StructuredLogStore(path)
+    TraceStore(path)
+    now = int(time.time() * 1000)
+    with sqlite3.connect(path) as connection:
+        for session in ("one", "two"):
+            connection.execute("INSERT INTO traces(id, session_id, runtime_epoch, status, started_at, created_at) VALUES (?, ?, 'epoch', 'running', ?, ?)",
+                               (f"trace-{session}", session, now, now))
+        for session in ("one", "two", None):
+            connection.execute("INSERT INTO security_events(timestamp, category, action, decision, result, risk, summary, session_id) VALUES (?, 'test', 'test', 'allow', 'ok', 'low', 'omitted', ?)", (now, session))
+    for trace in ("trace-one", "trace-two", None):
+        logs.write(level="info", component="test", message="omitted", trace_id=trace)
+    result = diagnostic_export.collect_database(path, now - 10000, now + 10000, "one")
+    assert [row["trace_id"] for row in result["tables"]["logs"]] == ["trace-one"]
+    assert [row["id"] for row in result["tables"]["traces"]] == ["trace-one"]
+    assert [row["session_id"] for row in result["tables"]["security_events"]] == ["one"]
 
 
 def test_traces_are_not_silently_truncated_at_200_items(tmp_path):

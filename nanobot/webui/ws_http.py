@@ -3258,8 +3258,13 @@ class GatewayHTTPHandler:
             return _http_error(409, "diagnostic export already running")
         self._diagnostic_export_running = True
         try:
+            from nanobot.observability.operations import flush_operations
+            flush = await asyncio.to_thread(flush_operations)
             snapshot = await collect_snapshot(self, session)
             result = await asyncio.to_thread(collect_database, self.logs.path, start, end, session)
+            result["sources"]["flush"] = {**flush, "flush_status": flush["status"],
+                "status": "included" if flush["status"] == "completed" else "truncated",
+                "reason": None if flush["status"] == "completed" else "QUEUE_" + flush["status"].upper()}
             result["snapshot"] = snapshot
             return _http_json_response(result)
         except LookupError:

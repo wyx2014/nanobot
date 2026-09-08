@@ -81,10 +81,11 @@ def collect_database(path: Path, start: int, end: int, session: str | None) -> d
                     where = "timestamp >= ? AND timestamp <= ?"
                     params: list[Any] = [start, end]
                     if session:
-                        where += " AND (session_id = ? OR session_id IS NULL)"
-                        params.append(session)
                         if table == "logs":
-                            where += " AND (trace_id IS NULL OR trace_id IN (SELECT id FROM traces WHERE session_id = ?))"
+                            where += " AND (session_id = ? OR (session_id IS NULL AND trace_id IN (SELECT id FROM traces WHERE session_id = ?)))"
+                            params.extend((session, session))
+                        else:
+                            where += " AND session_id = ?"
                             params.append(session)
                     order = "timestamp DESC, id DESC"
                 elif table == "traces":
@@ -134,13 +135,30 @@ def collect_database(path: Path, start: int, end: int, session: str | None) -> d
 async def collect_snapshot(handler: Any, session_id: str | None) -> dict[str, Any]:
     import asyncio
 
+    try:
+        ready = bool(handler.runtime_ready()) if handler.runtime_ready else None
+    except Exception:
+        ready = None
+    try:
+        mcp_status = handler.runtime_mcp_status() if handler.runtime_mcp_status else "unknown"
+    except Exception:
+        mcp_status = "unknown"
+    if not isinstance(mcp_status, str) or mcp_status not in {"disabled", "pending", "warming", "ready", "unavailable"}:
+        mcp_status = "unknown"
     snapshot: dict[str, Any] = {
         "captured_at": int(time.time() * 1000), "python_version": platform.python_version(),
         "collection": operation_health(),
-        "ready": bool(handler.runtime_ready()) if handler.runtime_ready else None,
-        "mcp_status": handler.runtime_mcp_status() if handler.runtime_mcp_status else None,
+        "ready": ready,
+        "mcp_status": mcp_status,
         "runtime": {"status": "excluded", "reason": "NO_SESSION_SELECTED"},
     }
+    from nanobot.observability.doctor import collect_doctor
+    try:
+        snapshot["doctor"] = await asyncio.wait_for(asyncio.to_thread(
+            collect_doctor, handler.logs.path, snapshot["ready"], snapshot["mcp_status"] or "unknown",
+            getattr(handler, "presentations", None)), timeout=2.0)
+    except Exception:
+        snapshot["doctor"] = {"status": "unavailable", "reason": "CHECK_FAILED_OR_TIMED_OUT"}
     if session_id:
         session = await asyncio.to_thread(handler.state.get_session_by_id, session_id)
         if session is None:

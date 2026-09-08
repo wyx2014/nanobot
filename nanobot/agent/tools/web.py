@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import html
 import json
 import os
 import re
+from datetime import date, datetime, timedelta
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from loguru import logger
@@ -35,6 +38,17 @@ _VOLCENGINE_SEARCH_API_URL = "https://open.feedcoopapi.com/search_api/web_search
 _VOLCENGINE_TRAFFIC_TAG = "nanobot"
 _VOLCENGINE_TIME_RANGES = {"OneDay", "OneWeek", "OneMonth", "OneYear"}
 _VOLCENGINE_DATE_RANGE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}$")
+_RECENT_TIME_RANGE_DAYS = {"OneDay": 1, "OneWeek": 7, "OneMonth": 31}
+_QUERY_YEAR_MONTH_RE = re.compile(
+    r"(?<!\d)(?P<year>19\d{2}|20\d{2})\s*年\s*"
+    r"(?P<month>0?[1-9]|1[0-2])\s*月"
+    r"(?:\s*(?P<day>0?[1-9]|[12]\d|3[01])\s*日)?"
+)
+_QUERY_NUMERIC_DATE_RE = re.compile(
+    r"(?<!\d)(?P<year>19\d{2}|20\d{2})[-/.]"
+    r"(?P<month>0?[1-9]|1[0-2])"
+    r"(?:[-/.](?P<day>0?[1-9]|[12]\d|3[01]))?(?!\d)"
+)
 
 
 class WebSearchConfig(Base):
@@ -206,9 +220,74 @@ def _normalize_volcengine_auth_level(value: Any) -> int | None:
     return auth_level
 
 
+def _today_in_timezone(timezone: str | None) -> date:
+    try:
+        tz = ZoneInfo(timezone) if timezone else None
+    except (KeyError, Exception):
+        tz = None
+    now = datetime.now(tz=tz) if tz else datetime.now().astimezone()
+    return now.date()
+
+
+def _explicit_query_date_ranges(query: str) -> list[tuple[date, date, str]]:
+    ranges: list[tuple[date, date, str]] = []
+    occupied: list[tuple[int, int]] = []
+    for pattern in (_QUERY_YEAR_MONTH_RE, _QUERY_NUMERIC_DATE_RE):
+        for match in pattern.finditer(query):
+            if any(match.start() < end and match.end() > start for start, end in occupied):
+                continue
+            try:
+                year = int(match.group("year"))
+                month = int(match.group("month"))
+                day_text = match.group("day")
+                if day_text:
+                    start = end = date(year, month, int(day_text))
+                else:
+                    start = date(year, month, 1)
+                    end = date(year, month, calendar.monthrange(year, month)[1])
+            except ValueError:
+                continue
+            ranges.append((start, end, match.group(0)))
+            occupied.append(match.span())
+    return ranges
+
+
+def _recent_query_date_error(
+    query: str,
+    time_range: Any,
+    *,
+    timezone: str | None,
+) -> str | None:
+    normalized_range = str(time_range or "").strip()
+    range_days = _RECENT_TIME_RANGE_DAYS.get(normalized_range)
+    if range_days is None:
+        return None
+
+    explicit_ranges = _explicit_query_date_ranges(query)
+    if not explicit_ranges:
+        return None
+
+    today = _today_in_timezone(timezone)
+    earliest = today - timedelta(days=range_days)
+    if any(start <= today and end >= earliest for start, end, _ in explicit_ranges):
+        return None
+
+    dates = ", ".join(text for _, _, text in explicit_ranges)
+    return (
+        f"Error: web_search query date conflicts with timeRange={normalized_range}. "
+        f"Current date is {today.isoformat()}, but the query contains {dates}. "
+        "For a recent/latest/today request, retry without a guessed year or month, "
+        "or use the current date from Runtime Context. Keep an old date only when "
+        "the user explicitly requested historical results, and then remove the recent timeRange."
+    )
+
+
 @tool_parameters(
     tool_parameters_schema(
-        query=StringSchema("Search query"),
+        query=StringSchema(
+            "Search query. For recent/latest/today requests, never guess a calendar date: "
+            "use Current Time from Runtime Context, and omit the year/month unless the user supplied it."
+        ),
         count=IntegerSchema(1, description="Results (1-10)", minimum=1, maximum=10),
         provider=StringSchema(
             "Optional one-call provider override. Only `duckduckgo` is accepted; "
@@ -216,7 +295,8 @@ def _normalize_volcengine_auth_level(value: Any) -> int | None:
         ),
         timeRange=StringSchema(
             "Optional time filter for providers that support it: "
-            "OneDay, OneWeek, OneMonth, OneYear, or YYYY-MM-DD..YYYY-MM-DD",
+            "OneDay, OneWeek, OneMonth, OneYear, or YYYY-MM-DD..YYYY-MM-DD. "
+            "For recent/latest/today requests, prefer this filter over adding a guessed date to query.",
         ),
         authLevel=IntegerSchema(
             0,
@@ -238,6 +318,8 @@ class WebSearchTool(Tool):
     description = (
         "Search the web. Returns titles, URLs, and snippets. "
         "count defaults to 5 (max 10). "
+        "For recent/latest/today information, use Current Time from Runtime Context and never "
+        "invent a year or month; use timeRange and omit dates the user did not provide. "
         "Set provider=duckduckgo only when an explicit DuckDuckGo fallback is required. "
         "Some providers support timeRange, authLevel, and queryRewrite. "
         "Use web_fetch to read a specific page in full."
@@ -265,6 +347,7 @@ class WebSearchTool(Tool):
             proxy=ctx.config.web.proxy,
             user_agent=ctx.config.web.user_agent,
             config_loader=config_loader,
+            timezone=ctx.timezone,
         )
 
     def __init__(
@@ -273,11 +356,13 @@ class WebSearchTool(Tool):
         proxy: str | None = None,
         user_agent: str | None = None,
         config_loader: Callable[[], WebSearchConfig] | None = None,
+        timezone: str | None = "UTC",
     ):
         self.config = config if config is not None else WebSearchConfig()
         self.proxy = proxy
         self.user_agent = user_agent if user_agent is not None else _DEFAULT_USER_AGENT
         self._config_loader = config_loader
+        self.timezone = timezone
 
     def _refresh_config(self) -> None:
         if self._config_loader is None:
@@ -357,6 +442,14 @@ class WebSearchTool(Tool):
             or "brave"
         )
         n = min(max(count or self.config.max_results, 1), 10)
+        effective_time_range = kwargs.get("timeRange", kwargs.get("time_range", time_range))
+        date_error = _recent_query_date_error(
+            query,
+            effective_time_range,
+            timezone=self.timezone,
+        )
+        if date_error:
+            return date_error
 
         if selected_provider == "olostep":
             return await self._search_olostep(query, n)
@@ -364,7 +457,7 @@ class WebSearchTool(Tool):
             return await self._search_volcengine(
                 query,
                 n,
-                time_range=kwargs.get("timeRange", kwargs.get("time_range", time_range)),
+                time_range=effective_time_range,
                 auth_level=kwargs.get("authLevel", kwargs.get("auth_level", auth_level)),
                 query_rewrite=kwargs.get("queryRewrite", kwargs.get("query_rewrite", query_rewrite)),
             )

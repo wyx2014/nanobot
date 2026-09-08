@@ -10,11 +10,18 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
+from nanobot.observability.error_facts import (
+    error_category,
+    incident_projection,
+    safe_error_facts,
+    technical_array,
+)
 from nanobot.security.audit import redact_security_text
 
 _PROCESS_ID = "gateway_" + uuid.uuid4().hex
@@ -29,7 +36,8 @@ _DETAIL_KEYS = frozenset({
     "event_seq", "event_type", "queue_depth", "cache_hit", "cancelled", "operation_id",
     "parent_operation_id", "app_launch_id", "process_instance_id", "process_seq",
     "event_id", "timestamp", "schema_version", "status", "client_action_id", "reason",
-    "delay_ms",
+    "delay_ms", "error_category", "cause_chain", "stack_frames", "provider_request_id",
+    "auth_mode", "auth_header_present", "rule_id", "incident_id", "incident_snapshot", "recent_event_ids",
 })
 _ACTIVE_OPERATION: ContextVar[Operation | None] = ContextVar("active_operation", default=None)
 
@@ -51,6 +59,16 @@ def _details(value: dict[str, Any]) -> dict[str, Any]:
     for key, item in list(value.items())[:64]:
         if key not in _DETAIL_KEYS:
             continue
+        if key in {"stack_frames", "cause_chain"}:
+            output[key] = [{field: redact_security_text(value) if isinstance(value, str) else value
+                            for field, value in row.items()} for row in technical_array(key, item)]
+            continue
+        if key == "incident_snapshot":
+            output[key] = incident_projection(item)
+            continue
+        if key == "recent_event_ids":
+            output[key] = [entry for entry in item[-32:] if valid_id(entry)] if isinstance(item, list) else []
+            continue
         if isinstance(item, str):
             if remaining <= 0:
                 break
@@ -68,12 +86,22 @@ class OperationRecorder:
         self.queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=max_queue)
         self.dropped = 0
         self.write_failures = 0
+        self.retention_failures = 0
         self._sequence = 0
+        self._accepted = 0
+        self._processed = 0
+        self._persisted = 0
+        self._condition = threading.Condition()
+        self._recent: deque[dict[str, Any]] = deque(maxlen=64)
         self._closing = threading.Event()
         self._thread = threading.Thread(target=self._write, name="nanobot-operations", daemon=True)
         self._thread.start()
 
     def record(self, event: dict[str, Any]) -> None:
+        with self._condition:
+            self._record(event)
+
+    def _record(self, event: dict[str, Any]) -> None:
         if self._closing.is_set():
             return
         critical = event.get("level") == "error" or event["details"].get("status") in {"completed", "failed", "cancelled", "abandoned"}
@@ -88,8 +116,23 @@ class OperationRecorder:
             "process_instance_id": _PROCESS_ID, "process_seq": self._sequence,
             "app_launch_id": valid_id(os.environ.get("NANOBOT_APP_LAUNCH_ID")),
         })
+        if event.get("level") == "error" or event["details"].get("status") == "failed":
+            event["details"].update({
+                "incident_id": "incident_" + uuid.uuid4().hex,
+                "incident_snapshot": {"captured_at": event["details"]["timestamp"],
+                    "queue_depth": self.queue.qsize(), "dropped": self.dropped,
+                    "write_failures": self.write_failures, "last_event_seq": self._sequence,
+                    **{key: event[key] for key in ("session_id", "turn_id", "trace_id") if event.get(key)},
+                    **{key: event["details"][key] for key in ("stage", "runtime_epoch") if event["details"].get(key)}},
+                "recent_event_ids": [row["event_id"] for row in self._recent
+                    if row.get("trace_id") == event.get("trace_id")
+                    and row.get("session_id") == event.get("session_id")][-32:],
+            })
         try:
             self.queue.put_nowait(event)
+            self._accepted = self._sequence
+            self._recent.append({"event_id": event["details"]["event_id"],
+                                 "trace_id": event.get("trace_id"), "session_id": event.get("session_id")})
         except queue.Full:
             self.dropped += 1
 
@@ -102,17 +145,36 @@ class OperationRecorder:
                 continue
             try:
                 self.store.write(**event)
+                with self._condition:
+                    self._persisted = event["details"]["process_seq"]
                 written += 1
                 if written % 1000 == 0:
-                    self.store.prune_operations()
+                    try:
+                        self.store.prune_operations()
+                    except Exception:
+                        self.retention_failures += 1
             except Exception:
                 self.write_failures += 1
                 self.dropped += 1
             finally:
+                with self._condition:
+                    self._processed = event["details"]["process_seq"]
+                    self._condition.notify_all()
                 self.queue.task_done()
 
+    def flush(self, timeout: float = 1.0) -> dict[str, Any]:
+        with self._condition:
+            target = self._accepted
+            completed = self._condition.wait_for(lambda: self._processed >= target, timeout=timeout)
+            return {"status": "timeout" if not completed else "write_failed" if self.write_failures
+                    else "incomplete" if self.dropped else "completed",
+                    "target_seq": target, "processed_seq": self._processed,
+                    "persisted_seq": self._persisted, "queue_depth": self.queue.qsize(),
+                    "dropped": self.dropped, "write_failures": self.write_failures}
+
     def close(self, timeout: float = 1.0) -> None:
-        self._closing.set()
+        with self._condition:
+            self._closing.set()
         self._thread.join(timeout)
 
 
@@ -129,8 +191,13 @@ def operation_health() -> dict[str, Any]:
     recorder = _RECORDER
     return {"enabled": recorder is not None, "dropped": recorder.dropped if recorder else 0,
             "write_failures": recorder.write_failures if recorder else 0,
+            "retention_failures": recorder.retention_failures if recorder else 0,
             "queue_depth": recorder.queue.qsize() if recorder else 0,
             "process_instance_id": _PROCESS_ID}
+
+
+def flush_operations(timeout: float = 1.0) -> dict[str, Any]:
+    return _RECORDER.flush(timeout) if _RECORDER else {"status": "unavailable"}
 
 
 def fail_current_operation(code: str) -> None:
@@ -178,7 +245,8 @@ def record_operation(event_name: str, *, status: str | None = None,
                 "request_id", "project_id", "session_id", "turn_id", "trace_id",
                 "run_id", "span_id", "tool_call_id", "artifact_id",
             )},
-            "details": _details({**(details or {}), "status": status,
+            "details": _details({"error_category": error_category(error_code, (details or {}).get("status_code")),
+                                  **(details or {}), "status": status,
                                   "client_action_id": valid_id(context.get("client_action_id")),
                                   "operation_id": context.get("operation_id"),
                                   "parent_operation_id": context.get("parent_operation_id")}),
@@ -212,10 +280,10 @@ def operation(event_name: str, **details: Any):
         except BaseException as exc:
             status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             scope.error_code = type(exc).__name__
-            scope.details["error_type"] = type(exc).__name__
-            import traceback
-            frames = traceback.extract_tb(exc.__traceback__, limit=12)
-            scope.details["stack"] = "\n".join(f"{frame.filename}:{frame.lineno} in {frame.name}" for frame in frames)
+            try:
+                scope.details.update(safe_error_facts(exc))
+            except Exception:
+                scope.details["error_type"] = type(exc).__name__
             raise
         finally:
             record_operation(event_name, status="failed" if scope.error_code and status == "completed" else status,

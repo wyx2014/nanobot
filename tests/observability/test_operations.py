@@ -1,9 +1,15 @@
 import asyncio
+import errno
+import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from nanobot.observability import operations
+from nanobot.observability.diagnostic_export import collect_database
+from nanobot.observability.error_facts import safe_error_facts
+from nanobot.observability.trace_store import TraceStore
 from nanobot.runtime.trace_context import TraceContext, bind_trace_context
 from nanobot.storage.logs import StructuredLogStore
 
@@ -125,3 +131,65 @@ def test_operation_token_counts_survive_secret_redaction(capture):
     assert row.details["output_tokens"] == 12
     assert "secret" not in str(row)
     assert "private-name" not in str(row)
+
+
+def test_nested_failure_snapshot_and_locations_survive_database_export(capture):
+    store, recorder = capture
+    TraceStore(store.path)
+    with operations.operation_context(session_id="session-one", turn_id="turn-one"):
+        with pytest.raises(RuntimeError):
+            with operations.operation("presentation.render", stage="template_read"):
+                try:
+                    raise FileNotFoundError(errno.ENOENT, "private document", "/Users/private/template.pptx")
+                except FileNotFoundError as cause:
+                    raise RuntimeError("private wrapper body") from cause
+    assert recorder.flush()["status"] == "completed"
+    result = collect_database(store.path, 0, 9999999999999, "session-one")
+    failed = next(row for row in result["tables"]["logs"] if row["details"]["status"] == "failed")
+    facts = failed["details"]
+    assert facts["error_category"] == "resource.missing"
+    assert facts["cause_chain"][1]["error_code"] == "ENOENT"
+    assert facts["stack_frames"][-1]["line"] > 0
+    assert facts["incident_snapshot"]["turn_id"] == "turn-one"
+    assert facts["incident_snapshot"]["captured_at"]
+    assert facts["recent_event_ids"]
+    assert "private" not in json.dumps(result)
+
+
+def test_cyclic_exception_chains_are_bounded():
+    error = RuntimeError("private")
+    error.__cause__ = error
+    assert len(safe_error_facts(error)["cause_chain"]) == 1
+
+
+def test_sdk_error_preserves_request_id_but_never_response_headers_or_body():
+    error = RuntimeError("private response")
+    error.response = SimpleNamespace(headers={"x-request-id": "req-provider-one", "authorization": "private-token"}, body="private body")
+    facts = safe_error_facts(error)
+    assert facts["provider_request_id"] == "req-provider-one"
+    assert "private" not in json.dumps(facts)
+
+
+def test_flush_reports_timeout_then_write_failure(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    class Store:
+        def write(self, **kwargs):
+            entered.set()
+            release.wait(2)
+            raise OSError("private path")
+
+    recorder = operations.OperationRecorder(Store())
+    monkeypatch.setattr(operations, "_RECORDER", recorder)
+    try:
+        operations.record_operation("storage.write")
+        assert entered.wait(1)
+        assert recorder.flush(0.005)["status"] == "timeout"
+        release.set()
+        result = recorder.flush()
+        assert result["status"] == "write_failed"
+        assert result["processed_seq"] == result["target_seq"] == 1
+        assert result["persisted_seq"] == 0
+    finally:
+        release.set()
+        recorder.close()

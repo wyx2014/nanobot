@@ -93,6 +93,8 @@ async def test_diagnostic_export_requires_auth_and_valid_scope(bus, tmp_path):
     assert payload["schema_version"] == 1
     assert "trace_spans" in payload["tables"]
     assert "captured_at" in payload["snapshot"]
+    assert payload["sources"]["flush"]["status"] in {"included", "truncated"}
+    assert payload["snapshot"]["doctor"]["mode"] == "local_read_only"
     invalid = await handler.http.dispatch(connection, Request("/api/diagnostics/export?start_ms=0&end_ms=9999999999999", headers))
     assert invalid.status_code == 400
     missing = await handler.http.dispatch(connection, Request(route + "&session_id=missing", headers))
