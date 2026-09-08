@@ -43,6 +43,101 @@ def _member_batch(*, missing: str | None = None) -> MemberBatchOutcome:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("role_status", ["completed", "failed", "cancelled"])
+async def test_revision_executes_only_selected_role_and_preserves_prior(role_status) -> None:
+    from copy import deepcopy
+
+    prior = new_asset_research_state(run_id="v1", member_ids=MEMBER_NODES)
+    prior = advance_asset_research_graph(prior, "data_package_ready", {"artifact": "reports/base.md"})
+    for member in MEMBER_NODES:
+        prior = advance_asset_research_graph(prior, "member_updated", {
+            "id": member, "status": "failed" if member == "risk-assessor" else "completed",
+            "artifact": f"reports/v1/{member}.md",
+        })
+    prior = advance_asset_research_graph(prior, "report_written", {"artifact": "reports/v1.html"})
+    prior = advance_asset_research_graph(prior, "audit_completed")
+    original = deepcopy(prior)
+    calls = []
+    checkpoints = []
+
+    async def node(name, prompt, stream):
+        calls.append(name)
+        assert name != "data-package"
+        if name == TEAM_LEAD:
+            assert "Revision v2" in prompt
+            assert "reports/v1.html" in prompt
+            assert "supplement.json" in prompt
+        return AgentNodeOutcome(content="revised", artifacts=["reports/v2.html"])
+
+    async def members(tasks):
+        assert list(tasks) == ["risk-assessor"]
+        assert "reports/base.md" in tasks["risk-assessor"]
+        assert "reports/v1/financial-analyst.md" in tasks["risk-assessor"]
+        calls.extend(tasks)
+        return MemberBatchOutcome(members={"risk-assessor": MemberNodeOutcome(
+            member_id="risk-assessor", status=role_status, content="risk result",
+            artifact="reports/v2/risk.md",
+        )})
+
+    async def publish(state, event, activity):
+        checkpoints.append(deepcopy(state))
+
+    result = await AssetResearchWorkflowRuntime(
+        run_agent_node=node, run_member_wave=members, publish_state=publish,
+    ).run(run_id="v2", target="比亚迪", request="更新风险", team=_team(),
+          report_path="reports/v2.md", resume_from=prior,
+          rerun_member_ids=["risk-assessor"], supplemental_artifacts=["supplement.json"])
+    assert calls == ["risk-assessor", TEAM_LEAD, REPORT_AUDIT]
+    assert checkpoints[0]["active_nodes"] == ["risk-assessor"]
+    assert result.graph_state["report_version"] == 2
+    assert result.graph_state["degraded"] == (role_status != "completed")
+    assert prior == original
+    for member in MEMBER_NODES[:-1]:
+        assert result.graph_state["members"][member]["artifact"] == prior["members"][member]["artifact"]
+        assert result.graph_state["members"][member]["reused"] is True
+
+
+def test_revision_rejects_unknown_member_before_execution() -> None:
+    with pytest.raises(ValueError, match="valid member"):
+        new_asset_research_state(run_id="v2", member_ids=MEMBER_NODES,
+                                 resume_from={}, rerun_member_ids=["unknown"])
+
+
+@pytest.mark.asyncio
+async def test_revision_stops_at_synthesis_budget_and_keeps_completed_roles():
+    prior = new_asset_research_state(run_id="old", member_ids=MEMBER_NODES)
+    prior["user_supplements"] = ["uploads/prior-supplement.json"]
+    prior = advance_asset_research_graph(prior, "data_package_ready", {"artifact": "old/base.md"})
+    for member in MEMBER_NODES:
+        prior = advance_asset_research_graph(prior, "member_updated", {
+            "id": member, "status": "completed", "artifact": f"old/{member}.md",
+        })
+    calls = []
+
+    async def node(name, prompt, stream):
+        calls.append(name)
+        assert "uploads/prior-supplement.json" in prompt
+        assert "No new external research" in prompt
+        return AgentNodeOutcome(stop_reason="max_iterations", content="no report yet")
+
+    async def members(tasks):
+        raise AssertionError("completed roles must not rerun during synthesis recovery")
+
+    async def publish(*args):
+        pass
+
+    result = await AssetResearchWorkflowRuntime(
+        run_agent_node=node, run_member_wave=members, publish_state=publish,
+    ).run(run_id="new", target="China Taiping", request="continue synthesis", team=_team(),
+          report_path="reports/v2.md", resume_from=prior)
+    assert calls == [TEAM_LEAD]
+    assert result.stop_reason == "workflow_error"
+    assert result.graph_state["user_supplements"] == ["uploads/prior-supplement.json"]
+    for member in MEMBER_NODES:
+        assert result.graph_state["members"][member]["artifact"] == f"old/{member}.md"
+
+
+@pytest.mark.asyncio
 async def test_runtime_executes_fixed_fanout_join_and_delivery_order() -> None:
     node_calls: list[str] = []
     published: list[tuple[str, list[str]]] = []
@@ -141,8 +236,10 @@ async def test_audit_iteration_limit_delivers_business_summary_without_runtime_c
     assert "降级" not in outcome.final_content
     assert "fallback" not in outcome.final_content.lower()
     assert "iteration" not in outcome.final_content.lower()
-    assert outcome.stop_reason == "max_iterations"
-    assert outcome.graph_state["status"] == "completed"
+    assert outcome.stop_reason == "completed_with_warnings"
+    assert outcome.graph_state["status"] == "completed_with_warnings"
+    assert outcome.graph_state["audit"]["verified"] is False
+    assert "审校未完成" in outcome.final_content
 
 
 @pytest.mark.asyncio
@@ -188,7 +285,8 @@ async def test_audit_generic_iteration_fallback_is_hidden_from_delivery() -> Non
     assert "完整 HTML 报告" not in outcome.final_content
     assert "reports/安集科技-run-1-投资研究报告.html" not in outcome.final_content
     assert "reports/安集科技-run-1-投资研究报告.html" in outcome.artifacts
-    assert outcome.graph_state["status"] == "completed"
+    assert outcome.graph_state["status"] == "completed_with_warnings"
+    assert "审校未完成" in outcome.final_content
 
 
 @pytest.mark.asyncio

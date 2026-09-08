@@ -35,6 +35,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.config.paths import get_media_dir
 from nanobot.config_base import Base
+from nanobot.security.audit import AuditedToolResult
 from nanobot.security.workspace_access import current_scope_allows_loopback, current_tool_workspace
 from nanobot.security.workspace_policy import is_path_within
 
@@ -293,7 +294,9 @@ class ExecTool(Tool):
                 )
             except asyncio.TimeoutError:
                 await self._kill_process(process)
-                return f"Error: Command timed out after {prepared.timeout} seconds"
+                return AuditedToolResult(
+                    f"Error: Command timed out after {prepared.timeout} seconds", result="timed_out",
+                )
             except asyncio.CancelledError:
                 await self._kill_process(process)
                 raise
@@ -321,7 +324,10 @@ class ExecTool(Tool):
                     + result[-half:]
                 )
 
-            return result
+            return AuditedToolResult(
+                result, result="succeeded" if process.returncode == 0 else "failed",
+                exit_code=process.returncode, working_directory=prepared.cwd,
+            )
 
         except Exception as e:
             return f"Error executing command: {str(e)}"

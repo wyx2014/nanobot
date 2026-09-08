@@ -22,6 +22,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 from nanobot.config_base import Base
+from nanobot.security.audit import audit_http_hooks
 from nanobot.utils.helpers import build_image_content_blocks
 
 # Shared constants
@@ -455,7 +456,7 @@ class WebSearchTool(Tool):
                 "X-Subscription-Token": api_key,
                 "User-Agent": self.user_agent,
             }
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 for attempt in range(2):
                     r = await client.get(
                         "https://api.search.brave.com/res/v1/web/search",
@@ -490,7 +491,7 @@ class WebSearchTool(Tool):
             logger.warning("TAVILY_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo(query, n)
         try:
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.post(
                     "https://api.tavily.com/search",
                     headers={"Authorization": f"Bearer {api_key}", "User-Agent": self.user_agent},
@@ -516,7 +517,7 @@ class WebSearchTool(Tool):
         else:
             url += "/public"
         try:
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.post(
                     url,
                     headers=headers,
@@ -550,7 +551,7 @@ class WebSearchTool(Tool):
         if not is_valid:
             return f"Error: invalid SearXNG URL: {error_msg}"
         try:
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.get(
                     endpoint,
                     params={"q": query, "format": "json"},
@@ -574,7 +575,7 @@ class WebSearchTool(Tool):
                 "User-Agent": self.user_agent,
             }
             encoded_query = quote(query, safe="")
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.get(
                     f"https://s.jina.ai/{encoded_query}",
                     headers=headers,
@@ -597,7 +598,7 @@ class WebSearchTool(Tool):
             logger.warning("KAGI_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo(query, n)
         try:
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.post(
                     "https://kagi.com/api/v1/search",
                     json={"query": query, "limit": n},
@@ -629,7 +630,7 @@ class WebSearchTool(Tool):
                 "numResults": n,
                 "contents": {"highlights": True},
             }
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.post(
                     "https://api.exa.ai/search",
                     headers=headers,
@@ -707,7 +708,7 @@ class WebSearchTool(Tool):
             "X-Traffic-Tag": _VOLCENGINE_TRAFFIC_TAG,
         }
         try:
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.post(
                     _VOLCENGINE_SEARCH_API_URL,
                     headers=headers,
@@ -806,7 +807,7 @@ class WebSearchTool(Tool):
                 "summary": True,
                 "count": n,
             }
-            async with httpx.AsyncClient(proxy=self.proxy) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, event_hooks=audit_http_hooks()) as client:
                 r = await client.post(
                     _BOCHA_SEARCH_API_URL,
                     headers=headers,
@@ -906,7 +907,7 @@ class WebFetchTool(Tool):
 
         # Detect and fetch images directly to avoid Jina's textual image captioning
         try:
-            async with httpx.AsyncClient(proxy=self.proxy, timeout=15.0) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, timeout=15.0, event_hooks=audit_http_hooks()) as client:
                 r, stream, redirect_error = await _stream_with_safe_redirects(
                     client,
                     url,
@@ -948,7 +949,7 @@ class WebFetchTool(Tool):
             jina_key = os.environ.get("JINA_API_KEY", "")
             if jina_key:
                 headers["Authorization"] = f"Bearer {jina_key}"
-            async with httpx.AsyncClient(proxy=self.proxy, timeout=20.0) as client:
+            async with httpx.AsyncClient(proxy=self.proxy, timeout=20.0, event_hooks=audit_http_hooks()) as client:
                 r = await client.get(f"https://r.jina.ai/{url}", headers=headers)
                 if r.status_code == 429:
                     logger.debug("Jina Reader rate limited, falling back to readability")
@@ -981,6 +982,7 @@ class WebFetchTool(Tool):
         """Local fallback using readability-lxml."""
         try:
             async with httpx.AsyncClient(
+                event_hooks=audit_http_hooks(),
                 timeout=30.0,
                 proxy=self.proxy,
             ) as client:

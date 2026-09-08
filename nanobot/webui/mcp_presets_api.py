@@ -21,6 +21,7 @@ from nanobot.apps.protocol import app_manifest, compact_dict
 from nanobot.config.loader import load_config, resolve_config_env_vars, save_config
 from nanobot.config.paths import get_runtime_subdir
 from nanobot.config.schema import MCPServerConfig
+from nanobot.runtime.mcp_diagnostics import capture_connections, connection_snapshot
 from nanobot.utils.helpers import ensure_dir
 
 QueryParams = dict[str, list[str]]
@@ -653,6 +654,8 @@ def _update_server(existing: MCPServerConfig, query: QueryParams) -> MCPServerCo
     raw_env = _query_first(query, "env")
     raw_headers = _query_first(query, "headers")
     return MCPServerConfig(
+        display_name=existing.display_name,
+        enabled=existing.enabled,
         type=transport,
         command=command if transport == "stdio" else "",
         args=_parse_string_list(raw_args) if raw_args is not None else list(existing.args),
@@ -713,7 +716,7 @@ def _command_available(command: str) -> bool:
 
 
 def _config_available(cfg: MCPServerConfig | None) -> bool:
-    if cfg is None:
+    if cfg is None or not cfg.enabled:
         return False
     if cfg.command:
         return _command_available(cfg.command)
@@ -929,7 +932,7 @@ def _custom_payload(
     status = "missing_dependency" if cfg.command and not _command_available(cfg.command) else "configured"
     return {
         "name": name,
-        "display_name": name,
+        "display_name": cfg.display_name or name,
         "category": "custom",
         "description": "Custom MCP server from nanobot config.",
         "docs_url": "",
@@ -983,6 +986,34 @@ def mcp_presets_payload(
         "presets": [*preset_rows, *custom_rows],
         "installed_count": len(config.tools.mcp_servers),
     }
+    for row in payload["presets"]:
+        cfg = config.tools.mcp_servers.get(row["name"])
+        row["enabled"] = bool(cfg and cfg.enabled)
+        if cfg is None:
+            continue
+        row["display_name"] = cfg.display_name or row["display_name"]
+        row["connection"]["connect_timeout"] = cfg.connect_timeout
+        row["connection"]["env_keys"] = list(cfg.env)
+        row["connection"]["header_keys"] = list(cfg.headers)
+        runtime = connection_snapshot(row["name"])
+        row["connection_state"] = (
+            "disabled" if not cfg.enabled else
+            runtime["status"] if runtime and runtime["status"] in {"connected", "connecting", "failed", "needs_auth"} else
+            "needs_auth" if row["status"] == "missing_credentials" else
+            "failed" if row["status"] == "missing_dependency" else
+            runtime["status"] if runtime else "pending"
+        )
+        row["diagnostics"] = runtime["history"] if runtime else []
+        row["checked_at"] = runtime["checked_at"] if runtime else None
+        if runtime and row["connection_state"] in {"failed", "needs_auth"}:
+            row["error"] = runtime["message"]
+        if row["status"] == "missing_dependency" and not runtime:
+            row["error"] = "Executable not found. Check the command path and install its dependencies."
+        if runtime and row["connection_state"] == "connected":
+            row["tool_names"] = runtime["tool_names"]
+            row["configured"] = True
+            row["available"] = True
+        row["tool_count"] = len(row.get("tool_names", []))
     if last_action is not None:
         payload["last_action"] = last_action
     return payload
@@ -1109,10 +1140,9 @@ async def mcp_presets_test_action(query: QueryParams) -> dict[str, Any]:
     registry = ToolRegistry()
     stacks: dict[str, Any] = {}
     try:
-        stacks = await asyncio.wait_for(
-            connect_mcp_servers({name: cfg}, registry),
-            timeout=_test_timeout(cfg),
-        )
+        with capture_connections():
+            async with asyncio.timeout(_test_timeout(cfg)):
+                stacks = await connect_mcp_servers({name: cfg}, registry)
         tool_prefix = f"mcp_{name}_"
         tool_names = sorted(name for name in registry.tool_names if name.startswith(tool_prefix))
         ok = name in stacks
@@ -1206,6 +1236,8 @@ def _parse_enabled_tools(raw: str | None) -> list[str]:
 
 
 def _normalize_transport(value: str | None, *, command: str = "", url: str = "") -> Literal["stdio", "sse", "streamableHttp"]:
+    if value is not None and not isinstance(value, str):
+        raise McpPresetError("MCP transport must be text")
     raw = (value or "").strip()
     if not raw:
         if command:
@@ -1228,7 +1260,7 @@ def _normalize_transport(value: str | None, *, command: str = "", url: str = "")
 
 
 def _validated_server_name(name: str) -> str:
-    if not name or _MCP_PRESET_NAME_RE.match(name) is None:
+    if not isinstance(name, str) or not name or _MCP_PRESET_NAME_RE.fullmatch(name) is None:
         raise McpPresetError("invalid MCP server name")
     return name.strip().lower()
 
@@ -1328,6 +1360,8 @@ def custom_mcp_action(action: str, query: QueryParams) -> dict[str, Any]:
     config = load_config()
     if action == "custom":
         name, cfg = _custom_server_from_query(query)
+        if name in config.tools.mcp_servers or name in _known_preset_names():
+            raise McpPresetError("MCP server already exists; edit it instead of adding it again", status=409)
         config.tools.mcp_servers[name] = cfg
         save_config(config)
         payload = mcp_presets_payload(last_action=_server_action_message(action, name))
@@ -1336,6 +1370,8 @@ def custom_mcp_action(action: str, query: QueryParams) -> dict[str, Any]:
 
     if action in {"import", "import-cursor"}:
         servers = _import_mcp_servers(_query_first(query, "config"))
+        if set(servers) & (set(config.tools.mcp_servers) | _known_preset_names()):
+            raise McpPresetError("MCP import conflicts with existing servers; use the import preview", status=409)
         config.tools.mcp_servers.update(servers)
         save_config(config)
         payload = mcp_presets_payload(last_action={

@@ -77,6 +77,7 @@ def test_public_state_keeps_artifacts_but_strips_large_node_bodies() -> None:
 
     assert public["data_package"] == {
         "status": "completed",
+        "degraded": False,
         "artifact": "reports/base.md",
     }
     assert public["members"][MEMBER_NODES[0]]["artifact"] == "reports/member.md"
@@ -164,7 +165,8 @@ def test_user_supplement_resumes_at_synthesis_without_rerunning_members() -> Non
     assert resumed["node"] == SYNTHESIS
     assert resumed["resume_from_run_id"] == "run-1"
     assert resumed["user_supplements"] == ["uploads/missing-risk-data.xlsx"]
-    assert all(member["status"] == "completed" for member in resumed["members"].values())
+    assert resumed["members"]["risk-assessor"]["status"] == "failed"
+    assert all(member["reused"] for member in resumed["members"].values())
     assert resumed["members"]["risk-assessor"]["artifact"].endswith(
         "risk-assessor.md"
     )

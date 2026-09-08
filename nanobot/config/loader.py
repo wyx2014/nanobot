@@ -9,7 +9,7 @@ from typing import Any
 import pydantic
 from pydantic import BaseModel
 
-from nanobot.config.schema import Config, _resolve_tool_config_refs
+from nanobot.config.schema import Config, MCPServerConfig, _resolve_tool_config_refs
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
@@ -98,6 +98,8 @@ def resolve_config_env_vars(config: Config) -> Config:
 
 
 def _resolve_in_place(obj: Any) -> Any:
+    if isinstance(obj, MCPServerConfig) and not obj.enabled:
+        return obj
     if isinstance(obj, str):
         new = _ENV_REF_PATTERN.sub(_env_replace, obj)
         return new if new != obj else obj

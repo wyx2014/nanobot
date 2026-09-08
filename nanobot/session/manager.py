@@ -21,6 +21,13 @@ from typing import Any, TextIO
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.utils.atomic_file import (
+    REPLACE_RETRY_DELAYS_S,
+    WINDOWS_REPLACE_ERRORS,
+    ReplaceStats,
+    is_retryable_replace_error,
+    replace_with_retry,
+)
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -59,9 +66,9 @@ _FORK_VOLATILE_METADATA_KEYS = {
 }
 _ACTIVE_SESSION_SAVES_LOCK = threading.Lock()
 _ACTIVE_SESSION_SAVES: dict[str, list[dict[str, Any]]] = {}
-_WINDOWS_ATOMIC_REPLACE_ERRORS = {5, 32}
+_WINDOWS_ATOMIC_REPLACE_ERRORS = WINDOWS_REPLACE_ERRORS
 _WINDOWS_SESSION_REPLACE_MIN_INTERVAL_S = 0.1
-_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
+_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S = REPLACE_RETRY_DELAYS_S
 _SESSION_READ_ACTIVITY_LOCK = threading.Lock()
 _ACTIVE_SESSION_READS: dict[str, list[dict[str, Any]]] = {}
 _RECENT_SESSION_READS: deque[dict[str, Any]] = deque(maxlen=256)
@@ -72,10 +79,7 @@ _SLOW_SESSION_IO_LOG_MS = 500
 
 def _is_retryable_windows_replace_error(exc: OSError) -> bool:
     """Return whether *exc* is a transient Windows replace conflict."""
-    return (
-        sys.platform == "win32"
-        and getattr(exc, "winerror", None) in _WINDOWS_ATOMIC_REPLACE_ERRORS
-    )
+    return is_retryable_replace_error(exc)
 
 
 def _session_file_scope(path: Path) -> str:
@@ -480,6 +484,11 @@ class Session:
                     breadcrumbs = "\n".join(cli_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
             mcp_presets = message.get("mcp_presets")
+            presentation = message.get("presentation")
+            if role == "user" and isinstance(presentation, dict) and isinstance(content, str):
+                template_id = str(presentation.get("template_id") or "")[:80]
+                document_id = str(presentation.get("document_id") or "")[:80]
+                content += f"\n[Presentation: template={template_id}; document={document_id}; tool=export_presentation]"
             if (
                 role == "user"
                 and isinstance(mcp_presets, list)
@@ -920,29 +929,11 @@ class SessionManager:
 
             readers_before_replace = _session_file_read_activity(path)
             replace_started = time.monotonic()
+            replace_stats = ReplaceStats()
             try:
-                for attempt, delay_s in enumerate(
-                    (*_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S, None), start=1
-                ):
-                    replace_attempts = attempt
-                    try:
-                        os.replace(tmp_path, path)
-                        break
-                    except OSError as exc:
-                        if not _is_retryable_windows_replace_error(exc) or delay_s is None:
-                            raise
-                        logger.warning(
-                            "Session atomic replace temporarily blocked for {} "
-                            "(attempt {}/{}, retry_in_ms={}): {}",
-                            path,
-                            attempt,
-                            len(_WINDOWS_SESSION_REPLACE_RETRY_DELAYS_S) + 1,
-                            round(delay_s * 1000),
-                            exc,
-                        )
-                        time.sleep(delay_s)
-                        retry_wait_s += delay_s
+                replace_with_retry(tmp_path, path, label="Session", stats=replace_stats, diagnose=False)
             except OSError as exc:
+                replace_attempts, retry_wait_s = replace_stats.attempts, replace_stats.retry_wait_s
                 replace_failed = time.monotonic()
                 should_diagnose = isinstance(exc, PermissionError) or (
                     sys.platform == "win32"
@@ -997,16 +988,9 @@ class SessionManager:
                     json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, default=str),
                 )
                 raise
+            replace_attempts, retry_wait_s = replace_stats.attempts, replace_stats.retry_wait_s
             replace_elapsed_ms = (time.monotonic() - replace_started) * 1000
             self._last_replace_monotonic[save_scope] = time.monotonic()
-            if replace_attempts > 1:
-                logger.info(
-                    "Session atomic replace recovered for {} after {} attempts "
-                    "(retry_wait_ms={})",
-                    path,
-                    replace_attempts,
-                    round(retry_wait_s * 1000),
-                )
 
             if fsync:
                 # fsync the directory so the rename is durable.
@@ -1024,7 +1008,8 @@ class SessionManager:
                     time.monotonic() - directory_fsync_started
                 ) * 1000
         except BaseException:
-            tmp_path.unlink(missing_ok=True)
+            with suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
             raise
         finally:
             with _ACTIVE_SESSION_SAVES_LOCK:

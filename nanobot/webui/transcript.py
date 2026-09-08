@@ -755,6 +755,9 @@ class WebUITranscriptRecorder:
         )
         if payload is None:
             return
+        if isinstance(metadata.get("presentation"), dict):
+            from nanobot.presentations import presentation_selection
+            payload["presentation"] = presentation_selection(metadata["presentation"])
         self.prepare_and_append(chat_id, payload, metadata=metadata, phase="user")
 
     def append(
@@ -904,6 +907,9 @@ def write_session_messages_as_transcript(
                 if isinstance(value, list) and value:
                     row[key] = json.loads(json.dumps(value, ensure_ascii=False))
             scope = msg.get("skill_scope")
+            if isinstance(msg.get("presentation"), dict):
+                from nanobot.presentations import presentation_selection
+                row["presentation"] = presentation_selection(msg["presentation"])
             if isinstance(scope, dict):
                 explicit = scope.get("explicit_skills")
                 if isinstance(explicit, list):
@@ -2014,6 +2020,9 @@ def replay_transcript_to_ui_messages(
                 if all(m.get("kind") == "image" for m in media_att):
                     row["images"] = [{"url": m.get("url"), "name": m.get("name")} for m in media_att]
             cli_apps = rec.get("cli_apps")
+            if isinstance(rec.get("presentation"), dict):
+                from nanobot.presentations import presentation_selection
+                row["presentation"] = presentation_selection(rec["presentation"])
             if isinstance(cli_apps, list) and cli_apps:
                 row["cliApps"] = [dict(app) for app in cli_apps if isinstance(app, dict)]
             mcp_presets = rec.get("mcp_presets")

@@ -91,6 +91,44 @@ async def test_state_run_routes_asset_team_to_runtime_graph_not_general_agent(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["missing_target", "model_route_unavailable", "resume_without_prior_run"])
+async def test_team_clarification_cannot_fall_through_to_agent_plan_or_search(tmp_path, reason):
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.bus.events import InboundMessage
+
+    loop = _make_loop(tmp_path)
+    loop._run_agent_loop = AsyncMock(side_effect=AssertionError("general research must not run"))
+    loop._run_asset_research_workflow = AsyncMock()
+    loop._last_usage = {"total_tokens": 999}
+    runtime_events = MagicMock()
+    runtime_events.run_status_changed = AsyncMock()
+    loop._runtime_events = MagicMock(return_value=runtime_events)
+    session = MagicMock()
+    session.metadata = {"expert_team": {"id": "asset-research-team"}}
+    msg = InboundMessage(
+        channel="websocket", sender_id="user", chat_id="anji", content="帮我分析下 安集科技 A股",
+        metadata={
+            "webui": True, "_expert_team_turn_suppressed": True,
+            "_expert_team_turn_route": {"action": "clarify", "reason": reason},
+        },
+    )
+    messages = [
+        {"role": "system", "content": "Always make a plan and search financial data."},
+        {"role": "user", "content": msg.content},
+    ]
+    ctx = TurnContext(msg=msg, session_key="websocket:anji", state=TurnState.RUN,
+                      turn_id="turn-anji", session=session, initial_messages=messages)
+    assert await loop._state_run(ctx) == "ok"
+    loop._run_agent_loop.assert_not_awaited()
+    loop._run_asset_research_workflow.assert_not_awaited()
+    assert ctx.tools_used == []
+    assert ctx.turn_usage == {}
+    assert ctx.all_messages[-1] == {"role": "assistant", "content": ctx.final_content}
+    assert ctx.stop_reason == "completed"
+    assert "重试" in ctx.final_content if reason == "model_route_unavailable" else "股票的名称或代码" in ctx.final_content
+
+
+@pytest.mark.asyncio
 async def test_state_run_scopes_brand_new_webui_greeting_to_no_tools(tmp_path):
     from nanobot.agent.loop import TurnContext, TurnState
     from nanobot.bus.events import InboundMessage
@@ -218,6 +256,61 @@ async def test_asset_workflow_applies_strict_policy_only_to_report_audit(
     assert "finalize_on_max_iterations" not in kwargs
     assert "write_file" in kwargs["tools"].tool_names
     assert "edit_file" not in kwargs["tools"].tool_names
+
+
+@pytest.mark.asyncio
+async def test_role_revision_adapter_spawns_only_risk_and_disables_synthesis_search(tmp_path, monkeypatch):
+    from nanobot.agent.loop import TurnContext, TurnState
+    from nanobot.bus.events import InboundMessage
+    from nanobot.graph.workflows.asset_research_runtime import AssetResearchWorkflowOutcome
+    from nanobot.session.manager import Session
+
+    loop = _make_loop(tmp_path)
+    tools = ToolRegistry()
+    for name in ("read_file", "write_file", "web_search", "web_fetch"):
+        tool = MagicMock()
+        tool.name = name
+        tools.register(tool)
+    loop.tools = tools
+    loop.subagents.spawn_for_workflow = AsyncMock(return_value="could not start role")
+    loop._run_agent_loop = AsyncMock(return_value=("done", [], [], "completed", False))
+
+    class RevisionRuntime:
+        def __init__(self, *, run_agent_node, run_member_wave, **kwargs):
+            self.node = run_agent_node
+            self.wave = run_member_wave
+
+        async def run(self, **kwargs):
+            assert kwargs["rerun_member_ids"] == ["risk-assessor"]
+            assert "-v2-" in kwargs["report_path"]
+            batch = await self.wave({"risk-assessor": "read supplemental evidence"})
+            assert list(batch.members) == ["risk-assessor"]
+            for node in ("team-lead", "report-audit"):
+                await self.node(node, "update", False)
+            return AssetResearchWorkflowOutcome(final_content="done", stop_reason="completed",
+                                                 graph_state={}, tools_used=[], usage={}, artifacts=[])
+
+    monkeypatch.setattr("nanobot.agent.loop.AssetResearchWorkflowRuntime", RevisionRuntime)
+    session = Session(key="websocket:revision", metadata={})
+    msg = InboundMessage(channel="websocket", sender_id="user", chat_id="revision", content="update",
+                         metadata={"expert_team": {"id": "asset-research-team"},
+                                   "expert_team_run_id": "new-run",
+                                   "_expert_team_turn_route": {"action": "run", "target": "比亚迪"},
+                                   "expert_team_resume": {"selected_roles": ["risk-assessor"],
+                                                          "graph_state": {"run_id": "old-run"}}})
+    ctx = TurnContext(msg=msg, session_key=session.key, state=TurnState.RUN,
+                      turn_id="turn", session=session, initial_messages=[], tools=tools)
+    await loop._run_asset_research_workflow(ctx)
+    loop.subagents.spawn_for_workflow.assert_awaited_once()
+    assert loop.subagents.spawn_for_workflow.await_args.kwargs["label"] == "risk-assessor"
+    for call in loop._run_agent_loop.await_args_list:
+        assert set(call.kwargs["tools"].tool_names) == {"read_file", "write_file"}
+        system = call.args[0][0]["content"]
+        assert "Validated security: 比亚迪" in system
+        assert "Current run: new-run" in system
+        assert "evidence-index.json" in system
+        assert call.kwargs["max_iterations"] in {5, 24}
+    assert (tmp_path / "reports/.team-runs/new-run/evidence-index.json").is_file()
 
 
 @pytest.mark.asyncio

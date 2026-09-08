@@ -564,6 +564,7 @@ class AgentRunner:
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
         length_recovery_count = 0
+        length_recovery_parts: list[str] = []
         had_injections = False
         injection_cycles = 0
         request_context = current_request_context()
@@ -689,6 +690,12 @@ class AgentRunner:
                 response.thinking_blocks,
                 response.content,
             )
+            if (response.finish_reason == "length" or length_recovery_parts) and (
+                response.content and response.content.strip() == cleaned_content
+            ):
+                # Preserve split words/table rows and Markdown newlines when
+                # reasoning cleanup made no change beyond trimming whitespace.
+                cleaned_content = response.content
             response.content = cleaned_content
             raw_usage = self._usage_or_estimate(spec, messages_for_model, response)
             context.usage = dict(raw_usage)
@@ -853,6 +860,7 @@ class AgentRunner:
                 )
                 empty_content_retries = 0
                 length_recovery_count = 0
+                length_recovery_parts.clear()
                 # Checkpoint 1: drain injections after tools, before next LLM call
                 _drained, injection_cycles = await self._try_drain_injections(
                     spec, messages, None, injection_cycles,
@@ -971,8 +979,10 @@ class AgentRunner:
                         thinking_blocks=response.thinking_blocks,
                     ))
                     messages.append(build_length_recovery_message())
+                    length_recovery_parts.append(clean)
                     await hook.after_iteration(context)
                     continue
+                stop_reason = "max_iterations"
 
             assistant_message: dict[str, Any] | None = None
             if response.finish_reason != "error" and not is_blank_text(clean):
@@ -994,6 +1004,10 @@ class AgentRunner:
             )
             if should_continue:
                 had_injections = True
+                length_recovery_parts.clear()
+                length_recovery_count = 0
+                if stop_reason == "max_iterations":
+                    stop_reason = "completed"
 
             if hook.wants_streaming():
                 await hook.on_stream_end(context, resuming=should_continue)
@@ -1056,7 +1070,9 @@ class AgentRunner:
                     "pending_tool_calls": [],
                 },
             )
-            final_content = clean
+            # Length recovery is one answer split across responses. Retain the
+            # prefix even if history compaction removed its message meanwhile.
+            final_content = "".join([*length_recovery_parts, clean])
             context.final_content = final_content
             context.stop_reason = stop_reason
             await hook.after_iteration(context)
@@ -1074,8 +1090,9 @@ class AgentRunner:
             )
             if drained_after_max_iterations:
                 had_injections = True
+                length_recovery_parts.clear()
             final_content = None
-            if spec.finalize_on_max_iterations:
+            if spec.finalize_on_max_iterations and not length_recovery_parts:
                 final_content = await self._try_finalize_after_max_iterations(
                     spec,
                     hook,
@@ -1083,7 +1100,7 @@ class AgentRunner:
                     usage,
                 )
             if final_content is None:
-                final_content = self._max_iterations_fallback(spec)
+                final_content = "".join(length_recovery_parts) or self._max_iterations_fallback(spec)
             self._append_final_message(messages, final_content)
 
         return AgentRunResult(
@@ -1339,6 +1356,11 @@ class AgentRunner:
             "event": "request_started",
         })
         provider_started_at = time.perf_counter()
+        model_audit = spec.security_service.begin_model_audit(
+            provider=self.provider, model=spec.model,
+            session_key=spec.session_key, turn_id=spec.security_turn_id,
+            agent_label=spec.agent_label,
+        ) if spec.security_service is not None else None
         try:
             response = (
                 await coro if outer_timeout_s is None
@@ -1355,6 +1377,8 @@ class AgentRunner:
                     "Tool call did not complete.",
                 )
         except asyncio.TimeoutError:
+            if spec.security_service is not None:
+                spec.security_service.complete_audit(model_audit, result="timed_out")
             await _mark_first_event("timeout", observed=False)
             if self.trace_collector is not None:
                 await self.trace_collector.end_span(
@@ -1377,6 +1401,8 @@ class AgentRunner:
                 error_kind="timeout",
             )
         except asyncio.CancelledError:
+            if spec.security_service is not None:
+                spec.security_service.complete_audit(model_audit, result="cancelled")
             if self.trace_collector is not None:
                 await self.trace_collector.end_span(
                     llm_span_id,
@@ -1386,6 +1412,8 @@ class AgentRunner:
                 )
             raise
         except BaseException as exc:
+            if spec.security_service is not None:
+                spec.security_service.complete_audit(model_audit, result="failed", details={"error_type": type(exc).__name__})
             if self.trace_collector is not None:
                 await self.trace_collector.end_span(
                     llm_span_id,
@@ -1395,6 +1423,11 @@ class AgentRunner:
                     error={"type": type(exc).__name__, "message": str(exc)},
                 )
             raise
+        if spec.security_service is not None:
+            spec.security_service.complete_audit(
+                model_audit, result="failed" if response.finish_reason == "error" else "succeeded",
+                details={"status_code": response.error_status_code} if response.finish_reason == "error" else {},
+            )
         if self.trace_collector is not None:
             llm_status = "failed" if response.finish_reason == "error" else "completed"
             await self.trace_collector.end_span(
@@ -1581,9 +1614,16 @@ class AgentRunner:
             else None
         )
         started_at = time.perf_counter()
+        model_audit = spec.security_service.begin_model_audit(
+            provider=self.provider, model=spec.model,
+            session_key=spec.session_key, turn_id=spec.security_turn_id,
+            agent_label=spec.agent_label,
+        ) if spec.security_service is not None else None
         try:
             response = await self.provider.chat_with_retry(**kwargs)
         except asyncio.CancelledError:
+            if spec.security_service is not None:
+                spec.security_service.complete_audit(model_audit, result="cancelled")
             if self.trace_collector is not None:
                 await self.trace_collector.end_span(
                     span_id,
@@ -1593,6 +1633,8 @@ class AgentRunner:
                 )
             raise
         except BaseException as exc:
+            if spec.security_service is not None:
+                spec.security_service.complete_audit(model_audit, result="failed", details={"error_type": type(exc).__name__})
             if self.trace_collector is not None:
                 await self.trace_collector.end_span(
                     span_id,
@@ -1602,6 +1644,10 @@ class AgentRunner:
                     error={"type": type(exc).__name__, "message": str(exc)},
                 )
             raise
+        if spec.security_service is not None:
+            spec.security_service.complete_audit(
+                model_audit, result="failed" if response.finish_reason == "error" else "succeeded",
+            )
         if self.trace_collector is not None:
             status = "failed" if response.finish_reason == "error" else "completed"
             await self.trace_collector.end_span(
@@ -2099,6 +2145,7 @@ class AgentRunner:
                     tool_name=tool_call.name,
                     session_key=spec.session_key,
                     turn_id=spec.security_turn_id,
+                    agent_label=spec.agent_label,
                 )
             except AuditUnavailable as exc:
                 if security_assessment.mutating:
@@ -2111,20 +2158,29 @@ class AgentRunner:
                     return payload, event, RuntimeError(payload) if spec.fail_on_tool_error else None
                 logger.error("Security audit unavailable for read-only tool: {}", exc)
 
-            allowed, security_result = await security.authorize(
-                security_assessment,
-                callback=spec.security_approval_callback,
-                chat_id=spec.security_chat_id,
-                turn_grants=spec.security_turn_grants,
-                interactive=spec.security_interactive,
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.name,
-            )
+            try:
+                allowed, security_result = await security.authorize(
+                    security_assessment,
+                    callback=spec.security_approval_callback,
+                    chat_id=spec.security_chat_id,
+                    turn_grants=spec.security_turn_grants,
+                    interactive=spec.security_interactive,
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    audit=security_audit,
+                )
+            except asyncio.CancelledError:
+                security.complete_audit(security_audit, result="cancelled")
+                raise
+            except Exception as exc:
+                security.complete_audit(security_audit, result="failed", details={"error_type": type(exc).__name__})
+                raise
             if not allowed:
                 security.complete_audit(
                     security_audit,
                     result=security_result,
                     decision=security_assessment.decision,
+                    details={"authorization": security_result, "execution_started": False},
                 )
                 payload = f"Error: Operation blocked by security protection: {security_assessment.summary}"
                 event = {
@@ -2134,30 +2190,21 @@ class AgentRunner:
                 }
                 return payload, event, RuntimeError(payload) if spec.fail_on_tool_error else None
             if security_result.startswith("approved"):
-                security.complete_audit(
+                recorded = security.complete_audit(
                     security_audit,
-                    result="approved",
+                    result="executing",
                     decision=security_result,
+                    details={
+                        "authorization": security_result,
+                        "approval_scope": "turn",
+                        "authorization_actor": "user" if security_result == "approved" else "turn_grant",
+                        "authorized_at": time.time_ns() // 1_000_000,
+                    },
                 )
-                try:
-                    security_audit = security.begin_audit(
-                        security_assessment,
-                        tool_call_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        session_key=spec.session_key,
-                        turn_id=spec.security_turn_id,
-                    )
-                except AuditUnavailable as exc:
-                    if security_assessment.mutating:
-                        payload = "Error: Security audit is unavailable; modifying operations are blocked."
-                        event = {
-                            "name": tool_call.name,
-                            "status": "error",
-                            "detail": "security audit unavailable",
-                        }
-                        return payload, event, RuntimeError(payload) if spec.fail_on_tool_error else None
-                    logger.error("Security audit unavailable for approved read-only tool: {}", exc)
-                    security_audit = None
+                if not recorded and security_assessment.mutating:
+                    payload = "Error: Security audit is unavailable; modifying operations are blocked."
+                    event = {"name": tool_call.name, "status": "error", "detail": "security audit unavailable"}
+                    return payload, event, RuntimeError(payload) if spec.fail_on_tool_error else None
         if file_edit_trackers and progress_callback is not None:
             await invoke_file_edit_progress(
                 progress_callback,
@@ -2168,7 +2215,7 @@ class AgentRunner:
             )
         try:
             if security is not None:
-                with security.network_context():
+                with security.network_context(security_audit):
                     if tool is not None:
                         result = await tool.execute(**params)
                     else:
@@ -2195,7 +2242,7 @@ class AgentRunner:
                 security.complete_audit(
                     security_audit,
                     result="failed",
-                    details={"error": str(exc)},
+                    details={"error_type": type(exc).__name__},
                 )
             if finance_source is not None:
                 mark_structured_finance_source_attempted(
@@ -2247,10 +2294,14 @@ class AgentRunner:
 
         if isinstance(result, str) and result.startswith("Error"):
             if security is not None:
+                from nanobot.security.audit import tool_audit_outcome
+
+                audit_outcome, audit_details = tool_audit_outcome(tool_call.name, result)
                 security.complete_audit(
                     security_audit,
-                    result="failed",
-                    details={"error": result[:500]},
+                    result=audit_outcome,
+                    decision="block" if audit_outcome == "blocked" else None,
+                    details=audit_details,
                 )
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(
@@ -2327,7 +2378,14 @@ class AgentRunner:
         elif len(detail) > 120:
             detail = detail[:120] + "..."
         if security is not None:
-            security.complete_audit(security_audit, result="succeeded")
+            from nanobot.security.audit import tool_audit_outcome
+
+            outcome, audit_details = tool_audit_outcome(tool_call.name, result)
+            security.complete_audit(
+                security_audit,
+                result=outcome,
+                details=audit_details,
+            )
         return result, {"name": tool_call.name, "status": "ok", "detail": detail}, None
 
     # SSRF is a hard security block at the tool boundary, but the agent turn

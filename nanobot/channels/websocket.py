@@ -62,6 +62,7 @@ from nanobot.utils.media_decode import (
     save_base64_data_url,
 )
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
+from nanobot.webui.expert_team_revisions import ExpertTeamRevisionService
 from nanobot.webui.expert_teams import (
     ASSET_RESEARCH_TEAM_ID,
     EXPERT_TEAM_PENDING_TARGET_KEY,
@@ -441,6 +442,8 @@ class WebSocketChannel(BaseChannel):
         self._conn_default: dict[Any, str] = {}
         self._stop_event: asyncio.Event | None = None
         self._server_task: asyncio.Task[None] | None = None
+        self._mcp_settings_tasks: set[asyncio.Task] = set()
+        self._mcp_probes: dict[tuple[Any, str], asyncio.Task] = {}
 
         self.gateway = gateway
         self._http_router = gateway.http
@@ -459,6 +462,8 @@ class WebSocketChannel(BaseChannel):
         # frames. Keep a compact run projection so status transitions can also
         # be appended to the WebUI journal and survive chat switches/reconnects.
         self._team_runs: dict[tuple[str, str], dict[str, Any]] = {}
+        self._team_revisions = ExpertTeamRevisionService(gateway.state)
+        self._message_dispatch_locks: dict[str, tuple[asyncio.Lock, int]] = {}
 
     # -- Subscription bookkeeping -------------------------------------------
 
@@ -472,6 +477,9 @@ class WebSocketChannel(BaseChannel):
 
     def _cleanup_connection(self, connection: Any) -> None:
         """Remove *connection* from every subscription set; safe to call multiple times."""
+        for (owner, _), task in list(self._mcp_probes.items()):
+            if owner is connection:
+                task.cancel()
         chat_ids = self._conn_chats.pop(connection, set())
         for cid in chat_ids:
             subs = self._subs.get(cid)
@@ -711,11 +719,12 @@ class WebSocketChannel(BaseChannel):
             )
             return fallback, "fallback"
         self.logger.info(
-            "expert-team model route chat={} team={} action={} target={}",
+            "expert-team model route chat={} team={} action={} target={} reason={}",
             chat_id,
             team_id,
             decision.get("action"),
             decision.get("target") or "-",
+            decision.get("reason") or "-",
         )
         return decision, "model"
 
@@ -730,6 +739,7 @@ class WebSocketChannel(BaseChannel):
         resume_state: dict[str, Any] | None = None,
         supplemental_artifacts: list[str] | None = None,
         target: str | None = None,
+        rerun_member_ids: list[str] | None = None,
     ) -> None:
         staged_members = [member for member in members if member.get("phase")]
         first_phase = staged_members[0].get("phase") if staged_members else None
@@ -777,6 +787,7 @@ class WebSocketChannel(BaseChannel):
                 member_ids=graph_member_ids,
                 resume_from=resume_state,
                 supplemental_artifacts=supplemental_artifacts or [],
+                rerun_member_ids=rerun_member_ids or [],
             )
         elif is_bottleneck_graph and set(graph_member_ids) == set(BOTTLENECK_MEMBER_NODES):
             graph_state = new_supply_chain_bottleneck_state(
@@ -794,11 +805,14 @@ class WebSocketChannel(BaseChannel):
             if isinstance(prior_members, dict):
                 for member in normalized_members:
                     prior = prior_members.get(member["id"])
-                    member["status"] = "completed"
+                    member["status"] = "running" if member["id"] in (rerun_member_ids or []) else "completed"
                     member["member_status"] = str(
                         prior.get("status") if isinstance(prior, dict) else "completed"
                     )
-                    member["activity"] = "复用上次角色产物，等待 Team Lead 重新交叉质证"
+                    member["activity"] = (
+                        "正在依据补充资料更新该角色" if member["id"] in (rerun_member_ids or [])
+                        else "复用上次角色产物，保留原始证据状态"
+                    )
                     if isinstance(prior, dict) and prior.get("artifact"):
                         member["artifact"] = str(prior["artifact"])
         initial_stage = (
@@ -832,6 +846,8 @@ class WebSocketChannel(BaseChannel):
             "stage": initial_stage,
             "status": "running",
             "note": (
+                f"局部更新 {len(rerun_member_ids)} 个角色，复用基础资料及其余角色结果"
+                if rerun_member_ids else
                 "已读取上次角色产物和本轮补充资料，主笔正在重新交叉质证与汇总"
                 if resume_state is not None
                 else "Team Lead 正在建立公司基础数据包，完成后启动四位专家"
@@ -927,6 +943,15 @@ class WebSocketChannel(BaseChannel):
             else "running" if stage == "audit"
             else "pending"
         )
+        graph = run.get("graph_state")
+        audit = graph.get("audit") if isinstance(graph, dict) else None
+        audit_warning = (
+            str(audit.get("warning") or "报告已生成，但审校未完成，当前结果仍需复核。")
+            if isinstance(audit, dict) and audit.get("verified") is False
+            else ""
+        )
+        if audit_warning:
+            audit_status = "error"
         steps.extend([
             {
                 "id": "team-lead",
@@ -948,7 +973,8 @@ class WebSocketChannel(BaseChannel):
                 "id": "report-audit",
                 "title": "报告审校与交付",
                 "detail": (
-                    "最终报告已完成审校并交付"
+                    audit_warning if audit_warning
+                    else "最终报告已完成审校并交付"
                     if completed
                     else "报告审校与交付未完成，团队运行已停止"
                     if terminal_step_status is not None
@@ -959,6 +985,7 @@ class WebSocketChannel(BaseChannel):
                 "status": audit_status,
                 "kind": "audit",
                 "stage_key": "audit",
+                **({"warning": audit_warning} if audit_warning else {}),
             },
         ])
         active_step_ids = [
@@ -1125,6 +1152,9 @@ class WebSocketChannel(BaseChannel):
 
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
+        if event == "error":
+            from nanobot.observability.operations import fail_current_operation
+            fail_current_operation("WS_REQUEST_REJECTED")
         payload: dict[str, Any] = {"event": event}
         payload.update(fields)
         raw = json.dumps(payload, ensure_ascii=False)
@@ -1214,7 +1244,12 @@ class WebSocketChannel(BaseChannel):
             connection: ServerConnection,
             request: WsRequest,
         ) -> Any:
-            return await self._dispatch_http(connection, request)
+            response = await self._dispatch_http(connection, request)
+            # The peer may close while an HTTP route awaits disk/worker I/O.
+            # websockets 16 checks the state only before awaiting this callback.
+            if connection.protocol.eof_sent or connection.transport.is_closing():
+                raise asyncio.CancelledError("HTTP peer disconnected before response")
+            return response
 
         async def handler(connection: ServerConnection) -> None:
             await self._connection_loop(connection)
@@ -1422,8 +1457,93 @@ class WebSocketChannel(BaseChannel):
         client_id: str,
         envelope: dict[str, Any],
     ) -> None:
+        from nanobot.observability.operations import operation, operation_context
+        with operation_context(client_action_id=envelope.get("client_action_id"),
+                               request_id=envelope.get("request_id")):
+            with operation("websocket.dispatch", event_type=str(envelope.get("type") or "unknown")):
+                await self._dispatch_observed_envelope(connection, client_id, envelope)
+
+    async def _dispatch_observed_envelope(
+        self, connection: Any, client_id: str, envelope: dict[str, Any],
+    ) -> None:
+        cid = envelope.get("chat_id")
+        if envelope.get("type") != "message" or not _is_valid_chat_id(cid):
+            await self._dispatch_envelope_inner(connection, client_id, envelope)
+            return
+        # Multiple connections may submit to the same conversation. Serialize
+        # admission until its durable turn exists, including revision claims.
+        lock, users = self._message_dispatch_locks.get(cid, (asyncio.Lock(), 0))
+        self._message_dispatch_locks[cid] = (lock, users + 1)
+        try:
+            async with lock:
+                await self._dispatch_envelope_inner(connection, client_id, envelope)
+        finally:
+            remaining = self._message_dispatch_locks[cid][1] - 1
+            if remaining:
+                self._message_dispatch_locks[cid] = (lock, remaining)
+            else:
+                self._message_dispatch_locks.pop(cid, None)
+
+    async def _dispatch_envelope_inner(
+        self,
+        connection: Any,
+        client_id: str,
+        envelope: dict[str, Any],
+    ) -> None:
         """Route one typed inbound WebUI envelope."""
         t = envelope.get("type")
+        if t == "mcp_settings_cancel":
+            request_id = envelope.get("request_id")
+            if isinstance(request_id, str) and self.is_allowed(client_id):
+                task = self._mcp_probes.get((connection, request_id))
+                if task is not None:
+                    task.cancel()
+            return
+        if t == "mcp_settings":
+            request_id = envelope.get("request_id")
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
+                await self._send_event(connection, "error", detail="invalid MCP request id")
+                return
+            if not self.is_allowed(client_id):
+                await self._send_event(connection, "mcp_settings_result", request_id=request_id, error="Unauthorized", status=403)
+                return
+            if len(self._mcp_settings_tasks) >= 8:
+                await self._send_event(connection, "mcp_settings_result", request_id=request_id, error="MCP requests are busy. Try again.", status=429)
+                return
+            probe_key = (connection, request_id)
+            if probe_key in self._mcp_probes:
+                await self._send_event(connection, "mcp_settings_result", request_id=request_id, error="Duplicate MCP request id", status=409)
+                return
+
+            async def handle_mcp_settings():
+                from nanobot.agent.tools.mcp import request_mcp_reload
+                from nanobot.webui.mcp_editor import mcp_editor_action
+                from nanobot.webui.mcp_presets_api import McpPresetError
+
+                try:
+                    values = envelope.get("values", {})
+                    if not isinstance(values, dict):
+                        raise McpPresetError("MCP values must be an object")
+                    result = await mcp_editor_action(
+                        envelope.get("action"), values,
+                        lambda name: request_mcp_reload(self.bus, server_name=name),
+                    )
+                    await self._send_event(connection, "mcp_settings_result", request_id=request_id, result=result)
+                except McpPresetError as exc:
+                    await self._send_event(connection, "mcp_settings_result", request_id=request_id, error=exc.message, status=exc.status)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger.exception("MCP settings request failed")
+                    await self._send_event(connection, "mcp_settings_result", request_id=request_id, error="MCP request failed. Check gateway diagnostics.", status=500)
+
+            task = asyncio.create_task(handle_mcp_settings())
+            self._mcp_settings_tasks.add(task)
+            task.add_done_callback(self._mcp_settings_tasks.discard)
+            if envelope.get("action") == "probe":
+                self._mcp_probes[probe_key] = task
+                task.add_done_callback(lambda _: self._mcp_probes.pop(probe_key, None))
+            return
         if t == "security_approval_response":
             cid = envelope.get("chat_id")
             approval_id = envelope.get("approval_id")
@@ -1557,6 +1677,7 @@ class WebSocketChannel(BaseChannel):
                 scope="metadata",
                 mcp_presets=presets,
             )
+            await self.send_session_updated(cid, scope="metadata", exclude_connection=connection)
             return
         if t == "set_workspace_scope":
             cid = envelope.get("chat_id")
@@ -1631,6 +1752,40 @@ class WebSocketChannel(BaseChannel):
         if t == "voice_stream_cancel":
             await self._voice_streams.cancel(connection, envelope)
             return
+        if t == "expert_team_revision_discard":
+            cid = envelope.get("chat_id")
+            if _is_valid_chat_id(cid) and self.is_allowed(client_id):
+                await asyncio.to_thread(
+                    self._team_revisions.discard, webui_session_key_for_chat_id(cid),
+                    envelope.get("plan_id"),
+                )
+            return
+        if t == "expert_team_revision":
+            cid = envelope.get("chat_id")
+            request_id = envelope.get("request_id")
+            if not _is_valid_chat_id(cid) or not isinstance(request_id, str):
+                await self._send_event(connection, "error", detail="invalid revision request")
+                return
+            try:
+                if not self.is_allowed(client_id):
+                    raise ValueError("当前客户端无权更新研究")
+                session_key = webui_session_key_for_chat_id(cid)
+                if envelope.get("action") == "context":
+                    result = await asyncio.to_thread(
+                        self._team_revisions.context, session_key, envelope.get("run_id"),
+                    )
+                elif envelope.get("action") == "prepare":
+                    result = await asyncio.to_thread(
+                        self._team_revisions.prepare, session_key, envelope,
+                    )
+                else:
+                    raise ValueError("无效的更新操作")
+                await self._send_event(connection, "expert_team_revision_result",
+                                       request_id=request_id, chat_id=cid, result=result)
+            except (ValueError, OSError) as exc:
+                await self._send_event(connection, "expert_team_revision_result",
+                                       request_id=request_id, chat_id=cid, error=str(exc))
+            return
         if t == "message":
             cid = envelope.get("chat_id")
             content = envelope.get("content")
@@ -1696,14 +1851,34 @@ class WebSocketChannel(BaseChannel):
             # Auto-attach on first use so clients can one-shot without a separate attach.
             self._attach(connection, cid)
             await self._hydrate_after_subscribe(cid)
-            team_route, team_route_source = await self._route_expert_team_turn(
-                cid,
-                expert_team,
-                content,
-                has_media=bool(media_paths),
-            )
+            revision_plan = None
+            if "expert_team_revision_plan_id" in envelope:
+                try:
+                    if not self.is_allowed(client_id) or not expert_team or expert_team.get("id") != ASSET_RESEARCH_TEAM_ID:
+                        raise ValueError("局部更新仅适用于当前资产投研团队会话")
+                    revision_plan = await asyncio.to_thread(
+                        self._team_revisions.consume,
+                        webui_session_key_for_chat_id(cid),
+                        envelope["expert_team_revision_plan_id"],
+                        expected_root=scope.project_path,
+                    )
+                except (ValueError, OSError) as exc:
+                    await self._send_event(connection, "error", chat_id=cid,
+                                           detail="expert_team_revision_rejected", reason=str(exc))
+                    return
+                team_route = {"action": "run", "reason": "confirmed_role_revision",
+                              "target": revision_plan["target"],
+                              "previous_run_id": revision_plan["run_id"]}
+                team_route_source = "explicit_revision"
+            else:
+                team_route, team_route_source = await self._route_expert_team_turn(
+                    cid, expert_team, content, has_media=bool(media_paths),
+                )
             resume_state: dict[str, Any] | None = None
             resume_artifacts: list[str] = []
+            if revision_plan:
+                resume_state = revision_plan["source"]["graph_state"]
+                resume_artifacts = [revision_plan["supplement_path"]]
             if team_route["action"] == "resume" and expert_team is not None:
                 prior_run = self.gateway.state.latest_expert_team_resume(
                     session_key=webui_session_key_for_chat_id(cid),
@@ -1757,6 +1932,9 @@ class WebSocketChannel(BaseChannel):
                     }
             is_team_run = team_route["action"] == "run"
             metadata: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
+            from nanobot.observability.operations import valid_id
+            if client_action_id := valid_id(envelope.get("client_action_id")):
+                metadata["client_action_id"] = client_action_id
             if expert_team is not None:
                 metadata[EXPERT_TEAM_TURN_ROUTE_KEY] = team_route
                 metadata[EXPERT_TEAM_TURN_ROUTE_SOURCE_KEY] = team_route_source
@@ -1803,6 +1981,8 @@ class WebSocketChannel(BaseChannel):
                     "artifacts": resume_artifacts,
                     "graph_state": resume_state,
                     "team_id": str(expert_team.get("id") or "") if expert_team else "",
+                    **({"selected_roles": revision_plan["selected_roles"],
+                        "plan_id": revision_plan["plan_id"]} if revision_plan else {}),
                 }
             if is_team_run:
                 metadata["expert_team_run_id"] = uuid.uuid4().hex[:12]
@@ -1815,7 +1995,8 @@ class WebSocketChannel(BaseChannel):
             self._set_expert_team_awaiting_target(
                 cid,
                 expert_team,
-                awaiting=team_route["action"] == "clarify",
+                awaiting=(team_route["action"] == "clarify"
+                          and team_route.get("reason") != "model_route_unavailable"),
             )
             metadata[PROJECT_CONTEXT_METADATA_KEY] = {
                 **binding,
@@ -1846,6 +2027,21 @@ class WebSocketChannel(BaseChannel):
                     "aspect_ratio": aspect_ratio if isinstance(aspect_ratio, str) else None,
                 }
             if metadata.get("webui") is True and self.is_allowed(client_id):
+                if envelope.get("presentation") is not None:
+                    from nanobot.presentations import PresentationError
+                    try:
+                        if expert_team:
+                            raise PresentationError("演示文稿需在普通会话中制作")
+                        metadata["presentation"] = await asyncio.to_thread(
+                            self.gateway.http.presentations.bind,
+                            envelope["presentation"],
+                            session_key=webui_session_key_for_chat_id(cid),
+                            project_root=scope.project_path or self.gateway.http.presentations.workspace,
+                            title=content,
+                        )
+                    except (PresentationError, OSError) as exc:
+                        await self._send_event(connection, "error", chat_id=cid, detail=str(exc))
+                        return
                 self._transcripts.append_user_message(
                     cid,
                     content,
@@ -1872,6 +2068,7 @@ class WebSocketChannel(BaseChannel):
                         *(media_paths or []),
                     ] if resume_state is not None else None,
                     target=str(team_route.get("target") or "") or None,
+                    rerun_member_ids=revision_plan["selected_roles"] if revision_plan else None,
                 )
                 await self._send_event(
                     connection,
@@ -1962,6 +2159,12 @@ class WebSocketChannel(BaseChannel):
     # -- Outbound WebSocket events -----------------------------------------
 
     async def stop(self) -> None:
+        tasks = list(self._mcp_settings_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._mcp_settings_tasks.clear()
         if not self._running:
             return
         self._running = False
@@ -2933,6 +3136,9 @@ class WebSocketChannel(BaseChannel):
             "snapshot_revision": snapshot_revision,
             "turn": turn,
         }
+        from nanobot.observability.operations import valid_id
+        if action_id := valid_id((metadata or {}).get("client_action_id")):
+            body["client_action_id"] = action_id
         persisted_event = (metadata or {}).get("_canonical_event")
         if isinstance(persisted_event, dict):
             for field in (
@@ -3000,6 +3206,9 @@ class WebSocketChannel(BaseChannel):
             "snapshot_revision": snapshot_revision,
             "turn": enriched_turn,
         }
+        from nanobot.observability.operations import valid_id
+        if action_id := valid_id((metadata or {}).get("client_action_id")):
+            body["client_action_id"] = action_id
         persisted_event = (metadata or {}).get("_canonical_event")
         if isinstance(persisted_event, dict):
             for field in (
@@ -3097,9 +3306,15 @@ class WebSocketChannel(BaseChannel):
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" goal_status ")
 
-    async def send_session_updated(self, chat_id: str, *, scope: str | None = None) -> None:
+    async def send_session_updated(
+        self,
+        chat_id: str,
+        *,
+        scope: str | None = None,
+        exclude_connection: ServerConnection | None = None,
+    ) -> None:
         """Notify WebUI clients that a session row should refresh."""
-        conns = list(self._conn_chats)
+        conns = [conn for conn in self._conn_chats if conn is not exclude_connection]
         if not conns:
             return
         body: dict[str, Any] = {"event": "session_updated", "chat_id": chat_id}

@@ -247,10 +247,13 @@ def _filter_disallowed_skill_history(
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return persisted kwargs for turn-attached capabilities."""
+    from nanobot.presentations import presentation_selection
+    presentation = metadata.get("presentation") if metadata else None
     return (
         cli_app_utils.session_extra(metadata)
         | mcp_tools.session_extra(metadata)
         | interactive_prompt_answer_session_extra(dict(metadata) if metadata else None)
+        | ({"presentation": presentation_selection(presentation)} if isinstance(presentation, dict) else {})
     )
 
 
@@ -631,7 +634,9 @@ class ContextBuilder:
         )
         disallowed_markers = self._disallowed_workspace_skill_markers(allowed_workspace_skills)
         history = _filter_disallowed_skill_history(history, disallowed_markers)
+        from nanobot.presentations import presentation_runtime_lines
         extra = [
+            *presentation_runtime_lines(msg_metadata),
             *goal_state_runtime_lines(session_metadata),
             *expert_team_resume_runtime_lines(
                 msg_metadata if isinstance(msg_metadata, Mapping) else None

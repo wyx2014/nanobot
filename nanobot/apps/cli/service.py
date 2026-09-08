@@ -20,6 +20,7 @@ import httpx
 
 from nanobot.apps.protocol import app_manifest, compact_dict
 from nanobot.config.paths import get_runtime_subdir
+from nanobot.security.audit import AuditedToolResult
 from nanobot.security.workspace_policy import is_path_within
 
 CLI_ANYTHING_REGISTRY_URL = "https://hkuds.github.io/CLI-Anything/registry.json"
@@ -1345,7 +1346,9 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                 },
             )
         except subprocess.TimeoutExpired:
-            return f"CLI app '{name}' timed out after {effective_timeout}s"
+            return AuditedToolResult(
+                f"CLI app '{name}' timed out after {effective_timeout}s", result="timed_out",
+            )
         output = [
             f"CLI app '{name}' exited {result.returncode}.",
             f"Command: {entry} {' '.join(shlex.quote(arg) for arg in clean_args)}".rstrip(),
@@ -1365,4 +1368,8 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                     "\nTo show a preview in WebUI, reference a raster artifact with Markdown "
                     "using its workspace-relative path, for example `![diagram](diagram.png)`."
                 )
-        return _truncate("\n".join(output))
+        return AuditedToolResult(
+            _truncate("\n".join(output)),
+            result="succeeded" if result.returncode == 0 else "failed",
+            exit_code=result.returncode, working_directory=str(cwd),
+        )

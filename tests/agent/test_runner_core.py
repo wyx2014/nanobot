@@ -16,6 +16,106 @@ _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("responses", "expected", "reason"), [
+    ([LLMResponse(content="complete")], "complete", "completed"),
+    ([LLMResponse(content="# Report\n\n| Cash | 1", finish_reason="length"),
+      LLMResponse(content="00 |\n\n## Risks\n", finish_reason="length"),
+      LLMResponse(content="Evidence and conclusion.")],
+     "# Report\n\n| Cash | 100 |\n\n## Risks\nEvidence and conclusion.", "completed"),
+    ([LLMResponse(content=part, finish_reason="length") for part in "ABCD"],
+     "ABCD", "max_iterations"),
+    ([LLMResponse(content="partial", finish_reason="length"),
+      LLMResponse(content="provider unavailable", finish_reason="error")],
+     "provider unavailable", "error"),
+])
+async def test_runner_length_recovery_preserves_complete_answer(responses, expected, reason):
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(side_effect=responses)
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "Write the report"}],
+        tools=tools, model="test-model", max_iterations=10,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+    assert result.final_content == expected
+    assert result.stop_reason == reason
+    assert provider.chat_with_retry.await_count == len(responses)
+
+
+@pytest.mark.asyncio
+async def test_runner_length_recovery_does_not_prepend_abandoned_draft_after_tools():
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="draft", finish_reason="length"),
+        LLMResponse(content="Checking evidence", tool_calls=[
+            ToolCallRequest(id="read", name="read_file", arguments={"path": "data.md"}),
+        ]),
+        LLMResponse(content="Revised report"),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="evidence")
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[], tools=tools, model="test-model", max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+    assert result.final_content == "Revised report"
+    assert result.stop_reason == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finalize", [True, False])
+async def test_runner_length_recovery_returns_partial_when_budget_ends(finalize):
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Saved prefix", finish_reason="length"))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[], tools=tools, model="test-model", max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS, finalize_on_max_iterations=finalize,
+    ))
+    assert result.final_content == "Saved prefix"
+    assert result.stop_reason == "max_iterations"
+    assert provider.chat_with_retry.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_length_recovery_resets_when_user_changes_task():
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        *[LLMResponse(content="old", finish_reason="length") for _ in range(4)],
+        LLMResponse(content="new answer"),
+    ])
+    sent = False
+
+    async def inject():
+        nonlocal sent
+        if not sent and provider.chat_with_retry.await_count == 4:
+            sent = True
+            return [{"role": "user", "content": "Now answer a different question"}]
+        return []
+
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[], tools=tools, model="test-model", max_iterations=10,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS, injection_callback=inject,
+    ))
+    assert sent and result.had_injections
+    assert result.final_content == "new answer"
+    assert result.stop_reason == "completed"
+
+
+@pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
     from nanobot.agent.runner import AgentRunner, AgentRunSpec
 

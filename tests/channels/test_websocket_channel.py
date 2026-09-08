@@ -407,6 +407,31 @@ async def test_token_issue_route_requires_secret_when_static_token_configured(bu
 
 
 @pytest.mark.asyncio
+async def test_presentation_selection_is_bound_and_replayed(bus: MagicMock, tmp_path: Path) -> None:
+    gateway = _basic_handler(bus, workspace_path=tmp_path)
+    channel = WebSocketChannel(gateway.http.config, bus, gateway=gateway)
+    conn = MagicMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+    selection = {"template_id": "taiping-standard", "document_id": "document-001", "sample_first": True}
+    await channel._dispatch_envelope(conn, "webui-client", {
+        "type": "message", "chat_id": "presentation-chat", "content": "生成年度报告样稿",
+        "webui": True, "presentation": selection,
+    })
+    message = bus.publish_inbound.await_args.args[0]
+    assert message.metadata["presentation"]["template_id"] == "taiping-standard"
+    assert Path(message.metadata["presentation"]["project_path"]).is_dir()
+    lines = read_transcript_lines("websocket:presentation-chat")
+    assert lines[-1]["presentation"]["document_id"] == "document-001"
+    assert "project_path" not in lines[-1]["presentation"]
+    bus.publish_inbound.reset_mock()
+    await channel._dispatch_envelope(conn, "webui-client", {
+        "type": "message", "chat_id": "other-chat", "content": "修改报告",
+        "webui": True, "presentation": selection,
+    })
+    bus.publish_inbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> None:
     from nanobot.webui.transcript import read_transcript_lines
 
@@ -423,6 +448,7 @@ async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> 
             "content": "hello",
             "webui": True,
             "turn_id": "turn-1",
+            "client_action_id": "action-ui-message",
         },
     )
 
@@ -431,6 +457,7 @@ async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> 
     assert msg.chat_id == "chat-1"
     assert msg.metadata["webui"] is True
     assert msg.metadata["webui_turn_id"] == "turn-1"
+    assert msg.metadata["client_action_id"] == "action-ui-message"
     assert msg.metadata["_wants_stream"] is True
     lines = read_transcript_lines("websocket:chat-1")
     assert len(lines) == 1
@@ -774,6 +801,9 @@ async def test_webui_clear_mcp_binding_uses_empty_tombstone(
         ),
     )
     conn = AsyncMock()
+    other_conn = AsyncMock()
+    channel._attach(conn, "beer-research")
+    channel._attach(other_conn, "beer-research")
 
     await channel._dispatch_envelope(
         conn,
@@ -794,6 +824,12 @@ async def test_webui_clear_mcp_binding_uses_empty_tombstone(
     }
     saved = sessions.read_session_file("websocket:beer-research")
     assert saved["metadata"]["mcp_presets"] == []
+    assert conn.send.await_count == 1
+    assert other_conn.send.await_count == 1
+    other_payload = json.loads(other_conn.send.await_args.args[0])
+    assert other_payload["event"] == "session_updated"
+    assert other_payload["chat_id"] == "beer-research"
+    assert other_payload["mcp_presets"] == []
 
     await channel._dispatch_envelope(
         conn,
@@ -879,6 +915,72 @@ async def test_expert_team_auto_attaches_configured_mcp_preset(
     assert msg.metadata["_expert_team_turn_route_source"] == "model"
     assert msg.metadata["expert_team_run_id"]
     assert "_expert_team_turn_suppressed" not in msg.metadata
+
+
+@pytest.mark.asyncio
+async def test_named_anji_request_recovers_route_and_receives_fixed_team_and_sources(bus, monkeypatch):
+    from nanobot.providers.base import LLMResponse
+    from nanobot.webui.expert_teams import classify_expert_team_turn_with_model
+
+    members = ["business-analyst", "financial-analyst", "industry-researcher", "risk-assessor"]
+    sources = ["hexin-ifind-ds-stock-mcp", "juyuan", "caihui_mcp", "anysearch"]
+    team = {
+        "id": "asset-research-team", "name": "资产投研团队",
+        "members": [{"id": name, "name": name} for name in members],
+        "mcp_presets": [{"name": name, "configured": True} for name in sources],
+    }
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content='{"action":"clarify","reason":"stock code missing"}'),
+        LLMResponse(content='{"action":"run","target":"安集科技","reason":"single named stock"}'),
+    ])
+
+    async def router(**kwargs):
+        return await classify_expert_team_turn_with_model(provider=provider, model="test", **kwargs)
+
+    monkeypatch.setattr("nanobot.channels.websocket.normalize_expert_team_binding", lambda _: team)
+    monkeypatch.setattr("nanobot.channels.websocket.expert_team_mcp_attachments", lambda _: team["mcp_presets"])
+    monkeypatch.setattr("nanobot.channels.websocket.normalize_mcp_preset_mentions", lambda rows: rows or [])
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"}, bus,
+        gateway=_basic_handler(bus, expert_team_turn_router=router),
+    )
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+    await channel._dispatch_envelope(conn, "webui-client", {
+        "type": "message", "chat_id": "anji-regression", "content": "帮我分析下 安集科技 A股",
+        "expert_team": {"id": "asset-research-team"}, "webui": True,
+    })
+    msg = bus.publish_inbound.await_args.args[0]
+    assert msg.metadata["_expert_team_turn_route"]["target"] == "安集科技"
+    assert msg.metadata["expert_team_run_id"]
+    assert "_expert_team_turn_suppressed" not in msg.metadata
+    assert [item["name"] for item in msg.metadata["mcp_presets"]] == sources
+    events = [json.loads(call.args[0]) for call in conn.send.await_args_list]
+    started = next(item for item in events if item.get("event") == "team_run_started")
+    assert [member["id"] for member in started["members"]] == members
+
+
+@pytest.mark.asyncio
+async def test_team_router_unavailable_never_silently_selects_general_research(bus, monkeypatch):
+    team = {"id": "asset-research-team", "name": "资产投研团队", "members": [], "mcp_presets": []}
+    monkeypatch.setattr("nanobot.channels.websocket.normalize_expert_team_binding", lambda _: team)
+    channel = WebSocketChannel(
+        {"enabled": True, "allowFrom": ["*"], "host": "127.0.0.1"}, bus,
+        gateway=_basic_handler(bus, expert_team_turn_router=AsyncMock(return_value=None)),
+    )
+    conn = AsyncMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+    await channel._dispatch_envelope(conn, "webui-client", {
+        "type": "message", "chat_id": "anji-unavailable", "content": "帮我分析下 安集科技 A股",
+        "expert_team": {"id": "asset-research-team"}, "webui": True,
+    })
+    msg = bus.publish_inbound.await_args.args[0]
+    assert msg.metadata["_expert_team_turn_route"] == {
+        "action": "clarify", "reason": "model_route_unavailable",
+    }
+    assert "expert_team_run_id" not in msg.metadata
+    assert not any(json.loads(call.args[0]).get("event") == "team_run_started" for call in conn.send.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -2937,6 +3039,34 @@ async def test_runtime_owned_asset_graph_rejects_stale_checkpoint_and_early_comp
         if payload.get("event") == "team_run_completed"
     )
     assert completion["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_failed_audit_is_preserved_in_team_progress() -> None:
+    from nanobot.graph.workflows.asset_research import MEMBER_NODES, advance_asset_research_graph
+
+    bus = MagicMock()
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=_basic_handler(bus))
+    channel._start_team_run_projection(
+        "audit-chat", run_id="audit-run", team_id="asset-research-team",
+        team_name="Asset research", members=[{"id": key, "name": key} for key in MEMBER_NODES],
+    )
+    graph = channel._team_runs[("audit-chat", "audit-run")]["graph_state"]
+    graph = advance_asset_research_graph(graph, "data_package_ready")
+    for key in MEMBER_NODES:
+        graph = advance_asset_research_graph(graph, "member_updated", {"id": key, "status": "completed"})
+    graph = advance_asset_research_graph(graph, "report_written", {"artifact": "reports/report.html"})
+    graph = advance_asset_research_graph(graph, "audit_completed", {"verified": False, "warning": "Audit incomplete"})
+    channel._transcripts.append = MagicMock()
+    await channel.send_team_graph_updated("audit-chat", {
+        "run_id": "audit-run", "team_id": "asset-research-team", "event": "audit_completed", "state": graph,
+    })
+    progress = channel._transcripts.append.call_args.args[1]["agent_ui"]
+    audit = next(step for step in progress["steps"] if step["id"] == "report-audit")
+    assert audit["status"] == "error"
+    assert audit["warning"] == audit["detail"] == "Audit incomplete"
+    assert progress["status"] == "completed"
+    assert progress["graph_state"]["status"] == "completed_with_warnings"
 
 
 @pytest.mark.asyncio

@@ -134,10 +134,16 @@ def _reduce_report_audit(
     for key, value in dict(payload.get("artifacts") or {}).items():
         if str(value).strip():
             artifacts[str(key)] = str(value)
-    status = "completed_with_warnings" if state.get("degraded") else "completed"
+    verified = payload.get("verified", True) is True
+    degraded = bool(state.get("degraded")) or not verified
+    status = "completed_with_warnings" if degraded else "completed"
     return NodeResult(
-        writes={"artifacts": artifacts, "status": status},
+        writes={
+            "artifacts": artifacts, "status": status, "degraded": degraded,
+            "audit": {"verified": verified, "warning": str(payload.get("warning") or "")},
+        },
         settled=True,
+        status="completed" if verified else "failed",
     )
 
 

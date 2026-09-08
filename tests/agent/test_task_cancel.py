@@ -158,14 +158,27 @@ class TestDispatch:
         await loop._dispatch(msg)
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert out.content == "hi"
-        loop.subagents.cancel_by_session.assert_awaited_once_with("test:c1")
+        loop.subagents.cancel_by_session.assert_awaited_with("test:c1")
 
     @pytest.mark.asyncio
     async def test_terminal_turn_cleans_up_orphaned_subagents(self):
         from nanobot.bus.events import InboundMessage, OutboundMessage
 
         loop, bus = _make_loop()
-        loop.subagents.cancel_by_session = AsyncMock(return_value=4)
+        remaining = {"count": 4}
+
+        async def cancel_subagents(session_key):
+            assert session_key == "test:c1"
+            count, remaining["count"] = remaining["count"], 0
+            return count
+
+        loop.subagents.cancel_by_session = AsyncMock(side_effect=cancel_subagents)
+
+        async def commit_answer(_msg, _session_key, response):
+            assert remaining["count"] == 0
+            return response
+
+        loop._commit_runtime_final_answer = AsyncMock(side_effect=commit_answer)
         loop._process_message = AsyncMock(
             return_value=OutboundMessage(channel="test", chat_id="c1", content="finished")
         )
@@ -175,7 +188,8 @@ class TestDispatch:
 
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert out.content == "finished"
-        loop.subagents.cancel_by_session.assert_awaited_once_with("test:c1")
+        loop.subagents.cancel_by_session.assert_awaited_with("test:c1")
+        loop._commit_runtime_final_answer.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_dispatch_streaming_preserves_message_metadata(self):

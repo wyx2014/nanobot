@@ -55,6 +55,7 @@ def _reduce_data_package(
         return None
     package = {
         "status": "completed",
+        "degraded": payload.get("degraded") is True,
         **({"content": str(payload["content"])} if payload.get("content") else {}),
         **({"artifact": str(payload["artifact"])} if payload.get("artifact") else {}),
     }
@@ -135,10 +136,16 @@ def _reduce_report_audit(
     for key, value in dict(payload.get("artifacts") or {}).items():
         if str(value).strip():
             artifacts[str(key)] = str(value)
-    status = "completed_with_warnings" if state.get("degraded") else "completed"
+    verified = payload.get("verified", True) is True
+    degraded = bool(state.get("degraded")) or not verified
+    status = "completed_with_warnings" if degraded else "completed"
     return NodeResult(
-        writes={"artifacts": artifacts, "status": status},
+        writes={
+            "artifacts": artifacts, "status": status, "degraded": degraded,
+            "audit": {"verified": verified, "warning": str(payload.get("warning") or "")},
+        },
         settled=True,
+        status="completed" if verified else "failed",
     )
 
 
@@ -190,6 +197,7 @@ def new_asset_research_state(
     member_ids: Iterable[str],
     resume_from: Mapping[str, Any] | None = None,
     supplemental_artifacts: Iterable[str] = (),
+    rerun_member_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Create a fresh blackboard, optionally resuming at Team Lead synthesis."""
 
@@ -200,6 +208,9 @@ def new_asset_research_state(
         )
 
     resumed = isinstance(resume_from, Mapping)
+    selected = tuple(dict.fromkeys(rerun_member_ids))
+    if any(member not in MEMBER_NODES for member in selected) or (selected and not resumed):
+        raise ValueError("role revision requires a prior run and valid member ids")
     prior_members = resume_from.get("members") if resumed else None
     members: dict[str, dict[str, Any]] = {}
     for member_id in MEMBER_NODES:
@@ -210,13 +221,19 @@ def new_asset_research_state(
             else {}
         )
         members[member_id] = {
-            "status": "completed" if resumed else "pending",
+            "status": ("running" if member_id in selected else
+                       str(prior.get("status") or "completed") if resumed else "pending"),
+            "reused": resumed and member_id not in selected,
             **({"artifact": str(prior["artifact"])} if prior.get("artifact") else {}),
             **({"content": str(prior["content"])} if prior.get("content") else {}),
         }
+        if member_id in selected:
+            members[member_id].pop("content", None)
+            if prior.get("artifact"):
+                members[member_id]["previous_artifact"] = str(prior["artifact"])
 
-    settled_nodes = [DATA_PACKAGE, *MEMBER_NODES] if resumed else []
-    active_nodes = [TEAM_LEAD] if resumed else [DATA_PACKAGE]
+    settled_nodes = [DATA_PACKAGE, *(m for m in MEMBER_NODES if m not in selected)] if resumed else []
+    active_nodes = [m for m in MEMBER_NODES if m in selected] or ([TEAM_LEAD] if resumed else [DATA_PACKAGE])
     node_states = {
         name: {
             "status": (
@@ -231,7 +248,7 @@ def new_asset_research_state(
         "schema_version": 2,
         "workflow": ASSET_RESEARCH_GRAPH.name,
         "run_id": run_id,
-        "node": SYNTHESIS if resumed else PREPARATION,
+        "node": MEMBERS if selected else SYNTHESIS if resumed else PREPARATION,
         "active_nodes": active_nodes,
         "settled_nodes": settled_nodes,
         "node_states": node_states,
@@ -239,12 +256,15 @@ def new_asset_research_state(
         "checkpoint_revision": 0,
         "status": "running",
         "degraded": bool(resume_from.get("degraded")) if resumed else False,
-        "data_package": {"status": "completed" if resumed else "running"},
+        "data_package": deepcopy(resume_from.get("data_package") or {"status": "completed"}) if resumed else {"status": "running"},
         "members": members,
         "artifacts": dict(resume_from.get("artifacts") or {}) if resumed else {},
-        "user_supplements": [
-            str(item) for item in supplemental_artifacts if str(item).strip()
-        ],
+        "user_supplements": list(dict.fromkeys(
+            str(item) for item in [
+                *(resume_from.get("user_supplements") or [] if resumed else []),
+                *supplemental_artifacts,
+            ] if str(item).strip()
+        )),
         "source_policy": {
             "cross_validate": list(CORE_STRUCTURED_SOURCES),
             "fallback": ["anysearch", "duckduckgo"],
@@ -254,6 +274,16 @@ def new_asset_research_state(
     }
     if resumed:
         state["resume_from_run_id"] = str(resume_from.get("run_id") or "")
+        state["report_version"] = int(resume_from.get("report_version") or 1) + 1
+        state["previous_report"] = (resume_from.get("artifacts") or {}).get("report")
+        state["revised_members"] = list(selected)
+        if selected:
+            state["degraded"] = bool(state["data_package"].get("degraded")) or any(
+                member["status"] in {"failed", "cancelled"}
+                for member in members.values()
+            )
+    else:
+        state["report_version"] = 1
     return state
 
 

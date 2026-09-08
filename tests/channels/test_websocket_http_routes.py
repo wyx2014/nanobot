@@ -43,6 +43,62 @@ def _free_port() -> int:
     raise RuntimeError("could not find a free localhost port")
 
 
+@pytest.mark.asyncio
+async def test_presentation_routes_require_auth_and_filter_conversation(bus, tmp_path, monkeypatch):
+    handler = _make_handler({"enabled": True}, bus, workspace_path=tmp_path)
+    monkeypatch.setattr(handler.http.presentations, "previews", lambda _: ["cover", "page2", "page3"])
+    connection = MagicMock()
+    connection.remote_address = ("127.0.0.1", 12345)
+    denied = await handler.http.dispatch(connection, Request("/api/presentations/templates", Headers()))
+    assert denied.status_code == 401
+    denied_preview = await handler.http.dispatch(connection, Request("/api/presentations/previews?template_id=kimi-work", Headers()))
+    assert denied_preview.status_code == 401
+    bootstrap = await handler.http.dispatch(connection, Request("/webui/bootstrap", Headers()))
+    headers = Headers({"Authorization": f"Bearer {json.loads(bootstrap.body)['token']}"})
+    headers["X-Request-Id"] = "http-presentation-catalog"
+    headers["X-Client-Action-Id"] = "action-presentation-picker"
+    removed_source = await handler.http.dispatch(connection, Request("/api/presentations/source", headers))
+    assert removed_source.status_code == 404
+    catalog = await handler.http.dispatch(connection, Request("/api/presentations/templates", headers))
+    assert catalog.status_code == 200
+    assert catalog.headers["X-Request-Id"] == "http-presentation-catalog"
+    assert len(json.loads(catalog.body)["templates"]) == 7
+    assert all(template["previews"] == ["cover"] for template in json.loads(catalog.body)["templates"])
+    preview = await handler.http.dispatch(connection, Request("/api/presentations/previews?template_id=kimi-work", headers))
+    assert json.loads(preview.body)["previews"] == ["cover", "page2", "page3"]
+    invalid_preview = await handler.http.dispatch(connection, Request("/api/presentations/previews?template_id=unknown", headers))
+    assert invalid_preview.status_code == 400
+    handler.http.presentations.bind({"template_id": "taiping-standard", "document_id": "document-001"},
+                                    session_key="websocket:chat-a", project_root=tmp_path, title="Annual report")
+    for chat, count in (("chat-a", 1), ("other", 0)):
+        result = await handler.http.dispatch(connection, Request(f"/api/presentations/documents?chat_id={chat}", headers))
+        assert result.status_code == 200
+        assert len(json.loads(result.body)["documents"]) == count
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_export_requires_auth_and_valid_scope(bus, tmp_path):
+    handler = _make_handler({"enabled": True}, bus, workspace_path=tmp_path)
+    connection = MagicMock()
+    connection.remote_address = ("127.0.0.1", 12345)
+    now = int(time.time() * 1000)
+    route = f"/api/diagnostics/export?start_ms={now - 60000}&end_ms={now}"
+    denied = await handler.http.dispatch(connection, Request(route, Headers()))
+    assert denied.status_code == 401
+    bootstrap = await handler.http.dispatch(connection, Request("/webui/bootstrap", Headers()))
+    headers = Headers({"Authorization": f"Bearer {json.loads(bootstrap.body)['token']}"})
+    result = await handler.http.dispatch(connection, Request(route, headers))
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["schema_version"] == 1
+    assert "trace_spans" in payload["tables"]
+    assert "captured_at" in payload["snapshot"]
+    invalid = await handler.http.dispatch(connection, Request("/api/diagnostics/export?start_ms=0&end_ms=9999999999999", headers))
+    assert invalid.status_code == 400
+    missing = await handler.http.dispatch(connection, Request(route + "&session_id=missing", headers))
+    assert missing.status_code == 404
+
+
 def _make_handler(
     cfg: dict[str, Any] | WebSocketConfig,
     bus: Any,
@@ -156,7 +212,7 @@ async def test_security_policy_updates_over_gateway_compatible_get(
 
 
 @pytest.mark.asyncio
-async def test_security_audit_hides_internal_and_targetless_records(
+async def test_security_audit_includes_legacy_mcp_and_targetless_records(
     bus: MagicMock,
     tmp_path: Path,
 ) -> None:
@@ -200,8 +256,21 @@ async def test_security_audit_hides_internal_and_targetless_records(
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["total"] == 1
-        assert [event["id"] for event in payload["events"]] == [visible_id]
+        assert payload["total"] == 3
+        assert payload["events"][0]["id"] == visible_id
+        assert payload["events"][1]["category"] == "network"
+        assert payload["events"][1]["action"] == "mcp_call"
+        assert payload["events"][2]["target"] is None
+        export = await _http_get(
+            f"http://127.0.0.1:{port}/api/security/audit/export",
+            headers={"Authorization": f"Bearer {boot.json()['token']}"},
+        )
+        assert export.status_code == 200
+        assert len(export.text.splitlines()) == 3
+        [admin] = logs.query_security_events(category="settings")
+        assert admin.action == "export_audit"
+        assert admin.details["exported_count"] == 3
+        assert admin.details["export_stage"] == "generated"
     finally:
         await channel.stop()
         await server_task

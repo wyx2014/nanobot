@@ -240,6 +240,8 @@ class GatewayHTTPHandler:
         self.tokens = tokens
         self.media = media
         self.workspaces = workspaces
+        from nanobot.presentations import PresentationService
+        self.presentations = PresentationService(skills_workspace_path)
         self.state = state_store
         self.logs = logs_store
         self.traces = trace_store
@@ -253,6 +255,7 @@ class GatewayHTTPHandler:
         self.thread_runtime_registry = thread_runtime_registry
         self._log = log
         self._runtime_surface = runtime_surface
+        self._artifact_index_tasks: dict[str, asyncio.Task[dict[str, int | bool]]] = {}
 
         from nanobot.security.protection import get_security_service
 
@@ -302,12 +305,31 @@ class GatewayHTTPHandler:
 
     async def dispatch(self, connection: Any, request: WsRequest) -> Any | None:
         """Route an HTTP request. Returns Response or None."""
+        import uuid
+
+        from nanobot.observability.operations import (
+            operation,
+            operation_context,
+            safe_route,
+            valid_id,
+        )
+
         got, _ = _parse_request_path(request.path)
         started = time.perf_counter()
         response: Any | None = None
 
         try:
-            response = await self._dispatch_resolved(connection, request, got)
+            if not (got.startswith('/api/') or got == '/webui/bootstrap'):
+                return await self._dispatch_resolved(connection, request, got)
+            request_id = valid_id(request.headers.get('X-Request-Id')) or 'http_' + uuid.uuid4().hex
+            with operation_context(request_id=request_id, client_action_id=request.headers.get('X-Client-Action-Id')):
+                with operation('http.request', route=safe_route(got), method=str(getattr(request, 'method', 'GET'))) as observed:
+                    response = await self._dispatch_resolved(connection, request, got)
+                    if response is not None:
+                        observed.details['status_code'] = response.status_code
+                        if response.status_code >= 400:
+                            observed.fail(f'HTTP_{response.status_code}')
+                        response.headers['X-Request-Id'] = request_id
             return response
         finally:
             self._log_slow_http(got, response, started)
@@ -327,6 +349,29 @@ class GatewayHTTPHandler:
         # Bootstrap
         if got == "/webui/bootstrap":
             return self._handle_bootstrap(connection, request)
+
+        if got.startswith("/api/presentations/"):
+            if not self.check_api_token(request):
+                return _http_error(401, "Unauthorized")
+            from nanobot.presentations import PresentationError, template_by_id
+            try:
+                if got == "/api/presentations/templates":
+                    return _http_json_response(await asyncio.to_thread(self.presentations.catalog))
+                if got == "/api/presentations/previews":
+                    _, query = _parse_request_path(request.path)
+                    template = template_by_id((query.get("template_id") or [""])[0])
+                    return _http_json_response({"previews": await asyncio.to_thread(
+                        self.presentations.previews, template
+                    )})
+                if got == "/api/presentations/documents":
+                    _, query = _parse_request_path(request.path)
+                    chat_id = (query.get("chat_id") or [""])[0]
+                    return _http_json_response({"documents": await asyncio.to_thread(
+                        self.presentations.list_documents, f"websocket:{chat_id}"
+                    )})
+            except (PresentationError, ValueError, OSError) as exc:
+                return _http_error(400, str(exc))
+            return _http_error(404, "Presentation route not found")
 
         # Settings routes (delegated)
         response = await self.settings_routes.dispatch(request, got)
@@ -529,7 +574,10 @@ class GatewayHTTPHandler:
 
         m = re.match(r"^/api/artifacts/([A-Za-z0-9_-]+)$", got)
         if m:
-            return self._handle_registered_artifact_get(request, m.group(1))
+            return await self._run_blocking_stage(
+                "artifact", "artifact_get", self._handle_registered_artifact_get,
+                request, m.group(1),
+            )
 
         m = re.match(r"^/api/sessions/([^/]+)/artifacts/content$", got)
         if m:
@@ -541,7 +589,9 @@ class GatewayHTTPHandler:
 
         m = re.match(r"^/api/sessions/([^/]+)/messages$", got)
         if m:
-            return self._handle_session_messages(request, m.group(1))
+            return await self._run_blocking_stage(
+                "messages", "payload_build", self._handle_session_messages, request, m.group(1),
+            )
 
         m = re.match(r"^/api/sessions/([^/]+)/thread$", got)
         if m:
@@ -553,7 +603,9 @@ class GatewayHTTPHandler:
 
         m = re.match(r"^/api/sessions/([^/]+)/turns/([^/]+)/plan$", got)
         if m:
-            return self._handle_turn_plan(request, m.group(1), m.group(2))
+            return await self._run_blocking_stage(
+                "plan", "plan_query", self._handle_turn_plan, request, m.group(1), m.group(2),
+            )
 
         m = re.match(r"^/api/sessions/([^/]+)/runtime-diagnostics$", got)
         if m:
@@ -561,11 +613,15 @@ class GatewayHTTPHandler:
 
         m = re.match(r"^/api/sessions/([^/]+)/webui-thread$", got)
         if m:
-            return self._handle_webui_thread_get(request, m.group(1))
+            return await self._run_blocking_stage(
+                "webui_thread", "payload_build", self._handle_webui_thread_get, request, m.group(1),
+            )
 
         m = re.match(r"^/api/sessions/([^/]+)/file-preview$", got)
         if m:
-            return self._handle_file_preview(request, m.group(1))
+            return await self._run_blocking_stage(
+                "file_preview", "payload_build", self._handle_file_preview, request, m.group(1),
+            )
 
         m = re.match(r"^/api/sessions/([^/]+)/automations$", got)
         if m:
@@ -606,6 +662,8 @@ class GatewayHTTPHandler:
         self,
         request: WsRequest,
         key: str,
+        *,
+        include_messages: bool = True,
     ) -> tuple[str, dict[str, Any]] | Response:
         """Resolve an authenticated, disk-backed WebUI session route.
 
@@ -635,7 +693,12 @@ class GatewayHTTPHandler:
             state_session is not None and state_session.status == "archived"
         ):
             return _http_error(410, "session is archived")
-        session_data = self.session_manager.read_session_file(decoded_key)
+        reader = (
+            self.session_manager.read_session_file
+            if include_messages
+            else self.session_manager.read_session_metadata
+        )
+        session_data = reader(decoded_key)
         if not isinstance(session_data, dict):
             return _http_error(404, "session not found")
         state_project = (
@@ -684,23 +747,18 @@ class GatewayHTTPHandler:
     ) -> Response:
         """Return the single, session-partitioned Thread Resource read model."""
         route = "thread"
-        stage_started = time.perf_counter()
-        context = self._session_route_context(request, key)
-        self._log_slow_stage(route, "session_route_context", stage_started)
+        context = await self._run_blocking_stage(
+            route, "session_route_context", self._session_route_context, request, key,
+        )
         if isinstance(context, Response):
             return context
         session_key, session_data = context
-        stage_started = time.perf_counter()
-        scope = self.workspaces.scope_for_session_key(session_key)
         try:
-            state_session = self._ensure_state_session(
-                session_key,
-                session_data,
-                scope,
+            scope, state_session = await self._run_blocking_stage(
+                route, "state_session_bind", self._bind_session_read, session_key, session_data,
             )
         except SessionProjectMismatch:
             return _http_error(409, "session_project_mismatch")
-        self._log_slow_stage(route, "state_session_bind", stage_started)
 
         try:
             await self._run_blocking_stage(
@@ -715,7 +773,9 @@ class GatewayHTTPHandler:
                 session_key,
             )
             return _http_error(503, "thread projection unavailable")
-        recovery_watermark = self.state.projector_watermark(session_key) or {}
+        recovery_watermark = await self._run_blocking_stage(
+            route, "projector_watermark", self.state.projector_watermark, session_key,
+        ) or {}
         recovery_error = recovery_watermark.get("error")
         if recovery_error is not None:
             await asyncio.to_thread(
@@ -788,8 +848,8 @@ class GatewayHTTPHandler:
                 )
                 if user_anchor is not None:
                     event_rows = [user_anchor, *event_rows]
-        stage_started = time.perf_counter()
-        thread = build_webui_thread_response(
+        thread = await self._run_blocking_stage(
+            route, "thread_payload_build", build_webui_thread_response,
             session_key,
             event_rows=event_rows,
             session_messages=session_messages,
@@ -805,7 +865,6 @@ class GatewayHTTPHandler:
             "messages": [],
             "has_pending_tool_calls": False,
         }
-        self._log_slow_stage(route, "thread_payload_build", stage_started)
 
         if self.thread_runtime_registry is None:
             runtime = {
@@ -822,36 +881,39 @@ class GatewayHTTPHandler:
             ).payload()
 
         active_turn = runtime.get("active_turn")
+        active_plan = None
         if isinstance(active_turn, dict) and active_turn.get("id"):
             if active_turn.get("project_id") not in {None, state_session.project_id}:
                 return _http_error(409, "runtime snapshot project mismatch")
             if active_turn.get("session_id") not in {None, state_session.id}:
                 return _http_error(409, "runtime snapshot session mismatch")
-            active_plan = self.state.turn_plan_snapshot(
+            active_plan = await self._run_blocking_stage(
+                route, "active_plan_query", self.state.turn_plan_snapshot,
                 session_key=session_key,
                 turn_id=str(active_turn["id"]),
             )
             if active_plan is not None:
                 active_turn["plan"] = active_plan
 
-        latest_turn = self.state.latest_turn_snapshot(session_key)
-        plan_turn = active_turn if isinstance(active_turn, dict) else latest_turn
-        plan = (
-            self.state.turn_plan_snapshot(
-                session_key=session_key,
-                turn_id=str(plan_turn["id"]),
-            )
-            if isinstance(plan_turn, dict) and plan_turn.get("id")
-            else None
+        latest_turn = await self._run_blocking_stage(
+            route, "latest_turn_query", self.state.latest_turn_snapshot, session_key,
         )
-        stage_started = time.perf_counter()
+        plan = active_plan
+        if (
+            not isinstance(active_turn, dict)
+            and isinstance(latest_turn, dict)
+            and latest_turn.get("id")
+        ):
+            plan = await self._run_blocking_stage(
+                route, "plan_query", self.state.turn_plan_snapshot,
+                session_key=session_key,
+                turn_id=str(latest_turn["id"]),
+            )
         artifact_migration = await self._ensure_session_artifact_index(
             session_key,
             session_data,
             scope,
-            state_session,
         )
-        self._log_slow_stage(route, "artifact_index", stage_started)
         artifact_turn = active_turn if isinstance(active_turn, dict) else latest_turn
         artifact_turn_id = (
             str(artifact_turn["id"])
@@ -913,7 +975,9 @@ class GatewayHTTPHandler:
             if isinstance(metadata, dict)
             else None
         )
-        artifact_revision = self.state.session_artifact_revision(session_key)
+        artifact_revision = await self._run_blocking_stage(
+            route, "artifact_revision", self.state.session_artifact_revision, session_key,
+        )
         snapshot_revision = (
             last_event_seq * 1_000_000
             + min(artifact_revision, 999_999)
@@ -962,13 +1026,18 @@ class GatewayHTTPHandler:
         request: WsRequest,
         key: str,
     ) -> Response:
-        context = self._session_route_context(request, key)
+        route = "runtime_snapshot"
+        context = await self._run_blocking_stage(
+            route, "session_route_context", self._session_route_context, request, key,
+            include_messages=False,
+        )
         if isinstance(context, Response):
             return context
         session_key, session_data = context
-        scope = self.workspaces.scope_for_session_key(session_key)
         try:
-            state_session = self._ensure_state_session(session_key, session_data, scope)
+            _scope, state_session = await self._run_blocking_stage(
+                route, "state_session_bind", self._bind_session_read, session_key, session_data,
+            )
         except SessionProjectMismatch:
             return _http_error(409, "session project mismatch")
 
@@ -985,7 +1054,9 @@ class GatewayHTTPHandler:
             snapshot = await self.thread_runtime_registry.snapshot(session_key)
             runtime_payload = snapshot.payload()
 
-        durable_latest = self.state.latest_turn_snapshot(session_key)
+        durable_latest = await self._run_blocking_stage(
+            route, "latest_turn_query", self.state.latest_turn_snapshot, session_key,
+        )
         active_turn = runtime_payload.get("active_turn")
         if isinstance(active_turn, dict) and active_turn.get("id"):
             active_project_id = active_turn.get("project_id")
@@ -1000,7 +1071,8 @@ class GatewayHTTPHandler:
                     active_turn.get("id"),
                 )
                 return _http_error(409, "runtime snapshot identity mismatch")
-            plan = self.state.turn_plan_snapshot(
+            plan = await self._run_blocking_stage(
+                route, "active_plan_query", self.state.turn_plan_snapshot,
                 session_key=session_key,
                 turn_id=str(active_turn["id"]),
             )
@@ -1011,7 +1083,8 @@ class GatewayHTTPHandler:
         runtime_payload["latest_turn"] = durable_latest
         latest_turn = runtime_payload.get("latest_turn")
         if isinstance(latest_turn, dict) and latest_turn.get("id"):
-            plan = self.state.turn_plan_snapshot(
+            plan = await self._run_blocking_stage(
+                route, "latest_plan_query", self.state.turn_plan_snapshot,
                 session_key=session_key,
                 turn_id=str(latest_turn["id"]),
             )
@@ -1031,7 +1104,7 @@ class GatewayHTTPHandler:
         key: str,
         encoded_turn_id: str,
     ) -> Response:
-        context = self._session_route_context(request, key)
+        context = self._session_route_context(request, key, include_messages=False)
         if isinstance(context, Response):
             return context
         session_key, _session_data = context
@@ -1058,6 +1131,14 @@ class GatewayHTTPHandler:
         if decoded_key is None:
             return _http_error(400, "invalid session key")
         snapshot = json.loads(bytes(snapshot_response.body).decode("utf-8"))
+        return await self._run_blocking_stage(
+            "runtime_diagnostics", "payload_build", self._runtime_diagnostics_response,
+            str(snapshot.get("session_key") or decoded_key), snapshot,
+        )
+
+    def _runtime_diagnostics_response(
+        self, decoded_key: str, snapshot: dict[str, Any],
+    ) -> Response:
         latest = self.state.latest_turn_snapshot(decoded_key)
         plan = (
             self.state.turn_plan_snapshot(
@@ -1090,7 +1171,31 @@ class GatewayHTTPHandler:
         session_key: str,
         session_data: dict[str, Any],
         scope: Any,
-        state_session: Any,
+    ) -> dict[str, int | bool]:
+        # A disconnected reader must not release ownership while its worker
+        # is still migrating. Other readers share that worker until it ends.
+        task = self._artifact_index_tasks.get(session_key)
+        if task is None:
+            task = asyncio.create_task(self._run_blocking_stage(
+                "artifacts", "artifact_index", self._index_session_artifacts,
+                session_key, session_data, scope,
+            ))
+            self._artifact_index_tasks[session_key] = task
+
+            def completed(done: asyncio.Task[dict[str, int | bool]]) -> None:
+                if self._artifact_index_tasks.get(session_key) is done:
+                    del self._artifact_index_tasks[session_key]
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(completed)
+        return await asyncio.shield(task)
+
+    def _index_session_artifacts(
+        self,
+        session_key: str,
+        session_data: dict[str, Any],
+        scope: Any,
     ) -> dict[str, int | bool]:
         """One-time migration of legacy file references into the registry.
 
@@ -1105,8 +1210,19 @@ class GatewayHTTPHandler:
             "migration_failures": 0,
             "pruned_count": 0,
         }
-        legacy_payload = await asyncio.to_thread(
-            discover_session_artifacts,
+        state_session = self.state.get_session(session_key)
+        if state_session is None:
+            raise StateStoreError(f"session is not registered: {session_key}")
+        if (
+            state_session.artifact_indexed_at is not None
+            and not self.state.has_unscoped_artifact_references(session_key)
+        ):
+            return stats
+        if "messages" not in session_data and self.session_manager is not None:
+            session_data = self.session_manager.read_session_file(session_key)
+            if not isinstance(session_data, dict):
+                raise StateStoreError(f"session history is unavailable: {session_key}")
+        legacy_payload = discover_session_artifacts(
             session_key,
             session_data,
             scope=scope,
@@ -1117,24 +1233,18 @@ class GatewayHTTPHandler:
             for row in legacy_payload.get("artifacts", [])
             if isinstance(row, dict) and isinstance(row.get("path"), str)
         }
-        stats["pruned_count"] = await asyncio.to_thread(
-            self.state.prune_unverified_referenced_artifacts,
+        turn_by_path = {
+            str(row["path"]): str(row["_turn_id"])
+            for row in legacy_payload.get("artifacts", [])
+            if isinstance(row, dict)
+            and isinstance(row.get("path"), str)
+            and isinstance(row.get("_turn_id"), str)
+        }
+        stats["pruned_count"] = self.state.prune_unverified_referenced_artifacts(
             session_key,
             allowed_paths,
+            turn_by_path=turn_by_path,
         )
-        for row in legacy_payload.get("artifacts", []):
-            if not isinstance(row, dict):
-                continue
-            path = row.get("path")
-            turn_id = row.get("_turn_id")
-            if not isinstance(path, str) or not isinstance(turn_id, str):
-                continue
-            await asyncio.to_thread(
-                self.state.assign_referenced_artifact_turn,
-                session_key,
-                path,
-                turn_id,
-            )
         if state_session.artifact_indexed_at is not None:
             return stats
 
@@ -1142,8 +1252,7 @@ class GatewayHTTPHandler:
             if not isinstance(row, dict) or not isinstance(row.get("path"), str):
                 continue
             try:
-                await asyncio.to_thread(
-                    self.state.register_artifact,
+                self.state.register_artifact(
                     session_key,
                     scope.project_path / row["path"],
                     relation_type="referenced",
@@ -1164,20 +1273,22 @@ class GatewayHTTPHandler:
                     row.get("path"),
                     exc_info=True,
                 )
-        await asyncio.to_thread(self.state.mark_artifact_indexed, session_key)
+        if not stats["migration_failures"]:
+            self.state.mark_artifact_indexed(session_key)
         return stats
 
     async def _handle_session_artifacts(self, request: WsRequest, key: str) -> Response:
-        context = self._session_artifact_context(request, key)
+        context = await self._run_blocking_stage(
+            "artifacts", "session_route_context", self._session_artifact_context, request, key,
+            include_messages=False,
+        )
         if isinstance(context, Response):
             return context
         decoded_key, session_data = context
-        scope = self.workspaces.scope_for_session_key(decoded_key)
         try:
-            state_session = self._ensure_state_session(
-                decoded_key,
-                session_data,
-                scope,
+            scope, state_session = await self._run_blocking_stage(
+                "artifacts", "state_session_bind", self._bind_session_read,
+                decoded_key, session_data,
             )
         except SessionProjectMismatch:
             return _http_error(409, "session_project_mismatch")
@@ -1186,7 +1297,6 @@ class GatewayHTTPHandler:
             decoded_key,
             session_data,
             scope,
-            state_session,
         )
         truncated = bool(migration["truncated"])
         migrated_count = int(migration["migrated_count"])
@@ -1227,6 +1337,20 @@ class GatewayHTTPHandler:
                 "truncated": truncated,
             }
         )
+
+    def _bind_session_read(
+        self,
+        session_key: str,
+        session_data: dict[str, Any],
+    ) -> tuple[Any, Any]:
+        existing = self.state.get_session(session_key)
+        project = self.state.get_project(existing.project_id) if existing is not None else None
+        metadata = session_data.get("metadata")
+        scope = self.workspaces.scope_for_session_metadata(
+            metadata if isinstance(metadata, dict) else None,
+            state_project=project,
+        )
+        return scope, self._ensure_state_session(session_key, session_data, scope)
 
     def _ensure_state_session(
         self,
@@ -1287,13 +1411,19 @@ class GatewayHTTPHandler:
         request: WsRequest,
         key: str,
     ) -> Response:
-        context = self._session_artifact_context(request, key)
+        context = await self._run_blocking_stage(
+            "artifact_content", "session_route_context", self._session_artifact_context,
+            request, key,
+        )
         if isinstance(context, Response):
             return context
         decoded_key, session_data = context
         query = _parse_query(request.path)
         raw_path = _query_first(query, "path")
-        scope = self.workspaces.scope_for_session_key(decoded_key)
+        scope = await self._run_blocking_stage(
+            "artifact_content", "workspace_scope", self.workspaces.scope_for_session_key,
+            decoded_key,
+        )
         try:
             path = await asyncio.to_thread(
                 resolve_session_artifact,
@@ -1448,6 +1578,8 @@ class GatewayHTTPHandler:
         self,
         request: WsRequest,
         key: str,
+        *,
+        include_messages: bool = True,
     ) -> tuple[str, dict[str, Any]] | Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
@@ -1458,7 +1590,12 @@ class GatewayHTTPHandler:
             return _http_error(400, "invalid session key")
         if not _is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
-        session_data = self.session_manager.read_session_file(decoded_key)
+        reader = (
+            self.session_manager.read_session_file
+            if include_messages
+            else self.session_manager.read_session_metadata
+        )
+        session_data = reader(decoded_key)
         if session_data is None:
             return _http_error(404, "session not found")
         return decoded_key, session_data
@@ -2378,6 +2515,8 @@ class GatewayHTTPHandler:
             return await self._handle_project_sessions(request, m.group(1))
         if got == "/api/diagnostics/logs":
             return await self._handle_diagnostic_logs(request)
+        if got == "/api/diagnostics/export":
+            return await self._handle_diagnostic_export(request)
         if got == "/api/security/policy":
             return self._handle_security_policy(request)
         if got == "/api/security/policy/update":
@@ -2554,6 +2693,12 @@ class GatewayHTTPHandler:
             self.state.list_projects,
             include_archived=include_archived,
         )
+        return await self._run_blocking_stage(
+            route, "project_payload_build", self._projects_list_response,
+            projects, include_archived=include_archived,
+        )
+
+    def _projects_list_response(self, projects: list[Any], *, include_archived: bool) -> Response:
         rows: list[dict[str, Any]] = []
         for project in projects:
             lifecycle = self._project_lifecycle_entry(project)
@@ -3071,6 +3216,7 @@ class GatewayHTTPHandler:
         )
 
     async def _handle_diagnostic_logs(self, request: WsRequest) -> Response:
+        from nanobot.observability.operations import operation_health
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         query = _parse_query(request.path)
@@ -3085,11 +3231,43 @@ class GatewayHTTPHandler:
             session_id=_query_first(query, "session_id"),
             artifact_id=_query_first(query, "artifact_id"),
             error_code=_query_first(query, "error_code"),
+            trace_id=_query_first(query, "trace_id"),
             limit=limit,
         )
         return _http_json_response(
-            {"logs": [self._structured_log_payload(record) for record in records]}
+            {"logs": [self._structured_log_payload(record) for record in records],
+             "collection": operation_health()}
         )
+
+    async def _handle_diagnostic_export(self, request: WsRequest) -> Response:
+        from nanobot.observability.diagnostic_export import (
+            collect_database,
+            collect_snapshot,
+            parse_window,
+        )
+        if not self.check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if str(getattr(request, "method", "GET")).upper() != "GET":
+            return _http_error(405, "unsupported method")
+        try:
+            start, end, session = parse_window(_parse_query(request.path))
+        except (ValueError, TypeError):
+            return _http_error(400, "invalid diagnostic export scope")
+        # Do not queue large exports behind each other on the event loop.
+        if getattr(self, "_diagnostic_export_running", False):
+            return _http_error(409, "diagnostic export already running")
+        self._diagnostic_export_running = True
+        try:
+            snapshot = await collect_snapshot(self, session)
+            result = await asyncio.to_thread(collect_database, self.logs.path, start, end, session)
+            result["snapshot"] = snapshot
+            return _http_json_response(result)
+        except LookupError:
+            return _http_error(404, "diagnostic session not found")
+        except (OSError, sqlite3.Error):
+            return _http_error(503, "diagnostic store unavailable")
+        finally:
+            self._diagnostic_export_running = False
 
     def _handle_security_policy(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):
@@ -3129,8 +3307,8 @@ class GatewayHTTPHandler:
     def _security_audit_filters(request: WsRequest) -> dict[str, Any]:
         query = _parse_query(request.path)
         category = (_query_first(query, "category") or "").strip() or None
-        visible_categories = ("file", "command", "network")
-        if category is not None and category not in visible_categories:
+        visible_categories = ("file", "command", "network", "mcp", "settings")
+        if category is not None and category not in (*visible_categories, "authorization"):
             raise ValueError("invalid audit category")
 
         def integer(key: str) -> int | None:
@@ -3143,7 +3321,7 @@ class GatewayHTTPHandler:
             "search": (_query_first(query, "search") or "").strip() or None,
             "category": category,
             "categories": None if category else visible_categories,
-            "require_target": True,
+            "require_target": False,
             "result": (_query_first(query, "result") or "").strip() or None,
             "start_ms": integer("start_ms"),
             "end_ms": integer("end_ms"),
@@ -3201,6 +3379,22 @@ class GatewayHTTPHandler:
         )
 
     def _security_audit_export_body(self, filters: dict[str, Any]) -> bytes:
+        event_id = self.logs.begin_security_event(
+            category="settings", action="export_audit", decision="allow", risk="normal",
+            rule_id="security.audit_exported", target="security-audit",
+            summary="生成安全审计导出文件", details={"actor": "user", "export_scope": filters},
+        )
+        try:
+            body, exported = self._build_security_audit_export(filters, exclude_id=event_id)
+        except Exception:
+            self.logs.complete_security_event(event_id, result="failed")
+            raise
+        self.logs.complete_security_event(event_id, result="succeeded", details={
+            "exported_count": exported, "export_stage": "generated",
+        })
+        return body
+
+    def _build_security_audit_export(self, filters: dict[str, Any], *, exclude_id: int) -> tuple[bytes, int]:
         output = io.BytesIO()
         cursor: int | None = None
         exported = 0
@@ -3214,6 +3408,8 @@ class GatewayHTTPHandler:
             if not records:
                 break
             for record in records:
+                if record.id == exclude_id:
+                    continue
                 output.write(
                     (
                         json.dumps(
@@ -3223,29 +3419,18 @@ class GatewayHTTPHandler:
                         + "\n"
                     ).encode("utf-8")
                 )
-            exported += len(records)
+            exported += sum(record.id != exclude_id for record in records)
             if len(records) < page_size:
                 break
             cursor = records[-1].id
-        return output.getvalue()
+        return output.getvalue(), exported
 
     async def _handle_security_audit_clear(self, request: WsRequest) -> Response:
         if not self.check_api_token(request):
             return _http_error(401, "Unauthorized")
         if str(getattr(request, "method", "GET")).upper() not in {"GET", "DELETE", "POST"}:
             return _http_error(405, "unsupported method")
-        deleted = await asyncio.to_thread(self.logs.clear_security_events)
-        await asyncio.to_thread(
-            self.logs.begin_security_event,
-            category="settings",
-            action="clear_audit",
-            decision="allow",
-            result="succeeded",
-            risk="normal",
-            rule_id="security.audit_cleared",
-            summary="安全审计记录已由用户清空",
-            details={"deleted_count": deleted},
-        )
+        deleted = await asyncio.to_thread(self.logs.clear_security_events, record_admin=True)
         return _http_json_response({"deleted": deleted})
 
     @staticmethod
@@ -3253,8 +3438,8 @@ class GatewayHTTPHandler:
         return {
             "id": record.id,
             "timestamp": record.timestamp,
-            "category": record.category,
-            "action": record.action,
+            "category": "network" if record.category == "mcp" else record.category,
+            "action": "mcp_call" if record.category == "mcp" else record.action,
             "decision": record.decision,
             "result": record.result,
             "risk": record.risk,

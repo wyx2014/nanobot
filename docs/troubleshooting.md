@@ -175,6 +175,55 @@ nanobot gateway --verbose
 | Heartbeat never runs | Keep the gateway running, add tasks under `<workspace>/HEARTBEAT.md` -> `## Active Tasks`, and make sure `gateway.heartbeat.enabled` is true. |
 | Cron jobs disappeared after switching workspaces | Cron jobs are workspace-scoped at `<workspace>/cron/jobs.json`; check you are using the intended workspace. |
 
+### Windows File Save Failures
+
+Session snapshots, cron snapshots/run records, and Token usage snapshots share
+atomic replacement retries for Windows errors 5 (access denied), 32 (sharing
+violation), and 33 (lock violation). There are seven attempts, with waits of
+50, 100, 200, 400, 800, and 1000 ms. Each write uses a unique sibling temporary
+file. Failed replacement preserves the existing destination; it never falls
+back to truncating it. Token usage updates also refuse to replace unreadable
+or corrupt history with an empty snapshot.
+
+An `atomic replace recovered` entry means that save succeeded after retrying.
+An `atomic replace diagnostic` entry means replacement exhausted its retries
+or encountered a permanent permission failure. Diagnostics include file
+attributes, directory permissions, and best-effort Windows Restart Manager
+information about processes holding the files. Session diagnostics also
+include concurrent reads and writes inside nanobot.
+
+On the affected Windows computer, check the exact path from the diagnostic:
+
+| Evidence | Check |
+|---|---|
+| A locking process is listed | Check whether an editor, backup/sync client, indexer, or second gateway instance has the file open. |
+| Read-only attributes or denied ACL access | Verify the file and its parent directory are writable by the account running the desktop app. |
+| Repeated access denial without an identified process | Correlate the timestamp with Windows Security Protection History and the security software's event logs, including Controlled Folder Access. Restart Manager cannot identify every driver-level lock. |
+
+Retrying cannot repair a persistent permission denial. Confirm the cause on
+Windows before changing permissions or security software settings; a copied
+log on macOS/Linux cannot establish which process or policy blocked the write.
+
+### MCP Connection Failures
+
+Each MCP server owns its transport and SDK cancellation scopes in a dedicated
+task. A failed connector is marked unavailable and its tools are removed;
+other connectors and the calling chat/Dream task remain active. Missing or
+failed connections are retried on the next connection attempt or MCP reload.
+An explicit task cancellation still cancels connection setup and closes its
+transports. Check the failing server's address, credentials, and output in the
+MCP toolbox before reconnecting it.
+
+### HTTP Response After Client Disconnect
+
+With `websockets` 16.0, a client closing while an HTTP route is running can
+cause `AssertionError: assert not self.eof_sent` in handshake response sending.
+The gateway checks the connection after the route finishes and cancels only
+that connection's handshake if it has already closed. Completed route work
+is preserved, and subsequent requests can use a new connection. Restart the
+gateway after updating the runtime; updating the GUI alone does not apply
+this fix to a packaged Python runtime.
+
 ## WebUI Problems
 
 The packaged WebUI is served by the WebSocket channel.

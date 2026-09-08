@@ -10,6 +10,7 @@ import pytest
 
 from nanobot.cron.types import CronJob, CronPayload, CronSchedule
 from nanobot.graph.workflows.asset_research import (
+    MEMBER_NODES,
     advance_asset_research_graph,
     new_asset_research_state,
 )
@@ -777,6 +778,121 @@ def test_workflow_plan_allows_parallel_members_and_terminal_revision(tmp_path: P
     assert second["active_step_ids"] == ["team-lead"]
 
 
+@pytest.mark.parametrize("graph_status", [None, "running", "completed_with_warnings"])
+def test_workflow_failure_does_not_override_team_status(tmp_path, graph_status):
+    store = _store(tmp_path)
+    project = store.ensure_project(tmp_path)
+    session = store.bind_session("websocket:stable-workflow", project.id)
+    common = {"project_id": project.id, "session_id": session.id,
+              "turn_id": "stable-turn", "recorded_at": 1000}
+    store.project_event(session.session_key, {
+        **common, "event": "user", "event_id": "user", "event_seq": 1, "text": "research",
+    })
+    store.project_event(session.session_key, {
+        **common, "event": "message", "kind": "progress", "event_id": "plan", "event_seq": 2,
+        "agent_ui": {
+            "kind": "task_progress", "plan_kind": "workflow", "execution": "staged",
+            "team_id": "asset-research-team", "team_run_id": "stable-run",
+            **({"graph_state": {"status": graph_status}} if graph_status else {}),
+            "steps": [
+                {"id": "first", "title": "First", "status": "error"},
+                {"id": "second", "title": "Second", "status": (
+                    "completed" if graph_status == "completed_with_warnings" else "running"
+                )},
+            ],
+        },
+    })
+    plan = store.turn_plan_snapshot(session_key=session.session_key, turn_id="stable-turn")
+    assert plan["status"] == ("completed" if graph_status == "completed_with_warnings" else "inProgress")
+    assert plan["steps"][0]["status"] == "error"
+
+
+@pytest.mark.parametrize("initial_plan", [True, False])
+@pytest.mark.parametrize("late_status", ["completed", "running"])
+def test_cancelled_turn_rejects_late_workflow_projection(tmp_path, initial_plan, late_status):
+    store = _store(tmp_path)
+    project = store.ensure_project(tmp_path)
+    session = store.bind_session("websocket:cancelled-workflow", project.id)
+    common = {"project_id": project.id, "session_id": session.id,
+              "turn_id": "cancelled-turn", "recorded_at": 1000}
+    store.project_event(session.session_key, {
+        **common, "event": "user", "event_id": "user", "event_seq": 1, "text": "research",
+    })
+    progress = {
+        **common, "event": "message", "kind": "progress", "event_id": "plan", "event_seq": 2,
+        "agent_ui": {"kind": "task_progress", "plan_kind": "workflow", "execution": "staged",
+                     "team_id": "asset-research-team", "team_run_id": "cancelled-run",
+                     "steps": [{"id": "role", "title": "Role", "status": "running"}]},
+    }
+    if initial_plan:
+        store.project_event(session.session_key, progress)
+    store.project_event(session.session_key, {
+        **common, "event": "turn_end", "event_id": "cancel", "event_seq": 2 + int(initial_plan),
+        "finish_reason": "cancelled",
+    })
+    before = store.turn_plan_snapshot(session_key=session.session_key, turn_id="cancelled-turn")
+    progress["agent_ui"]["steps"][0]["status"] = late_status
+    store.project_event(session.session_key, {
+        **progress, "event_id": "late-plan", "event_seq": 3 + int(initial_plan),
+    })
+    after = store.turn_plan_snapshot(session_key=session.session_key, turn_id="cancelled-turn")
+    assert after == before
+    if initial_plan:
+        assert after["status"] == "interrupted"
+    else:
+        assert after is None
+
+
+@pytest.mark.parametrize("terminal", ["cancelled", "restart"])
+def test_recovered_team_checkpoint_uses_durable_terminal_status(tmp_path, terminal):
+    store = _store(tmp_path)
+    project = store.ensure_project(tmp_path)
+    session = store.bind_session("websocket:checkpoint-terminal", project.id)
+    common = {"project_id": project.id, "session_id": session.id,
+              "turn_id": "terminal-turn", "recorded_at": 1000}
+    store.project_event(session.session_key, {
+        **common, "event": "user", "event_id": "user", "event_seq": 1, "text": "research",
+    })
+    graph = new_asset_research_state(run_id="terminal-run", member_ids=MEMBER_NODES)
+    graph = advance_asset_research_graph(graph, "data_package_ready")
+    graph = advance_asset_research_graph(graph, "member_updated", {
+        "id": "business-analyst", "status": "completed", "artifact": "reports/business.md",
+    })
+    # Other roles are still active; a saved partial result permits later recovery.
+    for member in graph["members"].values():
+        member.setdefault("artifact", "reports/partial.md")
+    store.project_event(session.session_key, {
+        **common, "event": "message", "kind": "progress", "event_id": "plan", "event_seq": 2,
+        "agent_ui": {"kind": "task_progress", "plan_kind": "workflow", "execution": "staged",
+                     "team_id": "asset-research-team", "team_run_id": "terminal-run",
+                     "graph_state": graph,
+                     "steps": [{"id": "role", "title": "Role", "status": "running"}]},
+    })
+    if terminal == "restart":
+        assert store.reconcile_incomplete_runs() == 1
+    else:
+        store.project_event(session.session_key, {
+            **common, "event": "turn_end", "event_id": "end", "event_seq": 3,
+            "finish_reason": "cancelled",
+        })
+    status = "failed" if terminal == "restart" else "cancelled"
+    exact = store.expert_team_revision_source(
+        session_key=session.session_key, run_id="terminal-run", team_id="asset-research-team",
+    )
+    resumed = store.latest_expert_team_resume(
+        session_key=session.session_key, team_id="asset-research-team",
+    )
+    for snapshot in (exact, resumed):
+        assert snapshot["status"] == status
+        recovered = snapshot["graph_state"]
+        assert recovered["status"] == status
+        assert recovered["active_nodes"] == []
+        assert recovered["members"]["business-analyst"]["status"] == "completed"
+        assert recovered["members"]["business-analyst"]["artifact"] == "reports/business.md"
+        assert all(node["status"] not in {"pending", "running"}
+                   for node in recovered["node_states"].values())
+
+
 def test_expert_team_graph_checkpoint_can_resume_from_same_session_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -872,6 +988,14 @@ def test_expert_team_graph_checkpoint_can_resume_from_same_session_artifacts(
     )
     assert resume is not None
     assert resume["run_id"] == "run-resume"
+    exact = store.expert_team_revision_source(
+        session_key=session.session_key, run_id="run-resume", team_id="asset-research-team",
+    )
+    assert exact["root"] == str(project_path)
+    assert exact["latest_run_id"] == "run-resume"
+    assert store.expert_team_revision_source(
+        session_key="websocket:other", run_id="run-resume", team_id="asset-research-team",
+    ) is None
     assert resume["graph_state"]["degraded"] is True
     assert any(path.endswith("risk-assessor.md") for path in resume["artifacts"])
     other_session = store.bind_session("websocket:other", project.id)
@@ -1276,6 +1400,40 @@ def test_permanent_session_and_project_purge_leave_foreign_keys_consistent(
     assert project_result["purged"] is True
     assert store.get_project(project.id) is None
     assert project_path.is_dir()
+
+
+@pytest.mark.parametrize("legacy_table", [
+    "gateway_command_receipts", "queued_inputs", "turn_steers", "security_approvals",
+])
+def test_session_purge_cleans_legacy_controls_without_touching_other_sessions(
+    tmp_path: Path, legacy_table: str,
+) -> None:
+    store = _store(tmp_path)
+    project = store.ensure_project(tmp_path)
+    deleted = store.bind_session("websocket:deleted", project.id)
+    retained = store.bind_session("websocket:retained", project.id)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(f"""
+            CREATE TABLE {legacy_table} (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                FOREIGN KEY (session_id, project_id) REFERENCES sessions(id, project_id)
+            )
+        """)
+        connection.executemany(
+            f"INSERT INTO {legacy_table} VALUES (?, ?, ?)",
+            [("delete-control", deleted.id, project.id), ("keep-control", retained.id, project.id)],
+        )
+
+    store.archive_session(deleted.session_key)
+    assert store.purge_session(deleted.session_key)["purged"] is True
+    assert store.get_session(deleted.session_key) is None
+    assert store.get_session(retained.session_key) is not None
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(f"SELECT id FROM {legacy_table}").fetchall() == [("keep-control",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_project_rag_and_cache_never_cross_project_boundaries(tmp_path: Path) -> None:

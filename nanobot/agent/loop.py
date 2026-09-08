@@ -66,14 +66,24 @@ from nanobot.graph.workflows.asset_research_runtime import (
 )
 from nanobot.graph.workflows.supply_chain_bottleneck import (
     MEMBER_NODES as BOTTLENECK_MEMBER_NODES,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck import (
     REPORT_AUDIT as BOTTLENECK_REPORT_AUDIT,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck import (
     SCOPE_BRIEF,
-    TEAM_LEAD as BOTTLENECK_TEAM_LEAD,
     public_supply_chain_bottleneck_state,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck import (
+    TEAM_LEAD as BOTTLENECK_TEAM_LEAD,
 )
 from nanobot.graph.workflows.supply_chain_bottleneck_runtime import (
     SCOPE_MAX_TOOL_ITERATIONS as BOTTLENECK_SCOPE_MAX_TOOL_ITERATIONS,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck_runtime import (
     TEAM_LEAD_MAX_TOOL_ITERATIONS as BOTTLENECK_TEAM_LEAD_MAX_TOOL_ITERATIONS,
+)
+from nanobot.graph.workflows.supply_chain_bottleneck_runtime import (
     SupplyChainBottleneckWorkflowRuntime,
 )
 from nanobot.observability.trace_collector import TraceCollector
@@ -129,6 +139,7 @@ from nanobot.webui.expert_teams import (
     EXPERT_TEAM_TURN_SUPPRESSED_KEY,
     SUPPLY_CHAIN_BOTTLENECK_TEAM_ID,
     classify_expert_team_turn_with_model,
+    expert_team_turn_blocking_reply,
 )
 from nanobot.webui.interactive_prompt import (
     INBOUND_META_INTERACTIVE_PROMPT_ANSWER,
@@ -1892,14 +1903,43 @@ class AgentLoop:
             "team-lead": report_tools,
             "report-audit": audit_tools,
         }
+        latest_graph_state: dict[str, Any] = {}
 
         async def _run_node(
             node_id: str,
             prompt: str,
             final_stream: bool,
         ) -> AgentNodeOutcome:
+            system = node_system
+            node_tools = node_tool_map[node_id]
+            if resume_state and node_id in {TEAM_LEAD, REPORT_AUDIT}:
+                from nanobot.agent.research_revision_tools import (
+                    ResearchRevisionToolRegistry,
+                    revision_evidence_index,
+                    revision_node_anchor,
+                )
+                from nanobot.webui.expert_team_revisions import write_revision_file
+
+                evidence = await asyncio.to_thread(
+                    revision_evidence_index, effective_scope.project_path,
+                    latest_graph_state or resume_state,
+                )
+                index_path = await asyncio.to_thread(
+                    write_revision_file, effective_scope.project_path,
+                    f"reports/.team-runs/{run_id}/evidence-index.json",
+                    json.dumps({"target": target, "run_id": run_id, "evidence": evidence},
+                               ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+                node_tools = ResearchRevisionToolRegistry(
+                    node_tools, root=effective_scope.project_path, report=report_path,
+                    run_id=run_id, evidence=evidence, index_path=index_path,
+                )
+                system += revision_node_anchor(
+                    target=target, run_id=run_id, node=node_id, report=report_path,
+                    evidence=evidence, index_path=index_path,
+                )
             node_messages = [
-                {"role": "system", "content": node_system},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ]
             render_template = (
@@ -1926,21 +1966,34 @@ class AgentLoop:
                     session_key=ctx.session_key,
                     pending_queue=None,
                     ephemeral=True,
-                    tools=node_tool_map[node_id],
+                    tools=node_tools,
                     max_iterations=(
                         AUDIT_MAX_TOOL_ITERATIONS
                         if node_id == REPORT_AUDIT
-                        else None
+                        else 24 if resume_state and node_id == TEAM_LEAD else None
                     ),
                 )
             )
+            node_artifacts = _generated_artifact_paths(messages)
+            if node_id == "data-package" and final_content:
+                from nanobot.webui.expert_team_revisions import write_revision_file
+
+                try:
+                    package_path = await asyncio.to_thread(
+                        write_revision_file, effective_scope.project_path,
+                        f"reports/.team-runs/{run_id}/data-package.md",
+                        final_content.encode("utf-8"),
+                    )
+                    node_artifacts.insert(0, package_path)
+                except OSError as exc:
+                    logger.warning("Could not cache research data package: {}", exc)
             return AgentNodeOutcome(
                 content=final_content or "",
                 stop_reason=stop_reason,
                 tools_used=list(tools_used or []),
                 messages=messages,
                 usage=dict(self._last_usage),
-                artifacts=_generated_artifact_paths(messages),
+                artifacts=node_artifacts,
             )
 
         effective_scope = self.workspace_scopes.for_turn(
@@ -1954,7 +2007,9 @@ class AgentLoop:
             task_ids: list[str] = []
             member_by_task: dict[str, str] = {}
             immediate: dict[str, MemberNodeOutcome] = {}
-            for member_id in MEMBER_NODES:
+            if not tasks or not set(tasks).issubset(MEMBER_NODES):
+                raise ValueError("invalid asset-research member wave")
+            for member_id in (member for member in MEMBER_NODES if member in tasks):
                 task_id = await self.subagents.spawn_for_workflow(
                     task=tasks[member_id],
                     label=member_id,
@@ -2026,7 +2081,9 @@ class AgentLoop:
             event: str,
             activity: str,
         ) -> None:
+            nonlocal latest_graph_state
             public_state = public_asset_research_state(state)
+            latest_graph_state = public_state
             await self.bus.publish_outbound(OutboundMessage(
                 channel=ctx.msg.channel,
                 chat_id=ctx.msg.chat_id,
@@ -2061,7 +2118,18 @@ class AgentLoop:
         )
         request = ctx.msg.content.strip()
         safe_target = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "-", target).strip("-")
-        report_path = f"reports/{(safe_target or 'stock')[:48]}-{run_id}-投资研究报告.md"
+        report_version = int(resume_state.get("report_version") or 1) + 1 if resume_state else 1
+        version_label = f"-v{report_version}" if resume_state else ""
+        report_path = f"reports/{(safe_target or 'stock')[:48]}-{run_id}{version_label}-投资研究报告.md"
+        if resume_state:
+            node_tool_map[TEAM_LEAD] = self._workflow_tool_subset(
+                report_tools,
+                allowed_names={"read_file", "write_file", "edit_file", "create_research_chart"},
+                allowed_prefixes=(),
+            )
+            node_tool_map[REPORT_AUDIT] = _SingleRewriteAuditToolRegistry(
+                self._workflow_tool_subset(audit_tools, allowed_names={"read_file", "write_file"}, allowed_prefixes=())
+            )
 
         file_state_token = bind_file_states(
             self._file_state_store.for_session(ctx.session_key)
@@ -2094,6 +2162,7 @@ class AgentLoop:
                 report_path=report_path,
                 resume_from=resume_state,
                 supplemental_artifacts=[*resume_artifacts, *(ctx.msg.media or [])],
+                rerun_member_ids=resume_metadata.get("selected_roles", []) if isinstance(resume_metadata, dict) else [],
             )
         finally:
             reset_project_context(project_context_token)
@@ -3629,7 +3698,17 @@ class AgentLoop:
                 started_at=ctx.visible_run_started_at,
             )
             expert_team = _expert_team_binding(ctx.msg.metadata, ctx.session.metadata)
-            if (
+            blocking_reply = expert_team_turn_blocking_reply(ctx.msg.metadata)
+            if blocking_reply is not None:
+                # Routing is a runtime boundary. A model must not turn a
+                # clarification into an unbound research plan or web search.
+                self._last_usage = {}
+                result = (
+                    blocking_reply, [],
+                    [*ctx.initial_messages, {"role": "assistant", "content": blocking_reply}],
+                    "completed", False,
+                )
+            elif (
                 isinstance(expert_team, dict)
                 and expert_team.get("id") == ASSET_RESEARCH_TEAM_ID
                 and isinstance(ctx.msg.metadata.get("expert_team_run_id"), str)

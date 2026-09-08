@@ -95,15 +95,17 @@ def test_powershell_recursive_delete_requires_approval(
     assert result.rule_id == "command.recursive_delete"
 
 
+@pytest.mark.parametrize("flags", ["-rf", "-fr", "-fR", "-vfr", "-f -r", "--recursive"])
 def test_recursive_delete_requires_approval_unless_user_allows_its_path(
     service: SecurityService,
     tmp_path: Path,
+    flags: str,
 ) -> None:
     build_dir = tmp_path / "project" / "build"
     build_dir.mkdir(parents=True)
     result = service.assess(
         tool_name="exec",
-        params={"command": "rm -rf build", "working_dir": str(build_dir.parent)},
+        params={"command": f"rm {flags} build", "working_dir": str(build_dir.parent)},
         tool=None,
         workspace=tmp_path,
     )
@@ -113,7 +115,7 @@ def test_recursive_delete_requires_approval_unless_user_allows_its_path(
     service.update_policy({"file_allow_paths": [str(build_dir)]})
     allowed = service.assess(
         tool_name="exec",
-        params={"command": "rm -rf build", "working_dir": str(build_dir.parent)},
+        params={"command": f"rm {flags} build", "working_dir": str(build_dir.parent)},
         tool=None,
         workspace=tmp_path,
     )
@@ -165,6 +167,68 @@ def test_approval_path_only_prompts_for_shell_mutations(
     assert read.decision == "allow"
     assert write.decision == "require_approval"
     assert write.rule_id == "file.protected_path"
+
+
+@pytest.mark.parametrize("command", [
+    "cp payload authorized_keys",
+    "mv payload authorized_keys",
+    "touch authorized_keys",
+    "echo updated >authorized_keys",
+    "echo updated >>authorized_keys",
+    'echo updated > "authorized keys"',
+    "echo updated 2>errors.log",
+    "echo updated >123",
+    "printf updated | cat >authorized_keys",
+    "Copy-Item payload authorized_keys",
+    "Set-Content authorized_keys updated",
+])
+def test_relative_shell_writes_require_approval_in_protected_cwd(
+    service: SecurityService, tmp_path: Path, command: str,
+) -> None:
+    protected = tmp_path / "finance"
+    service.update_policy({"approval_paths": [str(protected)]})
+    result = service.assess(
+        tool_name="exec",
+        params={"command": command, "working_dir": str(protected)},
+        tool=None,
+        workspace=tmp_path,
+    )
+    assert result.decision == "require_approval"
+    assert result.rule_id == "file.protected_path"
+
+
+@pytest.mark.parametrize("tool_name, params", [
+    ("create_presentation", {"source_path": "deck.yaml", "output_path": "finance/deck.pptx"}),
+    ("create_presentation", {"source_path": "finance/deck.yaml"}),
+    ("create_presentation", {
+        "source_path": "deck.yaml", "output_path": "deck.pptx", "preview_path": "finance/deck.pdf",
+    }),
+    ("import_presentation_asset", {"source_path": "image.png", "output_path": "finance/image.png"}),
+])
+def test_presentation_outputs_require_path_approval(
+    service: SecurityService, tmp_path: Path, tool_name: str, params: dict,
+) -> None:
+    service.update_policy({"approval_paths": [str(tmp_path / "finance")]})
+    result = service.assess(tool_name=tool_name, params=params, tool=None, workspace=tmp_path)
+    assert result.decision == "require_approval"
+    assert result.rule_id == "file.protected_path"
+    assert result.mutating is True
+    assert result.audit_required is True
+
+
+@pytest.mark.parametrize("tool_name", ["create_presentation", "import_presentation_asset"])
+def test_normal_presentation_writes_are_audited(
+    service: SecurityService, tmp_path: Path, tool_name: str,
+) -> None:
+    result = service.assess(
+        tool_name=tool_name,
+        params={"source_path": "deck.yaml", "output_path": "output.pptx"},
+        tool=None,
+        workspace=tmp_path,
+    )
+    assert result.decision == "allow"
+    assert result.mutating is True
+    assert result.audit_required is True
 
 
 def test_sensitive_reads_are_allowed_and_audited(service: SecurityService, tmp_path: Path) -> None:
@@ -226,10 +290,7 @@ def test_audit_details_redact_structured_credentials(service: SecurityService) -
     service.complete_audit(handle, result="succeeded")
 
     [record] = service.logs.query_security_events(limit=1)
-    arguments = record.details["arguments"]
-    assert arguments["api_key"] == "[REDACTED]"
-    assert arguments["nested"]["accessToken"] == "[REDACTED]"
-    assert arguments["query"] == "public company name"
+    assert record.details["arguments"] == "[CONTENT OMITTED]"
 
 
 def test_security_state_sidecars_are_hard_blocked(service: SecurityService, tmp_path: Path) -> None:
@@ -405,7 +466,8 @@ def test_allowed_web_tools_are_audited_with_useful_targets(
     assert fetched.audit_required is True
     assert searched.category == "network"
     assert searched.action == "search"
-    assert searched.target == "重庆啤酒财报"
+    assert searched.target == "web_search"
+    assert searched.details["data_categories"] == ["search_terms"]
     assert searched.audit_required is True
 
 

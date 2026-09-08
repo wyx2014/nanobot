@@ -13,7 +13,8 @@ from nanobot.webui.project_skills_api import remove_project_skill_grant_everywhe
 
 QueryParams = dict[str, list[str]]
 
-_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# Keep versioned directory names intact while rejecting paths and dot segments.
+_SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 class WebUISkillsError(ValueError):
@@ -85,7 +86,7 @@ def _query_first(query: QueryParams, key: str) -> str | None:
 
 def _skill_name(query: QueryParams) -> str:
     name = (_query_first(query, "name") or "").strip()
-    if not _SKILL_NAME_RE.match(name):
+    if not _SKILL_NAME_RE.fullmatch(name):
         raise WebUISkillsError("invalid skill name")
     return name
 

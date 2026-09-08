@@ -89,6 +89,10 @@ class CreatePresentationTool(_FsTool):
         force: bool | None = False,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
+        from nanobot.agent.tools.context import current_request_context
+        context = current_request_context()
+        if context and isinstance(context.metadata.get("presentation"), dict):
+            return "Error: this turn has a selected presentation; use export_presentation with its document_id"
         if not source_path:
             return self._error("render_failed", "source_path is required", "")
 

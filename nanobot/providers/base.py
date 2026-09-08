@@ -869,6 +869,7 @@ class LLMProvider(ABC):
         should_retry_guard: Callable[[], bool] | None = None,
         on_stream_recover: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
+        from nanobot.observability.operations import operation, record_operation
         attempt = 0
         delays = list(self._CHAT_RETRY_DELAYS)
         persistent = retry_mode == "persistent"
@@ -877,7 +878,11 @@ class LLMProvider(ABC):
         identical_error_count = 0
         while True:
             attempt += 1
-            response = await call(**kw)
+            with operation("llm.attempt", attempt=attempt, provider=type(self).__name__, model=kw.get("model")) as observed:
+                response = await call(**kw)
+                observed.details.update({"status_code": response.error_status_code, "finish_reason": response.finish_reason})
+                if response.finish_reason == "error":
+                    observed.fail(response.error_kind or "LLM_ERROR")
             if response.finish_reason != "error":
                 return response
             last_response = response
@@ -920,7 +925,10 @@ class LLMProvider(ABC):
                     )
                     retry_kw = dict(kw)
                     retry_kw["messages"] = stripped
-                    result = await call(**retry_kw)
+                    with operation("llm.attempt", attempt=attempt, provider=type(self).__name__, model=retry_kw.get("model"), stage="image_fallback") as observed:
+                        result = await call(**retry_kw)
+                        if result.finish_reason == "error":
+                            observed.fail(result.error_kind or "LLM_ERROR")
                     # Permanently strip images from the original messages so
                     # subsequent iterations do not repeat the error-retry cycle.
                     if result.finish_reason != "error":
@@ -956,6 +964,8 @@ class LLMProvider(ABC):
             delay = self._extract_retry_after_from_response(response) or base_delay
             if persistent:
                 delay = min(delay, self._PERSISTENT_MAX_DELAY)
+            record_operation("llm.retry_wait", details={"attempt": attempt, "delay_ms": round(delay * 1000),
+                             "error_code": response.error_kind, "status_code": response.error_status_code})
 
             logger.warning(
                 "LLM transient error (attempt {}{}), retrying in {}s: {}",

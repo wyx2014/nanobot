@@ -17,6 +17,7 @@ import pytest
 from nanobot.cron import service as cron_service_module
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronSchedule
+from nanobot.utils import atomic_file
 
 
 def _seeded_store(tmp_path: Path) -> tuple[CronService, Path]:
@@ -100,10 +101,12 @@ def test_atomic_write_retries_transient_permission_error(
         nonlocal attempts
         attempts += 1
         if attempts < 3:
-            raise PermissionError(13, "temporarily locked")
+            error = PermissionError(13, "temporarily locked")
+            error.winerror = 32
+            raise error
         real_replace(source, destination)
 
-    monkeypatch.setattr(cron_service_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(atomic_file.os, "replace", flaky_replace)
     monkeypatch.setattr(cron_service_module.time, "sleep", sleeps.append)
 
     CronService._atomic_write(store_path, "new")
@@ -126,9 +129,11 @@ def test_atomic_write_exhausts_retries_without_corrupting_existing_file(
     def blocked_replace(_source: Path, _destination: Path) -> None:
         nonlocal attempts
         attempts += 1
-        raise PermissionError(13, "still locked")
+        error = PermissionError(13, "still locked")
+        error.winerror = 5
+        raise error
 
-    monkeypatch.setattr(cron_service_module.os, "replace", blocked_replace)
+    monkeypatch.setattr(atomic_file.os, "replace", blocked_replace)
     monkeypatch.setattr(cron_service_module.time, "sleep", lambda _delay: None)
 
     with pytest.raises(PermissionError, match="still locked"):

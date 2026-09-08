@@ -91,6 +91,7 @@ class ActiveTurn:
     task: asyncio.Task[Any] | None = None
     final_answer_committed: bool = False
     same_turn_children: set[str] = field(default_factory=set)
+    monotonic_started_at: float = field(default_factory=time.perf_counter)
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -252,6 +253,11 @@ class ThreadRuntimeRegistry:
             facts.snapshot_revision += 1
             snapshot = self._snapshot_locked(context.session_key, facts)
         activate_turn_trace(active.trace_id)
+        from nanobot.observability.operations import record_operation
+        record_operation("turn.lifecycle", status="started", trace_id=active.trace_id,
+                         turn_id=active.id, project_id=project_id, session_id=session_id,
+                         client_action_id=context.metadata.get("client_action_id"),
+                         details={"runtime_epoch": self.runtime_epoch})
         if self._trace_collector is not None:
             await self._trace_collector.begin_trace(
                 trace_id=active.trace_id,
@@ -263,6 +269,7 @@ class ThreadRuntimeRegistry:
                 attributes={
                     "channel": active.context.channel,
                     "session_key": active.context.session_key,
+                    "client_action_id": context.metadata.get("client_action_id"),
                 },
             )
         if self._runtime_events is not None:
@@ -445,6 +452,14 @@ class ThreadRuntimeRegistry:
                 error_code=terminal.error.code if terminal.error is not None else None,
                 error=terminal.error.payload() if terminal.error is not None else None,
             )
+        from nanobot.observability.operations import record_operation
+        record_operation("turn.lifecycle", status={TurnStatus.COMPLETED: "completed", TurnStatus.FAILED: "failed", TurnStatus.INTERRUPTED: "cancelled"}[terminal.status],
+                         trace_id=terminal.trace_id, turn_id=terminal.id,
+                         project_id=terminal.project_id, session_id=terminal.session_id,
+                         client_action_id=context.metadata.get("client_action_id"),
+                         duration_ms=round((time.perf_counter() - active.monotonic_started_at) * 1000),
+                         error_code=terminal.error.code if terminal.error else None,
+                         details={"runtime_epoch": terminal.runtime_epoch, "finish_reason": terminal.finish_reason.value})
         clear_trace_context()
         return terminal
 

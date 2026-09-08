@@ -12,6 +12,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.observability.operations import record_operation
 from nanobot.observability.trace_store import TraceStore
 from nanobot.runtime.trace_context import (
     TraceContext,
@@ -43,6 +44,7 @@ class TraceCollector:
         self._queue: asyncio.Queue[_WriteOperation | None] | None = None
         self._worker: asyncio.Task[None] | None = None
         self._dropped = 0
+        self._operation_spans: dict[str, tuple[float, str, str, str]] = {}
 
     @staticmethod
     def new_trace_id() -> str:
@@ -235,6 +237,11 @@ class TraceCollector:
         if current is None or current.run_id is None:
             return None
         span_id = self.new_span_id()
+        if len(self._operation_spans) >= self.max_queue:
+            self._operation_spans.pop(next(iter(self._operation_spans)))
+        self._operation_spans[span_id] = (time.perf_counter(), name, current.trace_id, current.run_id)
+        record_operation("trace.span", status="started", trace_id=current.trace_id,
+                         run_id=current.run_id, span_id=span_id, details={**(attributes or {}), "stage": name})
         await self._submit(
             "begin_span",
             wait=True,
@@ -263,6 +270,14 @@ class TraceCollector:
     ) -> None:
         if span_id is None:
             return
+        timing = self._operation_spans.pop(span_id, None)
+        record_operation("trace.span", status=status, span_id=span_id,
+                         trace_id=timing[2] if timing else None,
+                         run_id=timing[3] if timing else None,
+                         duration_ms=round((time.perf_counter() - timing[0]) * 1000) if timing else None,
+                         error_code=error_code,
+                         details={**(attributes or {}), **(usage or {}), "ttft_ms": ttft_ms,
+                                  "stage": timing[1] if timing else None})
         await self._submit(
             "finish_span",
             wait=False,

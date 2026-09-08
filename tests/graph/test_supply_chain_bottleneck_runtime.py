@@ -248,7 +248,7 @@ async def test_runtime_persists_team_lead_content_without_rerunning_synthesis() 
     assert writes[0][0].endswith("供应链瓶颈地图.md")
     assert "核心结论" in writes[0][1]
     assert "report_recovered" in published
-    assert outcome.stop_reason == "completed"
+    assert outcome.stop_reason == "completed_with_warnings"
     assert outcome.graph_state["status"] == "completed_with_warnings"
 
 
@@ -285,7 +285,7 @@ async def test_runtime_builds_evidence_report_when_lead_only_returns_placeholder
 
     assert "降级交付" in saved[0]
     assert "trend-verifier current-run evidence" in saved[0]
-    assert outcome.stop_reason == "completed"
+    assert outcome.stop_reason == "completed_with_warnings"
 
 
 async def _async_batch(tasks: dict[str, str]) -> MemberBatchOutcome:

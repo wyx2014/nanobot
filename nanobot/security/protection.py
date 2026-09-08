@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -13,11 +14,17 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import urlparse
 
+from nanobot.security.audit import (
+    audit_url,
+    capture_http_audit,
+    redact_security_details,
+    redact_security_text,
+)
 from nanobot.security.project_context import current_project_context
 from nanobot.storage.logs import StructuredLogStore
 
@@ -27,7 +34,6 @@ ApprovalCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 _POLICY_FILE = "security-policy.json"
 _EMERGENCY_AUDIT_FILE = "security-emergency.jsonl"
-_MAX_COMMAND_PREVIEW = 2_000
 _MAX_POLICY_ITEMS = 200
 _MAX_POLICY_VALUE = 500
 _RETENTION_DAYS = 3 * 365
@@ -67,6 +73,7 @@ class AuditHandle:
     started_at: float
     emergency: bool = False
     fallback_payload: dict[str, Any] = field(default_factory=dict)
+    http_activity: dict[str, Any] = field(default_factory=dict)
 
 
 def _canonical(path: str | Path, workspace: Path | None = None) -> Path:
@@ -84,41 +91,6 @@ def _within(path: Path, root: Path) -> bool:
     candidate = _compare(path)
     base = _compare(root)
     return candidate == base or candidate.startswith(base + os.sep)
-
-
-def redact_security_text(value: str) -> str:
-    """Redact common credentials embedded in otherwise unstructured commands."""
-    text = str(value)
-    patterns = (
-        (r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)\S+", r"\1[REDACTED]"),
-        (r"(?i)\b(api[_-]?key|access[_-]?token|password|passwd|secret)\s*=\s*([^\s;&|]+)", r"\1=[REDACTED]"),
-        (r"(?i)(https?://[^\s:/]+:)[^@\s/]+@", r"\1[REDACTED]@"),
-        (r"\b(?:sk|pk|ghp|github_pat)_[A-Za-z0-9_-]{12,}\b", "[REDACTED]"),
-    )
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text)
-    if len(text) > _MAX_COMMAND_PREVIEW:
-        text = text[:_MAX_COMMAND_PREVIEW] + "..."
-    return text
-
-
-def redact_security_details(value: Any, *, key: str = "") -> Any:
-    """Keep audit metadata useful without persisting credentials or large payloads."""
-    normalized_key = key.lower().replace("-", "_")
-    if any(marker in normalized_key for marker in ("password", "passwd", "token", "secret", "api_key", "authorization")):
-        return "[REDACTED]"
-    if isinstance(value, dict):
-        return {
-            str(child_key): redact_security_details(child_value, key=str(child_key))
-            for child_key, child_value in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [redact_security_details(item, key=key) for item in value[:100]]
-    if isinstance(value, str):
-        return redact_security_text(value[:_MAX_COMMAND_PREVIEW])
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    return redact_security_text(str(value))
 
 
 class SecurityPolicyStore:
@@ -451,7 +423,7 @@ class SecurityApprovalBroker:
         try:
             return await asyncio.wait_for(future, timeout=timeout_s)
         except asyncio.TimeoutError:
-            return "deny"
+            return "timed_out"
         finally:
             self._pending.pop(approval_id, None)
 
@@ -487,7 +459,7 @@ _HARD_COMMAND_RULES: tuple[tuple[str, str, str], ...] = (
 )
 
 _HIGH_COMMAND_RULES: tuple[tuple[str, str, str], ...] = (
-    ("command.recursive_delete", r"(?i)\b(?:rm\b[^\n;&|]*(?:\s-r|\s-R|--recursive)|del\b[^\n;&|]*/s|rmdir\b[^\n;&|]*/s|remove-item\b[^\n;&|]*(?:-recurse|-r\b)|find\b[^\n;&|]*-delete|xargs\b[^\n;&|]*\brm\b)", "递归或批量删除可能造成数据丢失"),
+    ("command.recursive_delete", r"(?i)\b(?:rm\b[^\n;&|]*(?:\s-[a-z]*r[a-z]*\b|--recursive)|del\b[^\n;&|]*/s|rmdir\b[^\n;&|]*/s|remove-item\b[^\n;&|]*(?:-recurse|-r\b)|find\b[^\n;&|]*-delete|xargs\b[^\n;&|]*\brm\b)", "递归或批量删除可能造成数据丢失"),
     ("command.destructive_git", r"(?i)\bgit\s+(?:reset\s+--hard|clean\s+[^\n;&|]*-f|push\s+[^\n;&|]*(?:--force|-f\b)|checkout\s+--\s*\.)", "破坏性 Git 操作可能丢失本地或远程历史"),
     ("command.remote_execute", r"(?i)(?:curl|wget|Invoke-WebRequest)[^\n;&|]*\|\s*(?:sh|bash|zsh|python|powershell|iex)\b", "下载后直接执行远程代码"),
     ("command.obfuscated", r"(?i)\b(?:powershell|pwsh)\b[^\n;&|]*(?:-enc\b|-encodedcommand\b|-executionpolicy\s+bypass)|\b(?:eval|Invoke-Expression|IEX|set-executionpolicy)\b", "动态或编码执行会隐藏真实操作"),
@@ -547,18 +519,59 @@ class SecurityService:
     def policy_payload(self) -> dict[str, Any]:
         return self.policy.payload()
 
+    def begin_model_audit(
+        self, *, provider: Any, model: str, session_key: str | None, turn_id: str | None,
+        agent_label: str | None = None,
+    ) -> AuditHandle | None:
+        base = getattr(provider, "api_base", None)
+        destination = audit_url(base) if isinstance(base, str) and base else None
+        try:
+            return self.begin_audit(
+                SecurityAssessment(
+                    "allow", "normal", "network", "model_request", "network.model_request",
+                    "向配置的模型服务提交上下文", target=destination or type(provider).__name__,
+                    details={"model": model, "provider": type(provider).__name__,
+                             "destination_known": bool(destination),
+                             "observation": "provider_request",
+                             "data_categories": ["conversation_context", "tool_definitions"],
+                             "request_count_scope": "logical_request_including_retries"},
+                ), tool_call_id=None, tool_name=None, session_key=session_key, turn_id=turn_id,
+                agent_label=agent_label,
+            )
+        except AuditUnavailable:
+            return None
+
     def update_policy(self, payload: dict[str, Any]) -> dict[str, Any]:
-        saved = self.policy.save(payload)
-        self._record_setting_change("security.policy_updated", saved)
+        self._change_policy(payload)
         return self.policy.payload()
 
     def reset_policy(self) -> dict[str, Any]:
-        saved = self.policy.reset()
-        self._record_setting_change("security.policy_reset", saved)
+        self._change_policy(None)
         return self.policy.payload()
 
+    def _change_policy(self, payload: dict[str, Any] | None) -> None:
+        before = self.policy.load()
+        handle = self.begin_audit(
+            SecurityAssessment(
+                "allow", "normal", "settings", "reset" if payload is None else "update",
+                "security.policy_reset" if payload is None else "security.policy_updated",
+                "更新安全防护设置", target="security-policy", mutating=True,
+                details={"actor": "user"},
+            ), tool_call_id=None, tool_name=None, session_key=None, turn_id=None,
+        )
+        try:
+            saved = self.policy.reset() if payload is None else self.policy.save(payload)
+        except Exception as exc:
+            self.complete_audit(handle, result="failed", details={"error_type": type(exc).__name__})
+            raise
+        changes = {
+            key: {"before": before.get(key), "after": value}
+            for key, value in saved.items() if before.get(key) != value
+        }
+        self.complete_audit(handle, result="succeeded", details={"changes": changes})
+
     @contextmanager
-    def network_context(self):
+    def network_context(self, audit: AuditHandle | None = None):
         from nanobot.security.network import reset_network_policy, set_network_policy
 
         policy = self.policy.load()
@@ -568,27 +581,12 @@ class SecurityService:
             deny_domains=policy["network_deny_domains"],
         )
         try:
-            yield
+            with capture_http_audit() as activity:
+                if audit is not None:
+                    audit.http_activity = activity
+                yield
         finally:
             reset_network_policy(token)
-
-    def _record_setting_change(self, rule_id: str, details: dict[str, Any]) -> None:
-        handle = self.begin_audit(
-            SecurityAssessment(
-                decision="allow",
-                risk="normal",
-                category="settings",
-                action="update",
-                rule_id=rule_id,
-                summary="安全防护设置已更新",
-                details=details,
-            ),
-            tool_call_id=None,
-            tool_name=None,
-            session_key=None,
-            turn_id=None,
-        )
-        self.complete_audit(handle, result="succeeded")
 
     def assess(
         self,
@@ -600,7 +598,12 @@ class SecurityService:
     ) -> SecurityAssessment:
         root = (workspace or self.workspace).expanduser().resolve(strict=False)
         if tool_name == "exec":
-            return self._assess_command(str(params.get("command") or params.get("cmd") or ""), params, root)
+            assessment = self._assess_command(str(params.get("command") or params.get("cmd") or ""), params, root)
+            return replace(assessment, details={
+                **assessment.details,
+                "working_directory": str(_canonical(str(params.get("working_dir") or params.get("workdir") or root), root)),
+                "observation": "command_invocation",
+            })
         network_assessment = self._assess_network_tool(tool_name, params)
         if network_assessment is not None:
             return network_assessment
@@ -616,18 +619,43 @@ class SecurityService:
             return SecurityAssessment(
                 "allow", "normal", "command", "execute_cli", "command.cli_app",
                 f"运行已安装的 CLI 应用 {target}", target=target, mutating=True,
-                details={"arguments": params.get("args") or []},
+                details={"argument_count": len(params.get("args") or []), "working_directory": str(root)},
             )
         if tool_name.startswith("mcp_"):
             read_only = bool(getattr(tool, "read_only", False))
             return SecurityAssessment(
-                "allow", "normal", "mcp", "call", "mcp.tool_call",
+                "allow", "normal", "network", "mcp_call", "mcp.tool_call",
                 f"调用 MCP 工具 {tool_name}", target=tool_name,
                 audit_required=True, mutating=not read_only,
-                details={"arguments": params},
+                details={
+                    "server": getattr(tool, "_server_name", None),
+                    "argument_names": list(params),
+                    "data_categories": ["tool_arguments"],
+                    "observation": "tool_invocation",
+                    "destination_known": False,
+                },
             )
 
-        paths = self._tool_paths(tool_name, params, root)
+        if tool_name == "export_presentation":
+            from nanobot.agent.tools.context import current_request_session_key
+            from nanobot.presentations import PresentationError, PresentationService
+
+            try:
+                session_key = current_request_session_key()
+                if not session_key:
+                    raise PresentationError("Conversation context is required")
+                document = PresentationService(self.workspace).document(
+                    params.get("document_id", ""), session_key
+                )
+                folder = Path(document["project_path"])
+                paths = [folder, folder / f"presentation.{document['format']}", folder / "preview.pdf"]
+            except (PresentationError, OSError):
+                return SecurityAssessment(
+                    "block", "high", "file", "write", "presentation.invalid_document",
+                    "演示文稿不存在或不属于当前会话", mutating=True,
+                )
+        else:
+            paths = self._tool_paths(tool_name, params, root)
         mutating = self._tool_mutates(tool_name, tool)
         if tool_name == "apply_patch" and params.get("dry_run") is True:
             mutating = False
@@ -655,7 +683,7 @@ class SecurityService:
                 self._matches(path, policy["file_allow_paths"]) for path in paths
             ):
                 return SecurityAssessment(
-                    "allow", "normal", "file", self._file_action(tool_name),
+                    "allow", "sensitive" if any(self._is_sensitive_path(path) for path in paths) else "normal", "file", self._file_action(tool_name),
                     "file.user_allowed_path", "目标命中用户设置的自动放行白名单",
                     target=", ".join(str(path) for path in paths[:3]), mutating=True,
                     details={"paths": [str(path) for path in paths]},
@@ -669,7 +697,7 @@ class SecurityService:
                 "create": "通过文件工具创建文件",
             }
             return SecurityAssessment(
-                "allow", "normal", "file", action, "file.normal_write",
+                "allow", "sensitive" if any(self._is_sensitive_path(path) for path in paths) else "normal", "file", action, "file.normal_write",
                 summaries.get(action, "文件操作已通过安全检查"),
                 target=target, mutating=True,
                 details={"paths": [str(path) for path in paths]},
@@ -778,9 +806,7 @@ class SecurityService:
             return None
         policy = self.policy.load()
         is_search = tool_name == "web_search"
-        target = str(
-            (params.get("query") if is_search else params.get("url")) or tool_name
-        ).strip()
+        target = tool_name if is_search else audit_url(str(params.get("url") or ""))
         hosts = self._hosts_from_values(params.get("url", ""))
         blocked = self._network_decision(
             policy,
@@ -797,7 +823,10 @@ class SecurityService:
             target=redact_security_text(target or tool_name),
             audit_required=True,
             mutating=False,
-            details={"domains": hosts},
+            details={
+                "domains": hosts, "data_categories": ["search_terms" if is_search else "url"],
+                "observation": "tool_invocation", "destination_known": bool(hosts),
+            },
         )
 
     def _assess_network_command(
@@ -947,7 +976,8 @@ class SecurityService:
     def _tool_mutates(tool_name: str, _tool: Any | None) -> bool:
         return tool_name in {
             "write_file", "edit_file", "apply_patch", "create_docx", "create_pdf",
-            "create_research_chart",
+            "create_research_chart", "create_presentation", "import_presentation_asset",
+            "export_presentation",
         }
 
     @staticmethod
@@ -968,28 +998,55 @@ class SecurityService:
                 if isinstance(edit, dict) and isinstance(edit.get("path"), str):
                     values.append(edit["path"])
         else:
-            for key in ("path", "output_path"):
+            path_keys = (
+                ("path", "output_path", "preview_path")
+                if tool_name == "create_presentation" else ("path", "output_path")
+            )
+            for key in path_keys:
                 value = params.get(key)
                 if isinstance(value, str) and value.strip():
                     values.append(value)
-            if tool_name in {"create_docx", "create_pdf"} and not params.get("output_path"):
+            if tool_name in {"create_docx", "create_pdf", "create_presentation"} and not params.get("output_path"):
                 source = params.get("source_path")
                 if isinstance(source, str) and source:
-                    suffix = ".docx" if tool_name == "create_docx" else ".pdf"
+                    suffix = {
+                        "create_docx": ".docx",
+                        "create_pdf": ".pdf",
+                        "create_presentation": ".pptx",
+                    }[tool_name]
                     values.append(str(Path(source).with_suffix(suffix)))
         return [_canonical(value, workspace) for value in values]
 
     @staticmethod
     def _command_targets(command: str, cwd: Path) -> list[Path]:
         try:
-            tokens = shlex.split(command, posix=os.name != "nt")
+            lexer = shlex.shlex(command, posix=os.name != "nt", punctuation_chars=";&|<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
         except ValueError:
             tokens = command.split()
         targets: list[Path] = []
         destructive = False
+        redirect_target = False
+        redirect_fd = False
         for token in tokens:
             lower = token.lower().strip('"\'')
-            if lower in {"rm", "del", "rmdir", "remove-item", "truncate", "shred", "chmod", "chown", "takeown", "icacls"}:
+            if redirect_target:
+                redirect_target = False
+                if lower and not (redirect_fd and (lower.isdigit() or lower == "-")):
+                    targets.append(_canonical(token.strip('"\''), cwd))
+                continue
+            if lower in {">", ">>", ">|", ">&", ">>&"}:
+                redirect_target = True
+                redirect_fd = lower.endswith("&")
+                continue
+            if lower in {
+                "rm", "del", "rmdir", "remove-item", "truncate", "shred", "chmod",
+                "chown", "takeown", "icacls", "cp", "mv", "touch", "mkdir", "install",
+                "set-content", "add-content", "out-file", "copy-item", "move-item",
+                "new-item", "rename-item",
+            }:
                 destructive = True
                 continue
             if lower in {";", "&&", "||", "|"}:
@@ -1019,6 +1076,15 @@ class SecurityService:
         return unique
 
     def _is_protected_state(self, path: Path) -> bool:
+        presentation_state = self.workspace / ".nanobot" / "presentations"
+        if _within(path, presentation_state):
+            return True
+        # Bound template snapshots and manifests may only be changed by the gateway.
+        for parent in (path, *path.parents):
+            if parent.name == ".source" and parent.parent.parent.name == "presentations":
+                return True
+        if path.name == "presentation.json" and path.parent.parent.name == "presentations":
+            return True
         return any(_compare(path) == _compare(item) for item in self._protected_state)
 
     @staticmethod
@@ -1028,7 +1094,9 @@ class SecurityService:
     @staticmethod
     def _is_sensitive_path(path: Path) -> bool:
         normalized = str(path).replace("\\", "/").lower()
-        return any(part in normalized for part in _SENSITIVE_PARTS)
+        return (any(part in normalized for part in _SENSITIVE_PARTS)
+                or path.name.lower() == ".env" or path.name.lower().startswith(".env.")
+                or path.suffix.lower() in {".key", ".pem", ".p12", ".pfx"})
 
     @staticmethod
     def _is_system_write_path(path: Path) -> bool:
@@ -1052,6 +1120,7 @@ class SecurityService:
         interactive: bool,
         tool_call_id: str,
         tool_name: str,
+        audit: AuditHandle | None = None,
     ) -> tuple[bool, str]:
         if assessment.decision == "block":
             return False, "blocked"
@@ -1062,6 +1131,10 @@ class SecurityService:
         if not interactive or callback is None:
             return False, "blocked_unattended"
         approval_id = f"sap_{uuid.uuid4().hex}"
+        self.complete_audit(audit, result="pending", details={
+            "approval_id": approval_id, "approval_scope": "turn",
+            "approval_requested_at": time.time_ns() // 1_000_000,
+        })
         payload = {
             "approval_id": approval_id,
             "tool_call_id": tool_call_id,
@@ -1076,7 +1149,7 @@ class SecurityService:
         if decision == "allow_turn":
             turn_grants.add(assessment.grant_key)
             return True, "approved"
-        return False, "denied"
+        return False, "timed_out" if decision == "timed_out" else "denied"
 
     def begin_audit(
         self,
@@ -1086,34 +1159,66 @@ class SecurityService:
         tool_name: str | None,
         session_key: str | None,
         turn_id: str | None,
+        agent_label: str | None = None,
     ) -> AuditHandle | None:
         if not assessment.audit_required:
             return None
+        if tool_name == "write_stdin" and assessment.target and session_key:
+            try:
+                previous = self.logs.find_running_security_command(assessment.target, session_key)
+                if previous is not None:
+                    return AuditHandle(
+                        event_id=previous.id,
+                        started_at=time.monotonic() - max(0, (time.time_ns() // 1_000_000 - previous.timestamp) / 1000),
+                        fallback_payload={**vars(previous), "details": previous.details},
+                    )
+            except Exception:
+                pass
         project = current_project_context()
         details = redact_security_details(assessment.details)
         if not isinstance(details, dict):
             details = {}
         if session_key:
             details["session_key"] = session_key
+        if agent_label:
+            details["agent_label"] = redact_security_text(agent_label)
+        details["initial_decision"] = assessment.decision
+        details["actor"] = details.get("actor", "agent")
+        ordinary_file = (
+            assessment.category == "file" and assessment.risk == "normal"
+            and assessment.decision == "allow" and assessment.action != "delete"
+            and bool(assessment.details.get("paths"))
+            and all(_within(_canonical(path), project.root_path if project else self.workspace)
+                    for path in assessment.details["paths"])
+        )
+        if turn_id and session_key and (ordinary_file or (
+            assessment.category == "network" and assessment.action in {"search", "model_request"}
+            and assessment.decision == "allow"
+        )):
+            group = [project.project_id if project else None, session_key, turn_id,
+                     assessment.category, assessment.action, tool_name,
+                     None if ordinary_file else assessment.target]
+            details["aggregate_key"] = hashlib.sha256(json.dumps(group).encode()).hexdigest()
+            details["operation_count"] = 1
         payload = {
             "category": assessment.category,
             "action": assessment.action,
             "decision": assessment.decision,
             "risk": assessment.risk,
-            "summary": assessment.summary,
+            "summary": redact_security_text(assessment.summary),
             "rule_id": assessment.rule_id,
             "project_id": project.project_id if project is not None else None,
             "session_id": project.session_id if project is not None else None,
             "turn_id": turn_id,
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
-            "target": assessment.target,
+            "target": redact_security_text(assessment.target) if assessment.target else None,
             "details": details,
         }
         started = time.monotonic()
         try:
             event_id = self.logs.begin_security_event(**payload)
-            return AuditHandle(event_id=event_id, started_at=started)
+            return AuditHandle(event_id=event_id, started_at=started, fallback_payload=payload)
         except Exception as exc:
             fallback = {"timestamp": time.time_ns() // 1_000_000, **payload, "result": "pending"}
             if self._write_emergency(fallback):
@@ -1127,12 +1232,17 @@ class SecurityService:
         result: str,
         decision: str | None = None,
         details: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         if handle is None:
-            return
+            return True
         safe_details = redact_security_details(details or {})
         if not isinstance(safe_details, dict):
             safe_details = {}
+        if handle.http_activity.get("request_count"):
+            safe_details["http_activity"] = redact_security_details(handle.http_activity)
+        handle.fallback_payload["details"] = {**handle.fallback_payload.get("details", {}), **safe_details}
+        if decision:
+            handle.fallback_payload["decision"] = decision
         duration_ms = max(0, round((time.monotonic() - handle.started_at) * 1000))
         if handle.event_id is not None:
             try:
@@ -1143,7 +1253,18 @@ class SecurityService:
                     duration_ms=duration_ms,
                     details=safe_details,
                 )
-                return
+                return True
+            except LookupError:
+                # A user may clear the audit while an operation is running.
+                # Preserve its eventual outcome with the original provenance.
+                payload = {key: value for key, value in handle.fallback_payload.items()
+                           if key not in {"id", "timestamp", "duration_ms", "result"}}
+                payload["details"] = {**payload.get("details", {}), **safe_details}
+                try:
+                    handle.event_id = self.logs.begin_security_event(**payload, result=result)
+                    return True
+                except Exception:
+                    pass
             except Exception:
                 pass
         payload = {
@@ -1154,7 +1275,7 @@ class SecurityService:
             **({"decision": decision} if decision else {}),
             **({"completion_details": safe_details} if safe_details else {}),
         }
-        self._write_emergency(payload)
+        return self._write_emergency(payload)
 
     def _write_emergency(self, payload: dict[str, Any]) -> bool:
         try:

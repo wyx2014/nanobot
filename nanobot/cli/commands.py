@@ -45,19 +45,9 @@ _log_handler_id = logger.add(
 _desktop_log_file = os.environ.get("NANOBOT_LOG_FILE")
 if _desktop_log_file:
     try:
-        desktop_log_path = Path(_desktop_log_file)
-        desktop_log_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.add(
-            desktop_log_path,
-            format=_LOG_FORMAT,
-            level="INFO",
-            encoding="utf-8",
-            colorize=False,
-            rotation="5 MB",
-            retention=3,
-            filter=lambda record: record["extra"].setdefault("channel", "-")
-            or True,
-        )
+        from nanobot.utils.desktop_logging import add_desktop_file_logging
+
+        add_desktop_file_logging(Path(_desktop_log_file), _LOG_FORMAT)
     except OSError as exc:
         logger.warning("Could not initialize desktop log file {}: {}", _desktop_log_file, exc)
 
@@ -1107,6 +1097,9 @@ def _run_gateway(
     performance_logs = StructuredLogStore(
         config.workspace_path / ".nanobot" / "logs.sqlite"
     )
+    from nanobot.observability.operations import configure_operations, record_operation
+    operation_recorder = configure_operations(performance_logs)
+    record_operation("gateway.started", details={"stage": "runtime_initialized"})
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
@@ -1240,7 +1233,8 @@ def _run_gateway(
             finally:
                 from nanobot.webui.token_usage import record_response_token_usage
 
-                record_response_token_usage(
+                await asyncio.to_thread(
+                    record_response_token_usage,
                     resp,
                     source="dream",
                     timezone_name=config.agents.defaults.timezone,
@@ -1601,7 +1595,15 @@ def _run_gateway(
                 logger.info("Shutdown: flushed {} session(s) to disk", flushed)
 
     _desktop_startup_phase("gateway-event-loop-entering", startup_started_at)
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except BaseException:
+        record_operation("gateway.stopped", status="failed", error_code="GATEWAY_EXIT_FAILED")
+        raise
+    else:
+        record_operation("gateway.stopped", status="completed")
+    finally:
+        operation_recorder.close()
 
 
 # ============================================================================

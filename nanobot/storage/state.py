@@ -3340,6 +3340,12 @@ class StateStore:
             raise EventProjectionError(
                 f"task progress turn {bound_turn_id!r} does not match event turn {turn_id!r}"
             )
+        owner_turn = connection.execute(
+            "SELECT status FROM turns WHERE id = ? AND project_id = ?",
+            (turn_id, session.project_id),
+        ).fetchone()
+        if owner_turn is not None and owner_turn["status"] in {"completed", "failed", "cancelled"}:
+            return
         current_progress = connection.execute(
             "SELECT revision, kind, status FROM turn_progress WHERE turn_id = ?",
             (turn_id,),
@@ -3468,6 +3474,20 @@ class StateStore:
             else "completed" if all(step[2] == "completed" for step in normalized)
             else "pending"
         )
+        if plan_kind == "workflow":
+            graph_state = agent_ui.get("graph_state")
+            graph_status = graph_state.get("status") if isinstance(graph_state, dict) else None
+            workflow_status = graph_status or agent_ui.get("status")
+            if workflow_status in {"completed", "completed_with_warnings"}:
+                overall = "completed"
+            elif workflow_status in {"cancelled", "interrupted"}:
+                overall = "cancelled"
+            elif workflow_status in {"running", "failed"}:
+                overall = workflow_status
+            elif non_terminal:
+                overall = "running" if running_count else "pending"
+            elif all(step[2] == "cancelled" for step in normalized):
+                overall = "cancelled"
         if (
             current_progress is not None
             and str(current_progress["status"]) in {"completed", "failed", "cancelled"}
@@ -4253,10 +4273,26 @@ class StateStore:
             )
             connection.commit()
 
+    def has_unscoped_artifact_references(self, session_key: str) -> bool:
+        """Whether a read still needs legacy transcript evidence for file ownership."""
+        with self._lock, self._connection() as connection:
+            return connection.execute(
+                """
+                SELECT 1 FROM artifact_links AS l
+                JOIN sessions AS s ON s.id = l.session_id AND s.project_id = l.project_id
+                WHERE s.session_key = ? AND l.relation_type = 'referenced'
+                  AND l.turn_id IS NULL
+                LIMIT 1
+                """,
+                (session_key,),
+            ).fetchone() is not None
+
     def prune_unverified_referenced_artifacts(
         self,
         session_key: str,
         allowed_relative_paths: set[str],
+        *,
+        turn_by_path: dict[str, str] | None = None,
     ) -> int:
         """Unlink legacy mtime-discovered files that lack session evidence.
 
@@ -4295,14 +4331,46 @@ class StateStore:
                 for row in stale_rows
                 if str(row["relative_path"]) not in allowed
             ]
-            if not stale_link_ids:
+            if not stale_link_ids and not turn_by_path:
                 return 0
-            placeholders = ",".join("?" for _ in stale_link_ids)
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                f"DELETE FROM artifact_links WHERE id IN ({placeholders})",
-                stale_link_ids,
-            )
+            if stale_link_ids:
+                placeholders = ",".join("?" for _ in stale_link_ids)
+                connection.execute(
+                    f"DELETE FROM artifact_links WHERE id IN ({placeholders})",
+                    stale_link_ids,
+                )
+            # Repair all legacy turn links in this transaction instead of
+            # opening and committing a new connection for each discovered file.
+            updated = 0
+            for path, turn_id in (turn_by_path or {}).items():
+                normalized_path = Path(path).as_posix().lstrip("/")
+                if normalized_path not in allowed:
+                    continue
+                cursor = connection.execute(
+                    """
+                    UPDATE artifact_links SET turn_id = ?
+                    WHERE session_id = ? AND project_id = ?
+                      AND relation_type = 'referenced' AND turn_id IS NULL
+                      AND artifact_id IN (
+                          SELECT id FROM artifacts WHERE project_id = ? AND relative_path = ?
+                      )
+                      AND EXISTS (
+                          SELECT 1 FROM turns WHERE id = ? AND session_id = ? AND project_id = ?
+                      )
+                    """,
+                    (turn_id, session.id, session.project_id, session.project_id,
+                     normalized_path, turn_id, session.id, session.project_id),
+                )
+                updated += max(0, cursor.rowcount)
+            if updated:
+                connection.execute(
+                    """
+                    UPDATE sessions SET artifact_revision = artifact_revision + 1,
+                        updated_at = MAX(updated_at, ?) WHERE id = ?
+                    """,
+                    (_now_ms(), session.id),
+                )
             connection.commit()
         return len(stale_link_ids)
 
@@ -4822,10 +4890,13 @@ class StateStore:
         )
 
         records: list[ArtifactRecord] = []
+        projects: dict[str, ProjectRecord | None] = {}
         for row in selected_rows:
             record = self._artifact_record(row)
             if record.status in {"ready", "missing"}:
-                project = self.get_project(record.project_id)
+                if record.project_id not in projects:
+                    projects[record.project_id] = self.get_project(record.project_id)
+                project = projects[record.project_id]
                 exists = (
                     project is not None
                     and self._artifact_file_exists(project, record.relative_path)
@@ -5118,6 +5189,18 @@ class StateStore:
             connection.execute("DELETE FROM tool_calls WHERE session_id = ?", (session.id,))
             connection.execute("DELETE FROM projected_events WHERE session_id = ?", (session.id,))
             connection.execute("DELETE FROM projector_state WHERE session_id = ?", (session.id,))
+            # Older gateway builds left control tables outside the current schema.
+            # Their session foreign keys still apply when replaying a purge tombstone.
+            for table in (
+                "gateway_command_receipts", "queued_inputs", "turn_steers", "security_approvals",
+            ):
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone() is not None:
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE session_id = ?", (session.id,),
+                    )
             connection.execute("DELETE FROM turns WHERE session_id = ?", (session.id,))
             connection.execute("DELETE FROM sessions WHERE id = ?", (session.id,))
             connection.commit()
@@ -5222,6 +5305,62 @@ class StateStore:
             ),
         }
 
+    @staticmethod
+    def _reconcile_team_checkpoint(graph: dict[str, Any], status: str) -> dict[str, Any]:
+        """Overlay the durable lifecycle when cancellation outlived the last checkpoint."""
+        if status not in {"failed", "cancelled"} or graph.get("status") not in {"pending", "running"}:
+            return graph
+        graph.update({"status": status, "active_nodes": [], "degraded": True})
+        for key in ("node_states", "members"):
+            nodes = graph.get(key)
+            if isinstance(nodes, dict):
+                for node in nodes.values():
+                    if isinstance(node, dict) and node.get("status") in {"pending", "running"}:
+                        node["status"] = status
+        for key in ("data_package", "scope_brief"):
+            node = graph.get(key)
+            if isinstance(node, dict) and node.get("status") in {"pending", "running"}:
+                node["status"] = status
+        return graph
+
+    def expert_team_revision_source(
+        self, *, session_key: str, run_id: str, team_id: str,
+    ) -> dict[str, Any] | None:
+        """Read an exact, session-owned run for a user-confirmed revision."""
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT r.graph_state_json, r.status, p.canonical_root_path
+                FROM expert_team_runs r
+                JOIN sessions s ON s.id = r.session_id AND s.project_id = r.project_id
+                JOIN projects p ON p.id = s.project_id
+                WHERE s.session_key = ? AND r.id = ? AND r.team_id = ?
+                """, (session_key, run_id, team_id),
+            ).fetchone()
+            latest = connection.execute(
+                """
+                SELECT r.id FROM expert_team_runs r
+                JOIN sessions s ON s.id = r.session_id AND s.project_id = r.project_id
+                WHERE s.session_key = ? AND r.team_id = ?
+                ORDER BY r.created_at DESC, r.updated_at DESC LIMIT 1
+                """, (session_key, team_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            graph = json.loads(row["graph_state_json"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(graph, dict):
+            return None
+        graph = self._reconcile_team_checkpoint(graph, str(row["status"]))
+        graph["run_id"] = run_id
+        return {
+            "graph_state": graph, "status": row["status"],
+            "root": row["canonical_root_path"],
+            "latest_run_id": latest["id"] if latest else run_id,
+        }
+
     def latest_expert_team_resume(
         self,
         *,
@@ -5259,6 +5398,7 @@ class StateStore:
                     continue
                 if not isinstance(parsed, dict):
                     continue
+                parsed = self._reconcile_team_checkpoint(parsed, str(row["status"]))
                 members = parsed.get("members")
                 if (
                     not isinstance(members, dict)

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
@@ -332,7 +333,7 @@ class SubagentManager:
         registry: ToolRegistry,
         expert_team: dict[str, Any] | None,
     ) -> ToolRegistry:
-        """Limit fixed asset-workflow branches to bound MCP and web fallback tools."""
+        """Expose evidence reads, bound MCP and web fallback for workflow branches."""
 
         raw_presets = (
             expert_team.get("mcp_presets")
@@ -348,7 +349,7 @@ class SubagentManager:
         )
         scoped = ToolRegistry()
         for name in registry.tool_names:
-            if name not in {"web_search", "web_fetch"} and not name.startswith(prefixes):
+            if name not in {"read_file", "web_search", "web_fetch"} and not name.startswith(prefixes):
                 continue
             tool = registry.get(name)
             if tool is not None:
@@ -387,6 +388,7 @@ class SubagentManager:
         task_id = str(uuid.uuid4())[:8]
         child_session_key: str | None = None
         state_store = None
+        parent_turn_id = None
         if project_context is not None:
             from nanobot.storage.state import StateStore, StateStoreError
 
@@ -422,6 +424,7 @@ class SubagentManager:
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "session_key": session_key,
+            **({"turn_id": parent_turn_id} if parent_turn_id else {}),
             **(
                 {"project_id": project_context.project_id}
                 if project_context is not None
@@ -863,21 +866,28 @@ class SubagentManager:
                 )
                 if artifact:
                     final_result = f"{final_result}\n\nRole artifact: `{artifact}`"
-                logger.info("Subagent [{}] completed successfully", task_id)
+                delivery_failed = bool(
+                    expert_team is not None and expert_team_run_id
+                    and origin.get("channel") == "websocket" and not artifact
+                )
+                if delivery_failed:
+                    status.phase = "error"
+                    status.error = "研究正文已生成，但角色产物保存失败"
+                logger.info("Subagent [{}] finished; artifact delivery failed={}", task_id, delivery_failed)
                 await self._announce_result(
                     task_id,
                     label,
                     task,
                     final_result,
                     origin,
-                    "ok",
+                    "error" if delivery_failed else "ok",
                     origin_message_id,
                     expert_team=expert_team is not None,
                 )
                 await self._publish_team_member_update(
                     origin, expert_team, expert_team_run_id,
-                    task_id=task_id, label=label, status="completed",
-                    activity="研究完成，完整结果已交付 Team Lead",
+                    task_id=task_id, label=label, status="failed" if delivery_failed else "completed",
+                    activity=status.error if delivery_failed else "研究完成，完整结果已交付 Team Lead",
                     artifact=artifact,
                 )
 
@@ -1136,9 +1146,15 @@ class SubagentManager:
 
         def _write() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(path.suffix + ".tmp")
-            temporary.write_text(body, encoding="utf-8")
-            temporary.replace(path)
+            temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+            try:
+                with temporary.open("x", encoding="utf-8") as handle:
+                    handle.write(body)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
         try:
             await asyncio.to_thread(_write)
@@ -1152,7 +1168,7 @@ class SubagentManager:
                 origin.get("session_key")
                 or f"{origin['channel']}:{origin['chat_id']}"
             )
-            turn_id = state.active_turn_id(parent_session_key)
+            turn_id = origin.get("turn_id") or state.active_turn_id(parent_session_key)
             await asyncio.to_thread(
                 state.register_artifact,
                 parent_session_key,

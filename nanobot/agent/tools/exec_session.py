@@ -388,6 +388,8 @@ def _truncate_output(output: str, max_output_chars: int) -> tuple[str, int]:
 
 
 def format_session_poll(session_id: str, poll: _SessionPoll) -> str:
+    from nanobot.security.audit import AuditedToolResult
+
     parts = [poll.output] if poll.output else []
     if poll.truncated_chars:
         parts.append(f"(output truncated by {poll.truncated_chars:,} chars)")
@@ -402,7 +404,17 @@ def format_session_poll(session_id: str, poll: _SessionPoll) -> str:
     else:
         parts.append(f"Process running. session_id: {session_id}")
     parts.append(f"Elapsed: {poll.elapsed_s:.1f}s")
-    return "\n".join(parts) if parts else "(no output yet)"
+    outcome = "running"
+    if poll.timed_out:
+        outcome = "timed_out"
+    elif poll.terminated:
+        outcome = "cancelled"
+    elif poll.done:
+        outcome = "succeeded" if poll.exit_code == 0 else "failed"
+    return AuditedToolResult(
+        "\n".join(parts) if parts else "(no output yet)", result=outcome,
+        process_session_id=session_id, exit_code=poll.exit_code if poll.done else None,
+    )
 
 
 @tool_parameters(
@@ -600,7 +612,12 @@ class WriteStdinTool(Tool):
                 poll.output = "".join(aggregate)
                 result = format_session_poll(session_id, poll)
                 if wait_for not in poll.output:
-                    result += f"\nWait target not observed: {wait_for!r}"
+                    from nanobot.security.audit import AuditedToolResult
+
+                    result = AuditedToolResult(
+                        result + f"\nWait target not observed: {wait_for!r}",
+                        result=result.audit_result, **result.audit_details,
+                    )
                 return result
 
 

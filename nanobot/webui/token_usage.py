@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,6 +15,7 @@ from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.config.paths import get_webui_dir
+from nanobot.utils.atomic_file import atomic_write
 
 TOKEN_USAGE_SCHEMA_VERSION = 1
 _MAX_STATE_FILE_BYTES = 512 * 1024
@@ -171,17 +172,20 @@ def normalize_token_usage_state(raw: Any) -> dict[str, Any]:
     return state
 
 
-def read_token_usage_state() -> dict[str, Any]:
+def read_token_usage_state(*, strict: bool = False) -> dict[str, Any]:
     path = token_usage_state_path()
-    if not path.is_file():
-        return default_token_usage_state()
     try:
         if path.stat().st_size > _MAX_STATE_FILE_BYTES:
-            logger.warning("token usage state too large, ignoring: {}", path)
-            return default_token_usage_state()
+            raise ValueError("token usage state is too large")
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+        if strict and (not isinstance(raw, dict) or not isinstance(raw.get("days"), dict)):
+            raise ValueError("invalid token usage state")
+    except FileNotFoundError:
+        return default_token_usage_state()
+    except (OSError, ValueError) as e:
+        if strict:
+            raise
         logger.warning("read token usage state failed {}: {}", path, e)
         return default_token_usage_state()
     return normalize_token_usage_state(raw)
@@ -200,22 +204,7 @@ def write_token_usage_state(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("token usage state is too large")
 
     path = token_usage_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    with open(tmp, "wb") as f:
-        f.write(encoded)
-        f.write(b"\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    try:
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return state
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    atomic_write(path, encoded + b"\n", label="Token usage")
     return state
 
 
@@ -231,7 +220,8 @@ def record_token_usage(
         return read_token_usage_state()
 
     with _WRITE_LOCK:
-        state = read_token_usage_state()
+        # An unreadable history must never become an empty replacement snapshot.
+        state = read_token_usage_state(strict=True)
         day = _local_day(now, timezone_name=timezone_name)
         row = dict(state["days"].get(day) or {"date": day, "requests": 0})
         for key in _USAGE_KEYS:
@@ -348,7 +338,8 @@ class TokenUsageHook(AgentHook):
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         try:
-            record_token_usage(
+            await asyncio.to_thread(
+                record_token_usage,
                 context.usage,
                 source=_source_from_session_key(context.session_key),
                 timezone_name=self._timezone_name,

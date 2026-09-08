@@ -1,5 +1,6 @@
 """Tests for SubagentManager."""
 
+import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -31,6 +32,18 @@ async def test_subagent_uses_tool_loader():
     assert tools.has("write_file")
     assert not tools.has("message")
     assert not tools.has("spawn")
+
+
+def test_workflow_members_can_read_supplements_but_cannot_overwrite_reports(tmp_path):
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    manager = SubagentManager(provider=provider, workspace=tmp_path,
+                              bus=MessageBus(), max_tool_result_chars=16000)
+    scoped = manager._workflow_member_tools(manager._build_tools(), {})
+    assert scoped.has("read_file")
+    assert not scoped.has("write_file")
+    assert not scoped.has("edit_file")
+    assert not scoped.has("exec")
 
 
 @pytest.mark.asyncio
@@ -151,7 +164,8 @@ def test_asset_team_inherits_configured_three_source_and_fallback_mcp_tools(tmp_
 
 
 @pytest.mark.asyncio
-async def test_expert_team_member_terminal_result_is_registered_as_artifact(tmp_path):
+@pytest.mark.parametrize("newer_turn", [False, True])
+async def test_expert_team_member_terminal_result_is_registered_as_artifact(tmp_path, newer_turn):
     provider = MagicMock(spec=LLMProvider)
     provider.get_default_model.return_value = "test"
     state = StateStore(
@@ -178,6 +192,18 @@ async def test_expert_team_member_terminal_result_is_registered_as_artifact(tmp_
         max_tool_result_chars=16_000,
     )
 
+    if newer_turn:
+        state.project_event(session.session_key, {
+            "event": "turn_end", "event_id": "artifact-end", "event_seq": 2,
+            "recorded_at": 2, "project_id": project.id, "session_id": session.id,
+            "turn_id": "turn-artifact", "finish_reason": "cancelled",
+        })
+        state.project_event(session.session_key, {
+            "event": "user", "event_id": "next-user", "event_seq": 3,
+            "recorded_at": 3, "project_id": project.id, "session_id": session.id,
+            "turn_id": "next-turn", "text": "new task",
+        })
+
     relative = await manager._persist_expert_team_member_artifact(
         content="# 结论\n\n数据来源：交易所公告",
         label="financial-analyst",
@@ -186,6 +212,7 @@ async def test_expert_team_member_terminal_result_is_registered_as_artifact(tmp_
             "channel": "websocket",
             "chat_id": "artifact-chat",
             "session_key": session.session_key,
+            "turn_id": "turn-artifact",
         },
         workspace_scope=None,
         delivery_status="completed",
@@ -197,3 +224,29 @@ async def test_expert_team_member_terminal_result_is_registered_as_artifact(tmp_
     assert (tmp_path / relative).is_file()
     artifacts = state.list_session_artifacts(session.session_key)
     assert any(item.relative_path == relative for item in artifacts)
+    with sqlite3.connect(state.path) as connection:
+        assert connection.execute("SELECT turn_id FROM artifact_links").fetchall() == [("turn-artifact",)]
+
+
+@pytest.mark.asyncio
+async def test_role_artifact_write_failure_preserves_previous_file_and_cleans_temp(tmp_path, monkeypatch):
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    manager = SubagentManager(provider=provider, workspace=tmp_path,
+                              bus=MessageBus(), max_tool_result_chars=16_000)
+    artifact = tmp_path / "reports/.team-runs/run/members/financial-analyst.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("previous complete result", encoding="utf-8")
+
+    def fail_replace(*_args):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    result = await manager._persist_expert_team_member_artifact(
+        content="new result", label="financial-analyst", run_id="run",
+        origin={"channel": "websocket", "chat_id": "c1"},
+        workspace_scope=None, delivery_status="completed",
+    )
+    assert result is None
+    assert artifact.read_text(encoding="utf-8") == "previous complete result"
+    assert list(artifact.parent.glob("*.tmp")) == []

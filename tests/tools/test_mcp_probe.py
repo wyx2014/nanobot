@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -36,9 +36,13 @@ async def test_probe_returns_false_for_closed_port():
 
 
 @pytest.mark.asyncio
-async def test_probe_uses_default_port_for_http():
-    """When no port in URL, should default to 80 (will fail -> False)."""
-    assert await _probe_http_url("http://unreachable-host.test/mcp") is False
+@pytest.mark.parametrize("scheme, port", [("http", 80), ("https", 443)])
+async def test_probe_uses_default_port(monkeypatch, scheme, port):
+    """Check default ports without relying on external DNS or proxy behavior."""
+    connect = AsyncMock(side_effect=ConnectionRefusedError("closed"))
+    monkeypatch.setattr(asyncio, "open_connection", connect)
+    assert await _probe_http_url(f"{scheme}://unreachable-host.test/mcp") is False
+    connect.assert_awaited_once_with("unreachable-host.test", port)
 
 
 # ---------------------------------------------------------------------------

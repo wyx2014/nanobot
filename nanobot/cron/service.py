@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import os
 import time
 import uuid
 from contextlib import suppress
@@ -25,11 +24,12 @@ from nanobot.cron.types import (
     CronSchedule,
     CronStore,
 )
+from nanobot.utils.atomic_file import REPLACE_RETRY_DELAYS_S, atomic_write
 
 _STALE_RUNNING_RUN_MS = 24 * 60 * 60 * 1000
 _STALE_RUNNING_ERROR = "run interrupted before completion"
 _AUDIT_REPAIR_WINDOW_MS = 60 * 1000
-_ATOMIC_REPLACE_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
+_ATOMIC_REPLACE_RETRY_DELAYS_S = REPLACE_RETRY_DELAYS_S
 
 
 class CronJobSkippedError(Exception):
@@ -527,63 +527,8 @@ class CronService:
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
-        """Write *content* to *path* atomically with fsync.
-
-        Uses a temp-file + ``os.replace`` + ``fsync`` pattern so a crash or
-        SIGKILL mid-write cannot leave the destination truncated or invalid.
-        Mirrors ``nanobot.session.manager.SessionManager.save`` (see
-        commit 512bf59, ``fix(session): fsync sessions on graceful shutdown
-        to prevent data loss``).  Without this, ``jobs.json`` could be
-        corrupted on container shutdown and silently re-created empty on
-        next start, wiping every scheduled job.
-        """
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Use a unique sibling so concurrent writers never truncate each
-        # other's temporary file. Keeping it in the same directory preserves
-        # the atomicity guarantee of os.replace().
-        tmp_path = path.with_name(
-            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())
-
-            # Windows Defender, indexers, and backup tools can briefly hold a
-            # newly-created destination file and make os.replace() fail with
-            # WinError 5/32. Retry only that recoverable class of error; never
-            # fall back to a non-atomic overwrite that could corrupt the store.
-            for attempt, delay_s in enumerate(
-                (*_ATOMIC_REPLACE_RETRY_DELAYS_S, None), start=1
-            ):
-                try:
-                    os.replace(tmp_path, path)
-                    break
-                except PermissionError as exc:
-                    if delay_s is None:
-                        raise
-                    logger.warning(
-                        "Atomic replace temporarily blocked for {} "
-                        "(attempt {}/{}): {}",
-                        path,
-                        attempt,
-                        len(_ATOMIC_REPLACE_RETRY_DELAYS_S) + 1,
-                        exc,
-                    )
-                    time.sleep(delay_s)
-            # fsync the parent directory so the rename itself is durable.
-            # Skip on Windows where opening a directory raises PermissionError;
-            # NTFS journals metadata synchronously so this is a no-op there.
-            with suppress(PermissionError):
-                fd = os.open(str(path.parent), os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        """Write a durable snapshot without truncating the previous store."""
+        atomic_write(path, content, label="Cron")
 
     @staticmethod
     def _safe_run_record_name(run_id: str) -> str:

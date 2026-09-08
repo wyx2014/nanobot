@@ -41,7 +41,7 @@ async def test_model_router_treats_bare_stock_name_as_asset_research() -> None:
     assert usage == [{"prompt_tokens": 120, "completion_tokens": 20}]
     request = provider.chat_with_retry.await_args.kwargs
     assert request["model"] == "test-model"
-    assert request["max_tokens"] == 220
+    assert request["max_tokens"] == 512
     assert request["temperature"] == 0
     assert request["reasoning_effort"] == "none"
     assert "比亚迪" in request["messages"][0]["content"]
@@ -91,10 +91,7 @@ def test_model_router_output_is_validated_before_team_start() -> None:
     assert expert_teams.normalize_expert_team_model_decision({
         "action": "run",
         "target": None,
-    }) == {
-        "action": "clarify",
-        "reason": "model_missing_single_stock_target",
-    }
+    }) is None
     assert expert_teams.normalize_expert_team_model_decision({
         "action": "delete_files",
         "target": "比亚迪",
@@ -106,14 +103,14 @@ def test_asset_team_fallback_never_guesses_semantic_intent() -> None:
         {"id": "asset-research-team"},
         "比亚迪",
     ) == {
-        "action": "bypass",
+        "action": "clarify",
         "reason": "model_route_unavailable",
     }
     assert expert_teams.fallback_expert_team_turn_decision(
         {"id": "supply-chain-bottleneck-team"},
         "AI 基础设施",
     ) == {
-        "action": "bypass",
+        "action": "clarify",
         "reason": "model_route_unavailable",
     }
     assert expert_teams.fallback_expert_team_turn_decision(
@@ -123,6 +120,58 @@ def test_asset_team_fallback_never_guesses_semantic_intent() -> None:
         "action": "run",
         "reason": "team_selected",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", [
+    LLMResponse(content='{"action":"run","target":"安集', finish_reason="length"),
+    LLMResponse(content='{"action":"run"}'),
+    LLMResponse(content='{"action":"run","target":["安集科技","比亚迪"]}'),
+    LLMResponse(content='{"action":"clarify","reason":"stock code missing"}'),
+])
+async def test_router_reviews_incomplete_or_false_clarification_for_named_stock(first):
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        first,
+        LLMResponse(content='```json\n{"action":"run","target":"安集科技","reason":"single stock"}\n```'),
+    ])
+    decision = await expert_teams.classify_expert_team_turn_with_model(
+        provider=provider, model="test-model", history=[], user_message="帮我分析下 安集科技 A股",
+    )
+    assert decision == {"action": "run", "target": "安集科技", "reason": "single stock"}
+    assert provider.chat_with_retry.await_count == 2
+    assert provider.chat_with_retry.await_args.kwargs["max_tokens"] == 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    LLMResponse(content='{"action":"run","target":"安集科技"}', finish_reason="length"),
+    LLMResponse(content='{"action":"run","target":"安集'),
+    LLMResponse(content='{"action":"run","target":null}'),
+])
+async def test_router_never_executes_partial_or_invalid_json_after_bounded_retry(response):
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=response)
+    assert await expert_teams.classify_expert_team_turn_with_model(
+        provider=provider, model="test-model", history=[], user_message="帮我分析下 安集科技 A股",
+    ) is None
+    assert provider.chat_with_retry.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_router_preserves_confirmed_clarification_and_counts_both_attempts():
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content='{"action":"clarify","reason":"no target supplied"}',
+        usage={"total_tokens": 30},
+    ))
+    usage = []
+    result = await expert_teams.classify_expert_team_turn_with_model(
+        provider=provider, model="test-model", history=[], user_message="帮我分析一只股票",
+        usage_callback=usage.append,
+    )
+    assert result == {"action": "clarify", "reason": "no target supplied"}
+    assert usage == [{"total_tokens": 30}, {"total_tokens": 30}]
 
 
 def _write_team(root: Path) -> None:

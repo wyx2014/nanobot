@@ -8,11 +8,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from nanobot.graph.workflows.asset_research_runtime import (
-    AUDIT_MAX_TOOL_ITERATIONS,
     AUDIT_MAX_MODEL_ROUNDS,
+    AUDIT_MAX_TOOL_ITERATIONS,
     AgentNodeOutcome,
     MemberBatchOutcome,
     MemberNodeOutcome,
+    _audit_warning,
     _merge_usage,
     _preferred_report_artifact,
     _strip_duplicate_report_reference,
@@ -618,14 +619,16 @@ class SupplyChainBottleneckWorkflowRuntime:
         artifacts.extend(audit_outcome.artifacts)
         artifacts.append(report_artifact)
         final_artifacts = list(dict.fromkeys(artifacts))
-        if audit_outcome.stop_reason in {"error", "tool_error"}:
-            state["degraded"] = True
+        audit_warning = _audit_warning(audit_outcome)
         state = advance_supply_chain_bottleneck_graph(
             state,
             "audit_completed",
-            {"artifacts": {"report": report_artifact}},
+            {"artifacts": {"report": report_artifact},
+             "verified": not audit_warning, "warning": audit_warning},
         )
-        await self._publish_state(state, "audit_completed", "瓶颈地图已完成审校并交付")
+        await self._publish_state(
+            state, "audit_completed", audit_warning or "瓶颈地图已完成审校并交付",
+        )
 
         final_content = audit_outcome.content.strip() or (
             "供应链瓶颈地图已完成，请通过下方报告卡片查看完整内容。"
@@ -638,25 +641,20 @@ class SupplyChainBottleneckWorkflowRuntime:
             "迭代上限",
             "降级交付",
         )
-        if (
-            audit_outcome.stop_reason == "max_iterations"
-            and any(marker in final_content.lower() for marker in internal_runtime_markers)
-        ):
-            final_content = (
-                "供应链瓶颈地图已完成复核，请查看报告中的瓶颈证据、候选标的、"
-                "估值约束与失效条件。"
-            )
+        if audit_warning:
+            if (audit_outcome.stop_reason in {"error", "tool_error", "empty_final_response"}
+                    or not audit_outcome.content.strip()
+                    or any(marker in final_content.lower() for marker in internal_runtime_markers)):
+                final_content = audit_warning
+            else:
+                final_content = f"{audit_warning}\n\n{final_content}"
         final_content = _strip_duplicate_report_reference(
             final_content,
             report_artifact,
         ) or "供应链瓶颈地图已完成，请通过下方报告卡片查看完整内容。"
         return SupplyChainBottleneckWorkflowOutcome(
             final_content=final_content,
-            stop_reason=(
-                audit_outcome.stop_reason
-                if audit_outcome.stop_reason not in {"error", "tool_error"}
-                else "completed_with_warnings"
-            ),
+            stop_reason="completed_with_warnings" if state.get("degraded") else "completed",
             graph_state=state,
             tools_used=list(dict.fromkeys(tools_used)),
             usage=usage,

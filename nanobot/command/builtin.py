@@ -359,7 +359,8 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
         finally:
             from nanobot.webui.token_usage import record_response_token_usage
 
-            record_response_token_usage(
+            await asyncio.to_thread(
+                record_response_token_usage,
                 resp,
                 source="dream",
                 timezone_name=getattr(loop.context, "timezone", None),

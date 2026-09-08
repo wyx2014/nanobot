@@ -242,7 +242,8 @@ async def test_expert_team_gets_session_scoped_four_agent_limit(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_expert_team_member_uses_recoverable_tool_errors_and_runtime_contract(tmp_path):
+@pytest.mark.parametrize("artifact", ["reports/member.md", None])
+async def test_expert_team_member_uses_recoverable_tool_errors_and_runtime_contract(tmp_path, artifact):
     """Imported team prompts must use nanobot tools and recover from bad sources."""
     from nanobot.agent.subagent import SubagentManager, SubagentStatus
     from nanobot.bus.queue import MessageBus
@@ -264,6 +265,8 @@ async def test_expert_team_member_uses_recoverable_tool_errors_and_runtime_contr
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     )
     mgr._announce_result = AsyncMock()
+    mgr._persist_expert_team_member_artifact = AsyncMock(return_value=artifact)
+    mgr._publish_team_member_update = AsyncMock()
 
     async def fake_run(spec):
         assert spec.fail_on_tool_error is False
@@ -309,10 +312,17 @@ async def test_expert_team_member_uses_recoverable_tool_errors_and_runtime_contr
     )
 
     mgr.runner.run.assert_awaited_once()
+    assert mgr._announce_result.await_args.args[5] == ("ok" if artifact else "error")
+    assert mgr._publish_team_member_update.await_args.kwargs["status"] == (
+        "completed" if artifact else "failed"
+    )
+    if not artifact:
+        assert status.phase == "error"
+        assert _valid_team_report() in mgr._announce_result.await_args.args[3]
 
 
 @pytest.mark.asyncio
-async def test_runtime_owned_asset_member_is_mcp_only_and_hides_legacy_skills(tmp_path):
+async def test_runtime_owned_asset_member_reads_evidence_and_hides_legacy_skills(tmp_path):
     from nanobot.agent.subagent import SubagentManager, SubagentStatus
     from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.bus.queue import MessageBus
@@ -351,6 +361,7 @@ async def test_runtime_owned_asset_member_is_mcp_only_and_hides_legacy_skills(tm
 
     async def fake_run(spec):
         assert set(spec.tools.tool_names) == {
+            "read_file",
             "web_search",
             "web_fetch",
             "mcp_hexin-ifind-ds-stock-mcp_company",
@@ -446,6 +457,7 @@ async def test_expert_team_member_retries_once_before_degrading(tmp_path):
             tool_events=[],
         ),
     ])
+    mgr._persist_expert_team_member_artifact = AsyncMock(return_value="reports/risk.md")
     mgr.runner.run = AsyncMock(side_effect=lambda spec: next(results))
     status = SubagentStatus(
         task_id="team-retry",

@@ -165,6 +165,7 @@ allow-direct-references = true
 include = [
     "nanobot/**/*.py",
     "nanobot/templates/**/*.md",
+    "nanobot/presentation_assets/**/*",
     "nanobot/skills/**/*.md",
     "nanobot/skills/**/*.json",
     "nanobot/skills/**/*.js",

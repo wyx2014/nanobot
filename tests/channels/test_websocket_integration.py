@@ -20,6 +20,62 @@ from nanobot.channels.websocket import WebSocketChannel, WebSocketConfig
 from nanobot.webui.gateway_services import build_gateway_services
 
 
+async def test_http_peer_disconnect_during_route_never_sends_a_second_eof(
+    bus, unused_tcp_port, monkeypatch,
+):
+    from websockets.datastructures import Headers
+    from websockets.http11 import Response
+    from websockets.server import ServerProtocol
+
+    ch = _ch(bus, unused_tcp_port)
+    arrived = asyncio.Queue()
+    release = asyncio.Event()
+    send_states = []
+    original_send = ServerProtocol.send_response
+    def send(protocol, response):
+        send_states.append(protocol.eof_sent)
+        return original_send(protocol, response)
+    async def slow_route(connection, request):
+        await arrived.put(connection)
+        await release.wait()
+        return Response(200, "OK", Headers({"Content-Length": "2", "Connection": "close"}), b"{}")
+    monkeypatch.setattr(ServerProtocol, "send_response", send)
+    monkeypatch.setattr(ch, "_dispatch_http", slow_route)
+    task = asyncio.create_task(ch.start())
+    writers = []
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                try:
+                    reader, writer = await asyncio.open_connection("127.0.0.1", unused_tcp_port)
+                    break
+                except ConnectionRefusedError:
+                    await asyncio.sleep(0.01)
+            writers.append(writer)
+            writer.write(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            connection = await arrived.get()
+            writer.transport.abort()
+            await connection.connection_lost_waiter
+            release.set()
+            await asyncio.sleep(0.05)
+            assert send_states == []
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", unused_tcp_port)
+            writers.append(writer)
+            writer.write(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            assert b"200 OK" in await reader.read()
+            assert send_states == [False]
+    finally:
+        release.set()
+        for writer in writers:
+            writer.close()
+            await writer.wait_closed()
+        await ch.stop()
+        await task
+
+
 def _ch(bus: Any, port: int, **kw: Any) -> WebSocketChannel:
     cfg: dict[str, Any] = {
         "enabled": True,
