@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.skill_scope import current_allowed_workspace_skills
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
 from nanobot.agent.tools.path_utils import resolve_workspace_path
@@ -17,7 +18,6 @@ from nanobot.agent.tools.schema import (
     StringSchema,
     tool_parameters_schema,
 )
-from nanobot.agent.skill_scope import current_allowed_workspace_skills
 from nanobot.config_base import Base
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
@@ -266,7 +266,7 @@ class ReadFileTool(_FsTool):
             "Read a file (text, image, or document). "
             "Text output format: LINE_NUM|CONTENT. "
             "Images return visual content for analysis. "
-            "Supports PDF, DOCX, XLSX, PPTX documents. "
+            "Supports PDF, DOC, DOCX, XLS, XLSX, PPTX documents. "
             "Use find_files/list_dir first when the path is uncertain. "
             "Read the relevant range before editing so replacements or patches "
             "are based on current content. "
@@ -309,8 +309,8 @@ class ReadFileTool(_FsTool):
                 return self._read_pdf(fp, pages)
 
             # Office document support
-            if fp.suffix.lower() in {".docx", ".xlsx", ".pptx"}:
-                return self._read_office_doc(fp)
+            if fp.suffix.lower() in {".doc", ".docx", ".xls", ".xlsx", ".pptx"}:
+                return await self._read_office_doc(fp)
 
             raw = fp.read_bytes()
             if not raw:
@@ -453,10 +453,10 @@ class ReadFileTool(_FsTool):
             result = result[:self._MAX_CHARS] + "\n\n(PDF text truncated at ~128K chars)"
         return result
 
-    def _read_office_doc(self, fp: Path) -> str:
+    async def _read_office_doc(self, fp: Path) -> str:
         from nanobot.utils.document import extract_text
 
-        result = extract_text(fp)
+        result = await asyncio.to_thread(extract_text, fp)
 
         if result is None:
             return f"Error: Unsupported file format: {fp.suffix}"

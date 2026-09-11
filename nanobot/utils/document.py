@@ -1,7 +1,13 @@
 """Document text extraction utilities for nanobot."""
 
+import json
 import mimetypes
+import platform
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -11,7 +17,9 @@ from nanobot.utils.helpers import detect_image_mime
 SUPPORTED_EXTENSIONS: set[str] = {
     # Document formats
     ".pdf",
+    ".doc",
     ".docx",
+    ".xls",
     ".xlsx",
     ".pptx",
     # Text formats
@@ -37,6 +45,7 @@ SUPPORTED_EXTENSIONS: set[str] = {
 }
 
 _MAX_TEXT_LENGTH = 200_000
+_WORD_CONVERSION_TIMEOUT_SECONDS = 45
 
 
 def extract_text(path: Path) -> str | None:
@@ -62,8 +71,12 @@ def extract_text(path: Path) -> str | None:
     # python-docx / python-pptx / pypdf up front (see issue #3422).
     if ext == ".pdf":
         return _extract_pdf(path)
+    elif ext == ".doc":
+        return _extract_doc(path)
     elif ext == ".docx":
         return _extract_docx(path)
+    elif ext == ".xls":
+        return _extract_xls(path)
     elif ext == ".xlsx":
         return _extract_xlsx(path)
     elif ext == ".pptx":
@@ -100,15 +113,170 @@ def _extract_docx(path: Path) -> str:
     """Extract text from DOCX using python-docx."""
     try:
         from docx import Document as DocxDocument
+        from docx.oxml.ns import qn
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
     except ImportError:
         return "[error: python-docx not installed]"
     try:
         doc = DocxDocument(path)
-        paragraphs: list[str] = [p.text for p in doc.paragraphs if p.text.strip()]
-        return _truncate("\n\n".join(paragraphs), _MAX_TEXT_LENGTH)
+        blocks: list[str] = []
+        paragraph_tag = qn("w:p")
+        table_tag = qn("w:tbl")
+        for child in doc.element.body.iterchildren():
+            if child.tag == paragraph_tag:
+                text = Paragraph(child, doc).text
+                if text.strip():
+                    blocks.append(text)
+            elif child.tag == table_tag:
+                rows: list[str] = []
+                for row in Table(child, doc).rows:
+                    cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                    row_text = "\t".join(cells).rstrip()
+                    if row_text.strip():
+                        rows.append(row_text)
+                if rows:
+                    blocks.append("\n".join(rows))
+        return _truncate("\n\n".join(blocks), _MAX_TEXT_LENGTH)
     except Exception as e:
         logger.exception("Failed to extract DOCX {}", path)
         return f"[error: failed to extract DOCX: {e!s}]"
+
+
+def _extract_doc(path: Path) -> str:
+    """Convert a legacy DOC with desktop Word, then use the DOCX extractor."""
+    if platform.system() != "Windows":
+        return (
+            "[error: legacy .doc reading requires Microsoft Word desktop on Windows; "
+            "convert the file to .docx before reading it on this platform]"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="nanobot-word-", ignore_cleanup_errors=True
+    ) as temporary:
+        converted = Path(temporary) / "converted.docx"
+        error = _convert_doc_with_word(path, converted)
+        if error is not None:
+            return error
+        return _extract_docx(converted)
+
+
+def _convert_doc_with_word(source: Path, destination: Path) -> str | None:
+    command = [
+        sys.executable,
+        "-m",
+        "nanobot.utils._word_com_worker",
+        str(source.resolve()),
+        str(destination.resolve()),
+    ]
+    run_options: dict[str, Any] = {
+        "capture_output": True,
+        "check": False,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "text": True,
+        "timeout": _WORD_CONVERSION_TIMEOUT_SECONDS,
+    }
+    if platform.system() == "Windows":
+        run_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    try:
+        completed = subprocess.run(command, **run_options)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Microsoft Word conversion timed out after {} seconds for {}",
+            _WORD_CONVERSION_TIMEOUT_SECONDS,
+            source,
+        )
+        return (
+            "[error: Microsoft Word timed out while converting the legacy .doc file "
+            f"after {_WORD_CONVERSION_TIMEOUT_SECONDS} seconds]"
+        )
+    except OSError as exc:
+        logger.warning("Could not start Microsoft Word conversion for {}: {}", source, exc)
+        return f"[error: could not start Microsoft Word conversion: {exc!s}]"
+
+    payload = _word_worker_payload(completed.stdout)
+    if completed.returncode != 0:
+        code = str(payload.get("code") or "WORD_CONVERSION_FAILED")
+        message = str(
+            payload.get("message")
+            or completed.stderr.strip()
+            or "Microsoft Word could not convert the legacy .doc file"
+        )
+        detail = str(payload.get("detail") or "")
+        logger.warning(
+            "Microsoft Word conversion failed for {}: {} {} {}",
+            source,
+            code,
+            message,
+            detail,
+        )
+        return f"[error: {code}: {message}]"
+
+    if not destination.is_file() or destination.stat().st_size == 0:
+        logger.warning("Microsoft Word reported success without producing {}", destination)
+        return "[error: WORD_OUTPUT_MISSING: Microsoft Word produced no converted .docx file]"
+    return None
+
+
+def _word_worker_payload(stdout: str) -> dict[str, Any]:
+    for line in reversed(stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _extract_xls(path: Path) -> str:
+    """Extract cell values from a legacy XLS workbook using xlrd."""
+    try:
+        import xlrd
+    except ImportError:
+        return "[error: xlrd not installed]"
+
+    workbook = None
+    try:
+        workbook = xlrd.open_workbook(filename=str(path), on_demand=True)
+        sheets: list[str] = []
+        for sheet in workbook.sheets():
+            rows: list[str] = []
+            for row_index in range(sheet.nrows):
+                cells = [
+                    _format_xls_cell(cell, workbook, xlrd)
+                    for cell in sheet.row(row_index)
+                ]
+                row_text = "\t".join(cells).rstrip()
+                if row_text.strip():
+                    rows.append(row_text)
+            if rows:
+                sheets.append(f"--- Sheet: {sheet.name} ---\n" + "\n".join(rows))
+        return _truncate("\n\n".join(sheets), _MAX_TEXT_LENGTH)
+    except Exception as e:
+        logger.exception("Failed to extract XLS {}", path)
+        return f"[error: failed to extract XLS: {e!s}]"
+    finally:
+        if workbook is not None:
+            workbook.release_resources()
+
+
+def _format_xls_cell(cell: Any, workbook: Any, xlrd: Any) -> str:
+    if cell.ctype in {xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK}:
+        return ""
+    if cell.ctype == xlrd.XL_CELL_BOOLEAN:
+        return "TRUE" if cell.value else "FALSE"
+    if cell.ctype == xlrd.XL_CELL_ERROR:
+        return xlrd.error_text_from_code.get(cell.value, f"#ERROR({cell.value})")
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        value = xlrd.xldate_as_datetime(cell.value, workbook.datemode)
+        return value.isoformat(sep=" ")
+    if cell.ctype == xlrd.XL_CELL_NUMBER:
+        number = float(cell.value)
+        return str(int(number)) if number.is_integer() else str(number)
+    return str(cell.value)
 
 
 def _extract_xlsx(path: Path) -> str:

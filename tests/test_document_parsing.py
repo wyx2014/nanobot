@@ -1,7 +1,11 @@
 """Tests for document text extraction utilities."""
 
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+from nanobot.utils import document as document_utils
 from nanobot.utils.document import (
     SUPPORTED_EXTENSIONS,
     _is_text_extension,
@@ -16,7 +20,9 @@ class TestSupportedExtensions:
         """Test that common document formats are included."""
         # Document formats
         assert ".pdf" in SUPPORTED_EXTENSIONS
+        assert ".doc" in SUPPORTED_EXTENSIONS
         assert ".docx" in SUPPORTED_EXTENSIONS
+        assert ".xls" in SUPPORTED_EXTENSIONS
         assert ".xlsx" in SUPPORTED_EXTENSIONS
         assert ".pptx" in SUPPORTED_EXTENSIONS
 
@@ -152,6 +158,106 @@ class TestExtractText:
         # Empty sheets should return empty string or header only
         assert result == "--- Sheet: EmptySheet ---" or result == ""
 
+    def test_extract_text_xls(self, tmp_path: Path, monkeypatch):
+        """Legacy XLS values should be extracted without Excel or LibreOffice."""
+        import xlrd
+
+        xls_file = tmp_path / "legacy.xls"
+        xls_file.write_bytes(b"legacy-xls-placeholder")
+        workbook = SimpleNamespace(
+            datemode=0,
+            sheets=lambda: [SimpleNamespace(
+                name="项目清单",
+                nrows=3,
+                row=lambda index: [
+                    [
+                        SimpleNamespace(ctype=xlrd.XL_CELL_TEXT, value="项目"),
+                        SimpleNamespace(ctype=xlrd.XL_CELL_TEXT, value="金额"),
+                    ],
+                    [
+                        SimpleNamespace(ctype=xlrd.XL_CELL_TEXT, value="AI核稿"),
+                        SimpleNamespace(ctype=xlrd.XL_CELL_NUMBER, value=120.0),
+                    ],
+                    [
+                        SimpleNamespace(ctype=xlrd.XL_CELL_TEXT, value="已验收"),
+                        SimpleNamespace(ctype=xlrd.XL_CELL_BOOLEAN, value=1),
+                    ],
+                ][index],
+            )],
+            release_resources=Mock(),
+        )
+        monkeypatch.setattr(xlrd, "open_workbook", lambda **_kwargs: workbook)
+
+        result = extract_text(xls_file)
+
+        assert result is not None
+        assert "--- Sheet: 项目清单 ---" in result
+        assert "AI核稿\t120" in result
+        assert "已验收\tTRUE" in result
+        workbook.release_resources.assert_called_once_with()
+
+    def test_extract_text_doc_uses_isolated_word_conversion(self, tmp_path: Path, monkeypatch):
+        """Windows DOC reading should convert with the worker and reuse DOCX extraction."""
+        from docx import Document
+
+        doc_file = tmp_path / "太平资产AI核稿功能需求规格说明书V1.0.doc"
+        doc_file.write_bytes(b"legacy-doc-placeholder")
+        captured: dict[str, object] = {}
+
+        def fake_run(command, **options):
+            captured["command"] = command
+            captured["options"] = options
+            converted = Path(command[-1])
+            doc = Document()
+            doc.add_paragraph("功能需求")
+            table = doc.add_table(rows=2, cols=2)
+            table.cell(0, 0).text = "编号"
+            table.cell(0, 1).text = "说明"
+            table.cell(1, 0).text = "REQ-001"
+            table.cell(1, 1).text = "支持公文核稿"
+            doc.save(converted)
+            return subprocess.CompletedProcess(command, 0, '{"ok": true}\n', "")
+
+        monkeypatch.setattr(document_utils.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(document_utils.subprocess, "run", fake_run)
+
+        result = extract_text(doc_file)
+
+        assert result is not None
+        assert "功能需求" in result
+        assert "REQ-001\t支持公文核稿" in result
+        command = captured["command"]
+        assert "nanobot.utils._word_com_worker" in command
+        assert str(doc_file.resolve()) in command
+        assert captured["options"]["timeout"] == 45
+
+    def test_extract_text_doc_times_out_cleanly(self, tmp_path: Path, monkeypatch):
+        doc_file = tmp_path / "slow.doc"
+        doc_file.write_bytes(b"legacy-doc-placeholder")
+
+        def time_out(command, **_options):
+            raise subprocess.TimeoutExpired(command, 45)
+
+        monkeypatch.setattr(document_utils.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(document_utils.subprocess, "run", time_out)
+
+        result = extract_text(doc_file)
+
+        assert result is not None
+        assert "timed out" in result
+        assert "45 seconds" in result
+
+    def test_extract_text_doc_explains_non_windows_requirement(self, tmp_path: Path, monkeypatch):
+        doc_file = tmp_path / "legacy.doc"
+        doc_file.write_bytes(b"legacy-doc-placeholder")
+        monkeypatch.setattr(document_utils.platform, "system", lambda: "Linux")
+
+        result = extract_text(doc_file)
+
+        assert result is not None
+        assert "Microsoft Word desktop on Windows" in result
+        assert "convert the file to .docx" in result
+
     def test_extract_text_docx(self, tmp_path: Path):
         """Test extracting text from a .docx file."""
         from docx import Document
@@ -179,6 +285,29 @@ class TestExtractText:
 
         result = extract_text(docx_file)
         assert result == ""
+
+    def test_extract_text_docx_preserves_paragraph_and_table_order(self, tmp_path: Path):
+        """Requirements stored in DOCX tables must not be silently dropped."""
+        from docx import Document
+
+        docx_file = tmp_path / "requirements.docx"
+        doc = Document()
+        doc.add_paragraph("Before table")
+        table = doc.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "Requirement"
+        table.cell(0, 1).text = "Status"
+        table.cell(1, 0).text = "Read legacy DOC"
+        table.cell(1, 1).text = "Required"
+        doc.add_paragraph("After table")
+        doc.save(docx_file)
+
+        result = extract_text(docx_file)
+
+        assert result is not None
+        assert "Requirement\tStatus" in result
+        assert "Read legacy DOC\tRequired" in result
+        assert result.index("Before table") < result.index("Requirement")
+        assert result.index("Requirement") < result.index("After table")
 
     def test_extract_text_pptx(self, tmp_path: Path):
         """Test extracting text from a .pptx file."""

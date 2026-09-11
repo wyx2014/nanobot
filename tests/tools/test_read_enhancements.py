@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
-from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
 from nanobot.agent.tools import file_state
+from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
 
 
 @pytest.fixture(autouse=True)
@@ -311,7 +311,7 @@ class TestReadFileLineEndingNormalization:
 
 
 # ---------------------------------------------------------------------------
-# Office document support (DOCX, XLSX, PPTX)
+# Office document support (DOC, DOCX, XLS, XLSX, PPTX)
 # ---------------------------------------------------------------------------
 
 class TestReadOfficeDocuments:
@@ -331,6 +331,15 @@ class TestReadOfficeDocuments:
         assert "Error" not in result
 
     @pytest.mark.asyncio
+    async def test_doc_returns_extracted_text(self, tool, tmp_path):
+        with patch("nanobot.utils.document.extract_text", return_value="Legacy Word content"):
+            f = tmp_path / "test.doc"
+            f.write_bytes(b"legacy-doc")
+            result = await tool.execute(path=str(f))
+        assert "Legacy Word content" in result
+        assert "Cannot read binary file" not in result
+
+    @pytest.mark.asyncio
     async def test_xlsx_returns_extracted_text(self, tool, tmp_path):
         with patch("nanobot.utils.document.extract_text", return_value="--- Sheet: Sheet1 ---\nName\tAge\nAlice\t30"):
             f = tmp_path / "test.xlsx"
@@ -338,6 +347,16 @@ class TestReadOfficeDocuments:
             result = await tool.execute(path=str(f))
         assert "Sheet1" in result
         assert "Alice" in result
+
+    @pytest.mark.asyncio
+    async def test_xls_returns_extracted_text(self, tool, tmp_path):
+        with patch("nanobot.utils.document.extract_text", return_value="--- Sheet: Sheet1 ---\nAlice\t30"):
+            f = tmp_path / "test.xls"
+            f.write_bytes(b"legacy-xls")
+            result = await tool.execute(path=str(f))
+        assert "Sheet1" in result
+        assert "Alice" in result
+        assert "Cannot read binary file" not in result
 
     @pytest.mark.asyncio
     async def test_pptx_returns_extracted_text(self, tool, tmp_path):
