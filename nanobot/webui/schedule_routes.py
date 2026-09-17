@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -14,6 +15,10 @@ from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronRunRecord, CronSchedule
 from nanobot.security.workspace_access import WORKSPACE_SCOPE_METADATA_KEY
 from nanobot.storage.state import StateStore, StateStoreError
+from nanobot.webui.mcp_presets_api import (
+    normalize_mcp_preset_mentions,
+    public_mcp_preset_mentions,
+)
 
 QueryParams = dict[str, list[str]]
 
@@ -105,6 +110,22 @@ def _job_meta(job: CronJob) -> dict[str, Any]:
         meta = job.payload.channel_meta if isinstance(job.payload.channel_meta, dict) else {}
     scoped = meta.get(_META_NS)
     return scoped if isinstance(scoped, dict) else {}
+
+
+def _connector_bindings(query: QueryParams) -> list[dict[str, Any]]:
+    raw = _first(query, "mcp_presets", "[]")
+    try:
+        bindings = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ValueError("mcp_presets must be a JSON array") from None
+    if not isinstance(bindings, list) or len(bindings) > 8:
+        raise ValueError("mcp_presets must contain at most 8 connectors")
+    if not bindings:
+        return []
+    normalized = normalize_mcp_preset_mentions(bindings)
+    if len(normalized) != len(bindings):
+        raise ValueError("mcp_presets contains an invalid or unavailable connector")
+    return normalized
 
 
 def _schedule_from_query(query: QueryParams) -> tuple[CronSchedule, bool, dict[str, Any]]:
@@ -318,6 +339,7 @@ def _task_payload(job: CronJob) -> dict[str, Any]:
         "status": status,
         "skillName": meta.get("skillName") if isinstance(meta.get("skillName"), str) else "",
         "workspacePath": meta.get("workspacePath") if isinstance(meta.get("workspacePath"), str) else "",
+        "mcpPresets": public_mcp_preset_mentions(meta.get("mcpPresets")),
         "createdAt": job.created_at_ms,
         "updatedAt": job.updated_at_ms,
         "lastRunAt": job.state.last_run_at_ms,
@@ -395,15 +417,19 @@ class WebUIScheduleRouter:
         return self._parse_query(request.path)
 
     def _meta(self, query: QueryParams, schedule: dict[str, Any]) -> dict[str, Any]:
+        connectors = _connector_bindings(query)
         metadata: dict[str, Any] = {
             _META_NS: {
                 "description": _first(query, "description"),
                 "prompt": _first(query, "prompt"),
                 "skillName": _first(query, "skill_name"),
                 "workspacePath": _first(query, "workspace_path"),
+                "mcpPresets": connectors,
                 "schedule": schedule,
             }
         }
+        if connectors:
+            metadata["mcp_presets"] = connectors
         if self.state is not None:
             workspace_path = _first(query, "workspace_path").strip()
             project = self.state.ensure_project(

@@ -49,3 +49,26 @@ async def test_bound_webui_run_reuses_preallocated_identity_and_routes_to_child_
     assert agent.message.chat_id == context.session_key
     assert agent.message.session_key_override == context.session_key
     assert agent.message.metadata["_webui_transcript_session_key"] == context.session_key
+
+
+@pytest.mark.asyncio
+async def test_bound_run_passes_connector_binding_to_agent_turn() -> None:
+    job = CronJob(
+        id="research",
+        name="Research",
+        payload=CronPayload(
+            message="Get market data",
+            session_key="websocket:parent-chat",
+            origin_channel="websocket",
+            origin_chat_id="parent-chat",
+            origin_metadata={"mcp_presets": [{"name": "juyuan"}]},
+        ),
+    )
+    agent = _Agent()
+    cron = SimpleNamespace(write_run_record=lambda *_args: None)
+
+    await run_bound_cron_job(job, agent=agent, cron=cron)
+
+    assert agent.message is not None
+    assert agent.message.metadata["webui"] is True
+    assert agent.message.metadata["mcp_presets"] == [{"name": "juyuan"}]

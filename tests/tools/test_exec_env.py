@@ -101,6 +101,17 @@ async def test_exec_never_forwards_desktop_shared_mcp_keys(monkeypatch):
 
 @_UNIX_ONLY
 @pytest.mark.asyncio
+async def test_exec_never_forwards_managed_image_extract_key(monkeypatch):
+    monkeypatch.setenv("NANOBOT_IMAGE_EXTRACT_API_KEY", "managed-vision-secret")
+    tool = ExecTool(allowed_env_keys=["NANOBOT_IMAGE_EXTRACT_API_KEY"])
+
+    result = await tool.execute(command="printenv NANOBOT_IMAGE_EXTRACT_API_KEY")
+
+    assert "managed-vision-secret" not in result
+
+
+@_UNIX_ONLY
+@pytest.mark.asyncio
 async def test_exec_allowed_env_keys_missing_var_ignored(monkeypatch):
     """If an allowed key is not set in the parent process, it should be silently skipped."""
     monkeypatch.delenv("NONEXISTENT_VAR_12345", raising=False)

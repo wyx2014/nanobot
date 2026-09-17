@@ -286,6 +286,50 @@ async def test_create_schedule_persists_registered_workspace_scope(tmp_path: Pat
     }
 
 
+async def test_schedule_connector_bindings_round_trip_and_clear_on_update(tmp_path: Path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    create = Request(
+        '/api/schedule/tasks/create?name=research&prompt=fetch&frequency=daily'
+        '&mcp_presets=[{"name":"juyuan"}]',
+        Headers(),
+    )
+    router = _router(service)
+
+    response = await router.dispatch(create, "/api/schedule/tasks/create")
+
+    assert response is not None and response.status_code == 200
+    [job] = service.list_jobs(include_disabled=True)
+    assert job.payload.origin_metadata["mcp_presets"] == [{"name": "juyuan"}]
+    assert _task_payload(job)["mcpPresets"] == [{"name": "juyuan"}]
+
+    update = Request(
+        f'/api/schedule/tasks/update?id={job.id}&name=research&prompt=fetch'
+        '&frequency=daily&mcp_presets=[]',
+        Headers(),
+    )
+    response = await router.dispatch(update, "/api/schedule/tasks/update")
+
+    assert response is not None and response.status_code == 200
+    updated = service.get_job(job.id)
+    assert updated is not None
+    assert "mcp_presets" not in updated.payload.origin_metadata
+    assert _task_payload(updated)["mcpPresets"] == []
+
+
+async def test_schedule_rejects_unknown_connector(tmp_path: Path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    request = Request(
+        '/api/schedule/tasks/create?name=research&prompt=fetch'
+        '&mcp_presets=[{"name":"unknown-connector"}]',
+        Headers(),
+    )
+
+    response = await _router(service).dispatch(request, "/api/schedule/tasks/create")
+
+    assert response is not None and response.status_code == 400
+    assert service.list_jobs(include_disabled=True) == []
+
+
 async def test_delete_run_route_removes_completed_record(tmp_path) -> None:
     service, job_id = _service_with_run(tmp_path / "cron" / "jobs.json")
     request = Request(

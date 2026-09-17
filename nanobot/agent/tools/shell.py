@@ -41,14 +41,15 @@ from nanobot.security.workspace_policy import is_path_within
 
 _IS_WINDOWS = sys.platform == "win32"
 
-# Desktop-shared MCP credentials are intentionally available only to the MCP
-# client inside this gateway process. Never forward them to commands launched
+# Desktop-managed credentials are intentionally available only to native
+# clients inside this gateway process. Never forward them to commands launched
 # by the agent, even if a broad allow-list is configured later.
-_PRIVATE_DESKTOP_MCP_ENV_KEYS = frozenset({
+_PRIVATE_GATEWAY_ENV_KEYS = frozenset({
     "JUYUAN_MCP_TOKEN",
     "CAIHUI_MCP_API_KEY",
     "IFIND_MCP_API_KEY",
     "ANYSEARCH_API_KEY",
+    "NANOBOT_IMAGE_EXTRACT_API_KEY",
 })
 
 
@@ -585,7 +586,7 @@ class ExecTool(Tool):
                 "ProgramW6432": os.environ.get("ProgramW6432", ""),
             }
             for key in self.allowed_env_keys:
-                if key in _PRIVATE_DESKTOP_MCP_ENV_KEYS:
+                if key in _PRIVATE_GATEWAY_ENV_KEYS:
                     continue
                 val = os.environ.get(key)
                 if val is not None:
@@ -599,7 +600,7 @@ class ExecTool(Tool):
             "PYTHONUNBUFFERED": "1",
         }
         for key in self.allowed_env_keys:
-            if key in _PRIVATE_DESKTOP_MCP_ENV_KEYS:
+            if key in _PRIVATE_GATEWAY_ENV_KEYS:
                 continue
             val = os.environ.get(key)
             if val is not None:

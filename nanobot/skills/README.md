@@ -28,3 +28,6 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `skill-creator` | Create new skills |
 | `long-goal` | Sustained objectives: `long_task`, `complete_goal`, idempotent goals, modular project work, early research |
 | `corporate-ppt` | 使用内置公司模板生成可编辑、可校验的 PowerPoint 演示文稿 |
+| `image-extract` | 使用托管多模态服务识别图片文字或提取指定字段 |
+| `portfolio-analysis` | 持仓结构体检、两期持仓变动复盘及可复核的分析报告 |
+| `office-documents` | 工作材料撰写润色、会议纪要与待办、文档阅读总结 |
