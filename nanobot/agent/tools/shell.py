@@ -276,6 +276,27 @@ class ExecTool(Tool):
         if isinstance(prepared, str):
             return prepared
 
+        from nanobot.runtime.dependencies import (
+            check_install_command,
+            package_sources_config,
+            prepare_workspace_environment,
+            restore_task_environment,
+        )
+        try:
+            access = current_tool_workspace(
+                self.working_dir, restrict_to_workspace=self.restrict_to_workspace,
+                sandbox_restricts_workspace=bool(self.sandbox),
+            )
+            root = Path(access.project_path or self.working_dir or prepared.cwd)
+            if self.sandbox and package_sources_config().workspace_python:
+                return "Error: Managed Python requires a runtime available inside the configured exec sandbox"
+            prepared.env = await prepare_workspace_environment(root, prepared.env)
+            await check_install_command(command, prepared.env)
+            if not _IS_WINDOWS:
+                prepared.command = restore_task_environment(prepared.command, prepared.env)
+        except Exception as exc:
+            return f"Error preparing dependency environment: {exc}"
+
         if yield_time_ms is not None:
             return await self._execute_session(prepared, yield_time_ms, max_output_chars)
 
@@ -434,8 +455,10 @@ class ExecTool(Tool):
         env = self._build_env()
 
         if self.path_prepend or self.path_append:
-            if _IS_WINDOWS:
-                env["PATH"] = self._compose_path(env.get("PATH", ""))
+            from nanobot.runtime.dependencies import managed_python_enabled
+
+            if _IS_WINDOWS or managed_python_enabled():
+                env["PATH"] = self._compose_path(env.get("PATH", os.environ.get("PATH", "")))
             else:
                 command = self._wrap_path_export(command, env)
 

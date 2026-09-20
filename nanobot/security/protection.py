@@ -636,7 +636,18 @@ class SecurityService:
                 },
             )
 
-        if tool_name == "export_presentation":
+        if tool_name == "install_skill":
+            from nanobot.agent.tools.install_skill import InstallSkillTool
+
+            try:
+                installer = tool if isinstance(tool, InstallSkillTool) else InstallSkillTool(self.workspace)
+                paths = installer.destination_paths(params.get("source_dir", ""))
+            except (OSError, ValueError) as exc:
+                return SecurityAssessment(
+                    "block", "high", "file", "create", "skill.invalid_package",
+                    str(exc), mutating=True,
+                )
+        elif tool_name == "export_presentation":
             from nanobot.agent.tools.context import current_request_session_key
             from nanobot.presentations import PresentationError, PresentationService
 
@@ -977,12 +988,12 @@ class SecurityService:
         return tool_name in {
             "write_file", "edit_file", "apply_patch", "create_docx", "create_pdf",
             "create_research_chart", "create_presentation", "import_presentation_asset",
-            "export_presentation",
+            "export_presentation", "install_skill",
         }
 
     @staticmethod
     def _file_action(tool_name: str) -> str:
-        if tool_name.startswith("create_"):
+        if tool_name.startswith("create_") or tool_name == "install_skill":
             return "create"
         if tool_name == "apply_patch":
             return "patch"

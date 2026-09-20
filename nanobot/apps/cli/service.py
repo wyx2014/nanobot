@@ -20,6 +20,7 @@ import httpx
 
 from nanobot.apps.protocol import app_manifest, compact_dict
 from nanobot.config.paths import get_runtime_subdir
+from nanobot.runtime.dependencies import package_environment
 from nanobot.security.audit import AuditedToolResult
 from nanobot.security.workspace_policy import is_path_within
 
@@ -947,6 +948,7 @@ class CliAppManager:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=package_environment(dict(os.environ)),
         )
 
     def _installed_entry(self, app: dict[str, Any]) -> dict[str, Any]:
@@ -1334,7 +1336,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
-                env={
+                env=package_environment({
                     key: value
                     for key, value in os.environ.items()
                     if key not in {
@@ -1343,7 +1345,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
                         "IFIND_MCP_API_KEY",
                         "ANYSEARCH_API_KEY",
                     }
-                },
+                }),
             )
         except subprocess.TimeoutExpired:
             return AuditedToolResult(

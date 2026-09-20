@@ -1583,9 +1583,12 @@ task text:
         ]
         tasks = [self._running_tasks[tid] for tid in task_ids]
         for t in tasks:
-            t.cancel()
-        # Release concurrency accounting synchronously. Done callbacks remain
-        # idempotent and will see these entries already removed.
+            if not t.cancelling():
+                t.cancel()
+        # Keep children discoverable until cleanup completes. The parent and a
+        # /stop request can both wait here; neither should cancel cleanup twice.
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for task_id in task_ids:
             self._running_tasks.pop(task_id, None)
             self._task_statuses.pop(task_id, None)
@@ -1594,8 +1597,6 @@ task text:
             remaining.difference_update(task_ids)
             if not remaining:
                 self._session_tasks.pop(session_key, None)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)
 
     def get_running_count(self) -> int:

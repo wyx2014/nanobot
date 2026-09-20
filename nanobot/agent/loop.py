@@ -631,6 +631,7 @@ class AgentLoop:
         self._mcp_owner_task: asyncio.Task[None] | None = None
         self._mcp_shutdown_event: asyncio.Event | None = None
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._stop_tasks: dict[str, asyncio.Task[int]] = {}
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
@@ -1254,21 +1255,48 @@ class AgentLoop:
         else:
             logger.warning("Command '{}' matched but dispatch returned None", raw)
 
+    def request_stop(self, key: str) -> asyncio.Task[int]:
+        """Share cancellation work across retries without cancelling cleanup again."""
+        pending = self._stop_tasks.get(key)
+        if pending is not None and not pending.done():
+            return pending
+        task = asyncio.create_task(self._cancel_active_tasks(key), name=f"stop:{key}")
+        self._stop_tasks[key] = task
+        self._background_tasks.append(task)
+
+        def completed(done: asyncio.Task[int]) -> None:
+            if self._stop_tasks.get(key) is done:
+                self._stop_tasks.pop(key, None)
+            if done in self._background_tasks:
+                self._background_tasks.remove(done)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                logger.error("Session cancellation failed for {}: {}", key, error)
+
+        task.add_done_callback(completed)
+        return task
+
     async def _cancel_active_tasks(self, key: str) -> int:
         """Cancel and await all active tasks and subagents for *key*.
 
         Returns the total number of cancelled tasks + subagents.
         """
-        tasks = self._active_tasks.pop(key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        active_turn = await self.thread_runtime_registry.active_turn(key)
+        tasks = list(self._active_tasks.get(key, []))
+        cancelled = sum(1 for t in tasks if not t.done() and not t.cancelling() and t.cancel())
         # Cancel subagents before awaiting the main turn. The main turn may be
         # blocked waiting for those same subagents in _drain_pending.
         sub_cancelled = await self.subagents.cancel_by_session(key)
         for t in tasks:
             with suppress(asyncio.CancelledError, Exception):
                 await t
-        active_turn = await self.thread_runtime_registry.active_turn(key)
-        if active_turn is not None:
+        remaining = [t for t in self._active_tasks.get(key, []) if not t.done()]
+        if remaining:
+            self._active_tasks[key] = remaining
+        else:
+            self._active_tasks.pop(key, None)
+        current_turn = await self.thread_runtime_registry.active_turn(key)
+        # A deferred/new turn may have started while cleanup was awaited.
+        if active_turn is not None and current_turn is not None and current_turn.id == active_turn.id:
             await self.turn_lifecycle.finish_turn(
                 session_key=key,
                 expected_turn_id=active_turn.id,

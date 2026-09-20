@@ -46,6 +46,98 @@ class TestHandleStop:
         ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/stop", loop=loop)
         out = await cmd_stop(ctx)
         assert "没有运行中" in out.content
+        assert out.metadata["_stop_result"] == "stopped"
+        assert out.metadata["runtime_snapshot"]["active_turn"] is None
+
+    @pytest.mark.asyncio
+    async def test_stop_timeout_retains_tasks_and_later_confirms_completion(self, monkeypatch):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.runtime_events import RuntimeEventContext
+        from nanobot.command.builtin import cmd_stop
+        from nanobot.command.router import CommandContext
+
+        monkeypatch.setattr("nanobot.command.builtin.STOP_CONFIRM_TIMEOUT_SECONDS", 0.01)
+        loop, bus = _make_loop()
+        release = asyncio.Event()
+        cleaning = asyncio.Event()
+
+        async def slow_cleanup():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await release.wait()
+                raise
+
+        task = asyncio.create_task(slow_cleanup())
+        await asyncio.sleep(0)
+        loop._active_tasks["test:c1"] = [task]
+        await loop.turn_lifecycle.start_turn(
+            context=RuntimeEventContext(channel="test", chat_id="c1", session_key="test:c1"),
+            turn_id="turn-1",
+        )
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop",
+                             metadata={"client_action_id": "stop-1"})
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/stop", loop=loop)
+        try:
+            out = await asyncio.wait_for(cmd_stop(ctx), timeout=0.5)
+            assert out.metadata["_stop_result"] == "stopping"
+            assert out.metadata["runtime_snapshot"]["thread_status"]["type"] == "active"
+            assert cleaning.is_set()
+            assert loop._active_tasks[ctx.key] == [task]
+            pending = loop._stop_tasks[ctx.key]
+            assert loop.request_stop(ctx.key) is pending
+            retry = await asyncio.wait_for(cmd_stop(ctx), timeout=0.5)
+            assert retry.metadata["_stop_result"] == "stopping"
+            assert task.cancelling() == 1
+            assert not task.done()
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*list(loop._background_tasks)), timeout=1)
+
+        completed = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        assert completed.metadata["_stop_result"] == "stopped"
+        assert completed.metadata["client_action_id"] == "stop-1"
+        assert completed.metadata["runtime_snapshot"]["active_turn"] is None
+        assert completed.metadata["runtime_snapshot"]["latest_turn"]["status"] == "interrupted"
+        assert ctx.key not in loop._active_tasks
+        assert ctx.key not in loop._stop_tasks
+
+    @pytest.mark.asyncio
+    async def test_delayed_stop_does_not_finish_a_newer_turn(self):
+        from nanobot.bus.runtime_events import RuntimeEventContext
+        from nanobot.runtime.turn_lifecycle import FinishReason, TurnStatus
+
+        loop, _bus = _make_loop()
+        context = RuntimeEventContext(channel="test", chat_id="c1", session_key="test:c1")
+        await loop.turn_lifecycle.start_turn(context=context, turn_id="old-turn")
+
+        async def advance_turn(_key):
+            await loop.turn_lifecycle.finish_turn(
+                session_key=context.session_key, expected_turn_id="old-turn",
+                status=TurnStatus.INTERRUPTED, finish_reason=FinishReason.USER_INTERRUPTED,
+            )
+            await loop.turn_lifecycle.start_turn(context=context, turn_id="new-turn")
+            return 0
+
+        loop.subagents.cancel_by_session.side_effect = advance_turn
+        await loop._cancel_active_tasks(context.session_key)
+        active = await loop.thread_runtime_registry.active_turn(context.session_key)
+        assert active.id == "new-turn"
+
+    @pytest.mark.asyncio
+    async def test_stop_failure_returns_retryable_confirmation(self):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.command.builtin import cmd_stop
+        from nanobot.command.router import CommandContext
+
+        loop, _bus = _make_loop()
+        loop._cancel_active_tasks = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+        msg = InboundMessage(channel="test", sender_id="u1", chat_id="c1", content="/stop")
+        out = await cmd_stop(CommandContext(msg=msg, session=None, key=msg.session_key,
+                                           raw="/stop", loop=loop))
+        assert out.metadata["_stop_result"] == "failed"
+        assert "重试" in out.content
 
     @pytest.mark.asyncio
     async def test_stop_cancels_active_task(self):
@@ -261,6 +353,44 @@ class TestDispatch:
 
 
 class TestSubagentCancellation:
+    @pytest.mark.asyncio
+    async def test_concurrent_stop_keeps_child_tracked_until_cleanup_finishes(self):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        mgr = SubagentManager(provider=MagicMock(), workspace=MagicMock(), bus=MessageBus(),
+                              max_tool_result_chars=_MAX_TOOL_RESULT_CHARS)
+        cleaning = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_cleanup():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await release.wait()
+                raise
+
+        task = asyncio.create_task(slow_cleanup())
+        await asyncio.sleep(0)
+        mgr._running_tasks["sub-1"] = task
+        mgr._session_tasks["test:c1"] = {"sub-1"}
+        stop = asyncio.create_task(mgr.cancel_by_session("test:c1"))
+        retry = None
+        try:
+            await asyncio.wait_for(cleaning.wait(), timeout=1)
+            retry = asyncio.create_task(mgr.cancel_by_session("test:c1"))
+            await asyncio.sleep(0)
+            assert mgr.get_running_count_by_session("test:c1") == 1
+            assert task.cancelling() == 1
+            assert not stop.done()
+            assert not retry.done()
+        finally:
+            release.set()
+            await asyncio.gather(stop, *([retry] if retry else []))
+        assert mgr.get_running_count_by_session("test:c1") == 0
+        assert "test:c1" not in mgr._session_tasks
+
     @pytest.mark.asyncio
     async def test_cancel_by_session(self):
         from nanobot.agent.subagent import SubagentManager

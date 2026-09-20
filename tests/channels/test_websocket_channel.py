@@ -638,6 +638,28 @@ async def test_webui_stop_control_message_is_not_persisted_as_user_bubble(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["stopped", "stopping", "failed"])
+async def test_stop_result_is_a_correlated_control_frame(bus, tmp_path, monkeypatch, status):
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    channel = _ch(bus)
+    connection = AsyncMock()
+    channel._subs["chat-1"] = {connection}
+    snapshot = {"session_key": "websocket:chat-1", "runtime_epoch": "epoch-1",
+                "snapshot_revision": 2, "thread_status": {"type": "idle"},
+                "active_turn": None, "latest_turn": None}
+    await channel.send(OutboundMessage(
+        channel="websocket", chat_id="chat-1", content="没有运行中的任务。",
+        metadata={"_stop_result": status, "client_action_id": "stop-1",
+                  "runtime_snapshot": snapshot},
+    ))
+    assert json.loads(connection.send.await_args.args[0]) == {
+        "event": "stop_result", "chat_id": "chat-1", "client_action_id": "stop-1",
+        "status": status, "runtime_snapshot": snapshot,
+    }
+    assert read_transcript_lines("websocket:chat-1") == []
+
+
+@pytest.mark.asyncio
 async def test_webui_user_transcript_append_failure_does_not_block_inbound(
     bus: MagicMock,
     monkeypatch,

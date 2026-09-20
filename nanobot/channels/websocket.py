@@ -2221,6 +2221,18 @@ class WebSocketChannel(BaseChannel):
             await self._safe_send_to(connection, raw, label=" browser_event ")
 
     async def send(self, msg: OutboundMessage) -> None:
+        if stop_status := msg.metadata.get("_stop_result"):
+            body = {
+                "event": "stop_result",
+                "chat_id": msg.chat_id,
+                "client_action_id": msg.metadata.get("client_action_id"),
+                "status": stop_status,
+                "runtime_snapshot": msg.metadata.get("runtime_snapshot"),
+            }
+            raw = json.dumps(body, ensure_ascii=False)
+            for connection in list(self._subs.get(msg.chat_id, ())):
+                await self._safe_send_to(connection, raw, label=" stop_result ")
+            return
         if msg.metadata.get("_runtime_status_updated"):
             await self.send_runtime_status_updated(
                 agent_ready=msg.metadata.get("agent_ready"),

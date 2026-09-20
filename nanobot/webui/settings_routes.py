@@ -25,10 +25,10 @@ from nanobot.webui.expert_teams import (
 )
 from nanobot.webui.http_utils import query_first as _query_first
 from nanobot.webui.mcp_presets_api import mcp_presets_settings_action
-from nanobot.webui.project_skills_api import (
-    WebUIProjectSkillsError,
-    project_skills_payload,
-    project_skills_save,
+from nanobot.webui.package_sources_api import (
+    check_package_source_settings,
+    package_sources_payload,
+    save_package_sources,
 )
 from nanobot.webui.personalization_api import (
     PersonalizationError,
@@ -36,13 +36,18 @@ from nanobot.webui.personalization_api import (
     restore_personalization,
     save_personalization,
 )
+from nanobot.webui.project_skills_api import (
+    WebUIProjectSkillsError,
+    project_skills_payload,
+    project_skills_save,
+)
 from nanobot.webui.settings_api import (
     WebUISettingsError,
     create_model_configuration,
     create_provider_settings,
+    decorate_settings_payload,
     delete_model_configuration,
     delete_provider_settings,
-    decorate_settings_payload,
     login_oauth_provider,
     logout_oauth_provider,
     provider_models_payload,
@@ -50,8 +55,8 @@ from nanobot.webui.settings_api import (
     settings_usage_payload,
     update_agent_settings,
     update_image_generation_settings,
-    update_model_default,
     update_model_configuration,
+    update_model_default,
     update_network_safety_settings,
     update_provider_settings,
     update_transcription_settings,
@@ -143,6 +148,8 @@ class WebUISettingsRouter:
             return self._handle_settings_transcription_update(request)
         if path == "/api/settings/network-safety/update":
             return self._handle_settings_network_safety_update(request)
+        if path in {"/api/settings/package-sources", "/api/settings/package-sources/save", "/api/settings/package-sources/check"}:
+            return await self._handle_package_sources(request, path)
         if path == "/api/settings/cli-apps":
             return await self._handle_settings_cli_apps(request)
         if path == "/api/settings/cli-apps/install":
@@ -445,6 +452,38 @@ class WebUISettingsRouter:
         except WebUISettingsError as e:
             return self._error_response(e.status, e.message)
         return self._json_response(self._with_restart_state(payload, section="runtime"))
+
+    async def _handle_package_sources(self, request: WsRequest, path: str) -> Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        try:
+            if path.endswith("/save"):
+                raw = request.headers.get("X-Nanobot-Package-Sources", "")
+                if len(raw.encode("utf-8")) > 8192:
+                    return self._error_response(400, "Package source settings are too large")
+                values = json.loads(raw)
+                if not isinstance(values, dict):
+                    raise ValueError("Package source settings must be an object")
+                payload = save_package_sources(values)
+                try:
+                    reload_result = await request_mcp_reload(self.bus, server_name="*")
+                except Exception:
+                    self.logger.exception("Package sources saved, but MCP reload failed")
+                    reload_result = {
+                        "ok": False,
+                        "requires_restart": True,
+                        "message": "MCP reconnect failed. Restart the app to apply the saved settings.",
+                    }
+                payload["requires_restart"] = bool(reload_result.get("requires_restart"))
+                if not reload_result.get("ok"):
+                    payload["mcp_reload_error"] = reload_result.get("message") or "Some MCP servers did not reconnect."
+            elif path.endswith("/check"):
+                payload = await check_package_source_settings()
+            else:
+                payload = package_sources_payload()
+        except (ValueError, TypeError) as exc:
+            return self._error_response(400, str(exc))
+        return self._json_response(payload)
 
     async def _handle_settings_cli_apps(self, request: WsRequest) -> Response:
         if not self._authorized(request):

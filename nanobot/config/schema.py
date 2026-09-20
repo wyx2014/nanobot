@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import AliasChoices, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from nanobot.config_base import Base
@@ -338,6 +338,22 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
+class PackageSourcesConfig(Base):
+    """Application-owned package defaults, shared by commands and MCP."""
+
+    enabled: bool = False
+    npm_registry: str = "http://10.94.211.66/repository/npm_mirror/"
+    pypi_index_url: str = "http://10.94.211.66/repository/officialPypi/simple/"
+    workspace_python: bool = False
+
+    @field_validator("npm_registry", "pypi_index_url")
+    @classmethod
+    def validate_source(cls, value: str, info) -> str:
+        from nanobot.runtime.dependencies import normalize_source_url
+
+        return normalize_source_url(value, pypi=info.field_name == "pypi_index_url")
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -348,6 +364,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.web", "WebToolsConfig"))
     exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.shell", "ExecToolConfig"))
+    package_sources: PackageSourcesConfig = Field(default_factory=PackageSourcesConfig)
     file: FileToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.filesystem", "FileToolsConfig"))
     cli_apps: CliAppsToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.cli_apps", "CliAppsToolConfig"))
     my: MyToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.self", "MyToolConfig"))

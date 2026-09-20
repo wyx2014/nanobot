@@ -204,9 +204,9 @@ Skill creation involves these steps:
 
 1. Understand the skill with concrete examples
 2. Plan reusable skill contents (scripts, references, assets)
-3. Initialize the skill (run init_skill.py)
+3. Initialize the skill with init_skill.py or project file tools
 4. Edit the skill (implement resources and write SKILL.md)
-5. Package the skill (run package_skill.py)
+5. Install the skill into My Skills; package it only when an export is requested
 6. Iterate based on real usage
 
 Follow these steps in order, skipping only if there is a clear reason why they are not applicable.
@@ -266,9 +266,9 @@ At this point, it is time to actually create the skill.
 
 Skip this step only if the skill being developed already exists, and iteration or packaging is needed. In this case, continue to the next step.
 
-When creating a new skill from scratch, always run the `init_skill.py` script. The script conveniently generates a new template skill directory that automatically includes everything a skill requires, making the skill creation process much more efficient and reliable.
+Use `init_skill.py` when a scaffold is useful and the execution policy permits the bundled script. For a simple skill, or when the script is outside the permitted execution boundary, create `SKILL.md` and the needed resources with project file tools instead. Include valid `name` and `description` frontmatter and complete instructions; do not leave scaffold placeholders.
 
-For `nanobot`, custom skills should live under the active workspace `skills/` directory so they can be discovered automatically at runtime (for example, `<workspace>/skills/my-skill/SKILL.md`).
+For `nanobot`, newly generated skills default to **My Skills**, the personal library shown in the runtime instructions. It is separate from the active project and is shared across projects. Prepare the draft under the current project (for example, `.skill-drafts/my-skill/`), then call `install_skill` with that folder after editing and testing. The tool saves `SKILL.md`, scripts, references, and assets together into My Skills without overwriting an existing skill. Do not leave the project draft as the only deliverable or ask the user to manually import it. Respect an explicit request for project-only files or an export.
 
 Usage:
 
@@ -279,9 +279,9 @@ scripts/init_skill.py <skill-name> --path <output-directory> [--resources script
 Examples:
 
 ```bash
-scripts/init_skill.py my-skill --path ./workspace/skills
-scripts/init_skill.py my-skill --path ./workspace/skills --resources scripts,references
-scripts/init_skill.py my-skill --path ./workspace/skills --resources scripts --examples
+scripts/init_skill.py my-skill --path ./.skill-drafts
+scripts/init_skill.py my-skill --path ./.skill-drafts --resources scripts,references
+scripts/init_skill.py my-skill --path ./.skill-drafts --resources scripts --examples
 ```
 
 The script:
@@ -334,9 +334,11 @@ Keep frontmatter minimal. In `nanobot`, `metadata` and `always` are also support
 
 Write instructions for using the skill and its bundled resources.
 
-### Step 5: Packaging a Skill
+### Step 5: Install the Skill (Export Only When Requested)
 
-Once development of the skill is complete, it must be packaged into a distributable .skill file that gets shared with the user. The packaging process automatically validates the skill first to ensure it meets all requirements:
+After editing and testing, call `install_skill(source_dir=".skill-drafts/my-skill")`. Confirm success and tell the user the skill is available in **Toolbox → Skills → My Skills**. It can be selected in a conversation or bound to a project; installation does not enable it in every project. If the name already exists, preserve the existing skill and resolve the name conflict. If installation fails, report the actual error and retain the draft for recovery.
+
+When the user requests a distributable file, package the skill into a `.skill` archive in the current project's output directory. An archive alone is an export, not installation into My Skills. The packaging process validates the skill first:
 
 ```bash
 scripts/package_skill.py <path/to/skill-folder>

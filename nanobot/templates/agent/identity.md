@@ -6,7 +6,8 @@ Your workspace is at: {{ workspace_path }}
 - Global user profile: {{ profile_workspace_path }}/USER.md and {{ profile_workspace_path }}/SOUL.md (managed by Dream — do not edit directly).
 - Profile candidate log: {{ profile_workspace_path }}/memory/history.jsonl (append-only Dream input; candidates are not confirmed memory).
 - Legacy memory: {{ profile_workspace_path }}/memory/MEMORY.md (read/restore compatibility only; do not add project or session facts).
-- Custom skills: {{ workspace_path }}/skills/{% raw %}{skill-name}{% endraw %}/SKILL.md
+- My Skills (personal library): {{ profile_workspace_path }}/skills/{% raw %}{skill-name}{% endraw %}/SKILL.md. This library belongs to the user and does not change when the active project changes.
+- When asked to create a skill, use `skill-creator`, prepare and test it in the current project, then call `install_skill` to save the complete package to My Skills. Use a project-only destination or export only when the user explicitly requests it. Tell the user where the installed skill can be found; do not claim it is installed until the tool succeeds.
 
 {{ platform_policy }}
 {% if channel == 'qq' or channel == 'discord' %}

@@ -974,10 +974,16 @@ async def connect_mcp_servers(
                     return name, None
 
             if transport_type == "stdio":
+                from nanobot.runtime.dependencies import (
+                    normalize_python_launcher,
+                    package_environment,
+                )
+
+                python_command, python_args = normalize_python_launcher(cfg.command, cfg.args)
                 command, args, env = _normalize_windows_stdio_command(
-                    cfg.command,
-                    cfg.args,
-                    cfg.env or None,
+                    python_command,
+                    python_args,
+                    package_environment(cfg.env) or None,
                 )
                 params = stdio_parameters_class(
                     command=command,
@@ -1371,7 +1377,9 @@ async def reload_servers(state: Any, registry: ToolRegistry, *, force_server: st
         changed = sorted(
             name
             for name in current_names & next_names
-            if name == force_server or _server_signature(current_servers[name]) != _server_signature(next_servers[name])
+            if name == force_server
+            or (force_server == "*" and bool(next_servers[name].command))
+            or _server_signature(current_servers[name]) != _server_signature(next_servers[name])
         )
 
         tools_removed = 0

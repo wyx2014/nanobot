@@ -125,18 +125,47 @@ def builtin_command_palette() -> list[dict[str, str]]:
     return [spec.as_dict() for spec in BUILTIN_COMMAND_SPECS]
 
 
+STOP_CONFIRM_TIMEOUT_SECONDS = 3.0
+
+
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
     msg = ctx.msg
-    total = await loop._cancel_active_tasks(ctx.key)
-    # A user-facing acknowledgement is clearer than exposing the internal
-    # number of cancelled agent/subagent tasks.
-    content = "用户已取消" if total else "没有运行中的任务。"
-    return OutboundMessage(
-        channel=msg.channel, chat_id=msg.chat_id, content=content,
-        metadata=dict(msg.metadata or {})
-    )
+    task = loop.request_stop(ctx.key)
+
+    async def result() -> OutboundMessage:
+        status = "stopping"
+        content = "正在停止，任务清理尚未完成。"
+        if task.done():
+            try:
+                total = task.result()
+                status = "stopped"
+                content = "用户已取消" if total else "没有运行中的任务。"
+            except (asyncio.CancelledError, Exception):
+                status = "failed"
+                content = "未能确认停止结果，请重试。"
+        snapshot = await loop.thread_runtime_registry.snapshot(ctx.key)
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata={
+                **(msg.metadata or {}),
+                "_stop_result": status,
+                "runtime_snapshot": snapshot.payload(),
+            },
+        )
+
+    # wait_for would cancel cleanup and can itself hang when cancellation is
+    # suppressed. A bounded wait lets the bus keep dispatching other sessions.
+    done, _ = await asyncio.wait({task}, timeout=STOP_CONFIRM_TIMEOUT_SECONDS)
+    if not done:
+        async def publish_completion() -> None:
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(task)
+            await loop.bus.publish_outbound(await result())
+
+        loop._schedule_background(publish_completion())
+    return await result()
 
 
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:

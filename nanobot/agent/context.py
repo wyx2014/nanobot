@@ -519,12 +519,15 @@ class ContextBuilder:
         workspace_path = str(root.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
+        from nanobot.runtime.dependencies import dependency_instructions
+
+        dependencies = dependency_instructions(root)
 
         return render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
             profile_workspace_path=str(self.workspace.expanduser().resolve()),
-            runtime=runtime,
+            runtime=runtime + ("\n\n" + dependencies if dependencies else ""),
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
         )
