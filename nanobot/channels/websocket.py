@@ -116,6 +116,7 @@ from nanobot.webui.metadata import (
 )
 from nanobot.webui.session_artifacts import (
     explicit_artifact_row,
+    is_temporary_artifact_path,
     registered_artifact_row,
 )
 from nanobot.webui.transcription_ws import webui_transcription_event
@@ -2654,6 +2655,8 @@ class WebSocketChannel(BaseChannel):
                     continue
                 raw_path = edit.get("absolute_path") or edit.get("path")
                 if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                if is_temporary_artifact_path(raw_path, scope.project_path):
                     continue
                 relation_type = (
                     "modified"

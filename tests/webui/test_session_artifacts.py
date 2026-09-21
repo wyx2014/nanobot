@@ -115,6 +115,26 @@ def test_discovery_caps_explicit_artifacts(
     assert len(payload["artifacts"]) <= 2
 
 
+def test_scratch_files_are_not_deliverables_even_when_tools_reference_them(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts_module, "read_transcript_lines", lambda _key: [])
+    scratch = tmp_path / "tmp" / "output-1"
+    scratch.mkdir(parents=True)
+    for name in ("generate.py", "preview.pdf", "source.txt"):
+        (scratch / name).write_text("internal", encoding="utf-8")
+    final = tmp_path / "周报2026092010.docx"
+    final.write_bytes(b"final")
+    paths = [*scratch.iterdir(), final]
+    data = _session_data(created_at=datetime.now().astimezone(), messages=[{
+        "role": "tool", "content": json.dumps({"files": [{"path": str(path)} for path in paths]}),
+    }])
+    scope = build_workspace_scope(tmp_path, "restricted")
+    result = discover_session_artifacts("websocket:artifact-test", data, scope=scope)
+    assert [row["path"] for row in result["artifacts"]] == [final.name]
+    assert artifacts_module.explicit_artifact_row(
+        str(scratch / "preview.pdf"), scope=scope, session_key="websocket:artifact-test",
+    ) is None
+
+
 def test_discovery_preserves_the_turn_that_explicitly_emitted_a_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

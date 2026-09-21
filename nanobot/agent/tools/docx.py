@@ -1,4 +1,4 @@
-"""DOCX artifact generation tool for structured Markdown reports."""
+"""Generate Word documents using the user's bundled document template."""
 
 from __future__ import annotations
 
@@ -12,18 +12,28 @@ from nanobot.agent.tools.filesystem import FileToolsConfig, _FsTool
 from nanobot.agent.tools.pdf import _markdown_blocks
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
+_DEFAULT_TEMPLATE_PATH = (
+    Path(__file__).resolve().parents[2] / "skills" / "office-documents" / "assets" / "template.docx"
+)
+
 
 @tool_parameters(
     tool_parameters_schema(
-        source_path=StringSchema("Path to the Markdown or plain-text source file.", min_length=1),
-        output_path=StringSchema("Optional DOCX output path. Defaults to source_path with .docx.", nullable=True),
+        content=StringSchema("Document text, with optional Markdown formatting. Prefer this to creating a source file. Supply content or source_path, not both.", min_length=1, nullable=True),
+        source_path=StringSchema("Optional existing Markdown/plain-text source file, instead of content.", min_length=1, nullable=True),
+        output_path=StringSchema("Use the output_path returned by prepare_output. Required with content; defaults to a versioned source filename otherwise. Always use the actual returned file path.", nullable=True),
         title=StringSchema("Optional document title. Defaults to the first H1 or source filename.", nullable=True),
-        template=StringSchema("Optional template name. Use research_report for an investment report.", nullable=True),
-        required=["source_path"],
+        template_path=StringSchema("Optional user-requested DOCX template. Uses the bundled user template by default. Replaces sample body text, preserving styles, page setup, headers and footers.", nullable=True),
+        template=StringSchema("Legacy compatibility argument; named styles such as research_report no longer replace the user template.", nullable=True),
+        classification=StringSchema("Optional confidentiality label explicitly provided by the user; never infer one from the template example.", nullable=True),
+        recipient=StringSchema("Optional recipient provided by the user.", nullable=True),
+        signatory=StringSchema("Optional signing organization or person provided by the user.", nullable=True),
+        document_date=StringSchema("Optional document date provided by the user.", nullable=True),
+        required=[],
     )
 )
 class CreateDocxTool(_FsTool):
-    """Create a polished Word artifact from a Markdown or text file."""
+    """Create a Word artifact without requiring a Markdown companion."""
 
     _scopes = {"core", "subagent"}
     config_key = "file"
@@ -39,9 +49,10 @@ class CreateDocxTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Create a styled DOCX artifact from a Markdown or text file. "
-            "Use this after the final source has been written and audited; it returns the generated "
-            "file as a structured artifact. Do not install pandoc or office-conversion dependencies during a user turn."
+            "Create a DOCX using the bundled user-provided Word template. Prefer inline content "
+            "and output_path; no Markdown or HTML source/companion files are created. "
+            "An existing source_path is also supported. Returns the DOCX as a structured artifact. "
+            "Do not substitute a self-designed template or install conversion dependencies."
         )
 
     async def execute(
@@ -50,43 +61,70 @@ class CreateDocxTool(_FsTool):
         output_path: str | None = None,
         title: str | None = None,
         template: str | None = None,
+        content: str | None = None,
+        template_path: str | None = None,
+        classification: str | None = None,
+        recipient: str | None = None,
+        signatory: str | None = None,
+        document_date: str | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        if not source_path:
-            return self._error("render_failed", "source_path is required", "")
+        if (content is None) == (not source_path):
+            return self._error("render_failed", "provide exactly one of content or source_path", source_path or "")
+        if content is not None and not output_path:
+            return self._error("render_failed", "output_path is required with content", "")
 
         try:
-            source = self._resolve_read(source_path)
             output = self._resolve_write(output_path or str(Path(source_path).with_suffix(".docx")))
+            source = self._resolve_read(source_path) if source_path else output
+            word_template = self._resolve_read(template_path) if template_path else _DEFAULT_TEMPLATE_PATH
         except Exception as exc:
-            return self._error("permission_denied", str(exc), source_path)
+            return self._error("permission_denied", str(exc), source_path or "")
 
-        if source.suffix.lower() not in {".md", ".markdown", ".txt"}:
-            return self._error("render_failed", "source_path must be a Markdown or text file", str(source))
-        try:
-            content = source.read_text(encoding="utf-8")
-        except Exception as exc:
-            return self._error("render_failed", f"failed to read source: {exc}", str(source))
+        if output.suffix.lower() != ".docx":
+            return self._error("render_failed", "output_path must end in .docx", source_path or "")
+        if output == word_template.resolve():
+            return self._error("render_failed", "output_path must not overwrite the Word template", source_path or "")
+        if source_path:
+            if source.suffix.lower() not in {".md", ".markdown", ".txt"}:
+                return self._error("render_failed", "source_path must be a Markdown or text file", str(source))
+            try:
+                content = source.read_text(encoding="utf-8")
+            except Exception as exc:
+                return self._error("render_failed", f"failed to read source: {exc}", str(source))
         if not content.strip():
-            return self._error("render_failed", "source file is empty", str(source))
+            return self._error("render_failed", "document content is empty", source_path or "")
+        if not word_template.is_file():
+            return self._error("render_failed", "Word template not found", str(word_template))
 
         render_title = (title or _title_from_markdown(content, source)).strip()
         try:
-            await asyncio.to_thread(_render_docx, content, source, output, render_title, template or "research_report")
+            output = self._versioned_output_path(output)
+            staged = self._staged_output_path(output)
+            await asyncio.to_thread(
+                _render_docx, content, source, staged, render_title, word_template,
+                classification=classification, recipient=recipient,
+                signatory=signatory, document_date=document_date,
+            )
         except ModuleNotFoundError as exc:
             return self._error("dependency_missing", f"missing dependency: {exc.name}", str(source))
         except Exception as exc:
             return self._error("render_failed", str(exc), str(source))
 
-        valid, validation_error = _validate_docx(output)
+        valid, validation_error = _validate_docx(staged)
         if not valid:
             return self._error("validation_failed", validation_error, str(source))
+        try:
+            self._publish_output(staged, output)
+        except (OSError, ValueError) as exc:
+            return self._error("publish_failed", str(exc), str(source))
         size = output.stat().st_size
         return {
             "text": (
                 "DOCX created successfully\n"
-                f"source_path: {source}\n"
-                f"docx_path: {output}\n"
+                + (f"source_path: {source}\n" if source_path else "")
+                + f"template_path: {word_template}\n"
+                + f"docx_path: {output}\n"
                 f"file_size: {size}"
             ),
             "files": [{
@@ -151,44 +189,11 @@ def _add_inline(paragraph: Any, value: str) -> None:
             _set_run_text(run, token)
 
 
-def _set_style_fonts(style: Any, *, western: str, east_asian: str) -> None:
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    style.font.name = western
-    r_pr = style.element.get_or_add_rPr()
-    r_fonts = r_pr.rFonts
-    if r_fonts is None:
-        r_fonts = OxmlElement("w:rFonts")
-        r_pr.append(r_fonts)
-    r_fonts.set(qn("w:eastAsia"), east_asian)
-
-
-def _add_page_number(paragraph: Any) -> None:
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    run = paragraph.add_run()
-    fld_char_begin = OxmlElement("w:fldChar")
-    fld_char_begin.set(qn("w:fldCharType"), "begin")
-    instr_text = OxmlElement("w:instrText")
-    instr_text.set(qn("xml:space"), "preserve")
-    instr_text.text = "PAGE"
-    fld_char_end = OxmlElement("w:fldChar")
-    fld_char_end.set(qn("w:fldCharType"), "end")
-    run._r.append(fld_char_begin)
-    run._r.append(instr_text)
-    run._r.append(fld_char_end)
-
-
-def _shade_cell(cell: Any, fill: str) -> None:
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    tc_pr = cell._tc.get_or_add_tcPr()
-    shading = OxmlElement("w:shd")
-    shading.set(qn("w:fill"), fill)
-    tc_pr.append(shading)
+def _add_paragraph(document: Any, value: str = "", *, style: str = "Body Text") -> Any:
+    paragraph = document.add_paragraph(style=style if style in document.styles else "Normal")
+    if value:
+        _add_inline(paragraph, value)
+    return paragraph
 
 
 def _add_table(document: Any, rows: list[list[str]]) -> None:
@@ -196,7 +201,8 @@ def _add_table(document: Any, rows: list[list[str]]) -> None:
         return
     column_count = max(len(row) for row in rows)
     table = document.add_table(rows=0, cols=column_count)
-    table.style = "Table Grid"
+    if "Table Grid" in document.styles:
+        table.style = "Table Grid"
     for row_index, values in enumerate(rows):
         cells = table.add_row().cells
         for column_index in range(column_count):
@@ -205,7 +211,6 @@ def _add_table(document: Any, rows: list[list[str]]) -> None:
             paragraph = cell.paragraphs[0]
             _add_inline(paragraph, value)
             if row_index == 0:
-                _shade_cell(cell, "EDE8DF")
                 for run in paragraph.runs:
                     run.bold = True
     document.add_paragraph()
@@ -223,7 +228,7 @@ def _add_image(document: Any, source: Path, image_ref: str, caption: str) -> boo
             return False
         document.add_picture(str(resolved))
         if caption:
-            paragraph = document.add_paragraph(style="Caption")
+            paragraph = _add_paragraph(document, style="Caption")
             paragraph.alignment = 1
             paragraph.add_run(caption)
         return True
@@ -231,64 +236,29 @@ def _add_image(document: Any, source: Path, image_ref: str, caption: str) -> boo
         return False
 
 
-def _research_toc(content: str, title: str) -> list[tuple[int, str]]:
-    entries: list[tuple[int, str]] = []
-    for kind, value in _markdown_blocks(content):
-        if not re.fullmatch(r"h[1-3]", kind):
-            continue
-        level = int(kind[1:])
-        heading = _plain_markdown(value)
-        if heading and not (level == 1 and heading == title):
-            entries.append((level, heading))
-    return entries[:36]
-
-
-def _render_docx(content: str, source: Path, output: Path, title: str, template: str) -> None:
+def _render_docx(
+    content: str, source: Path, output: Path, title: str, template_path: Path,
+    *, classification: str | None = None, recipient: str | None = None,
+    signatory: str | None = None, document_date: str | None = None,
+) -> None:
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.shared import Cm, Pt, RGBColor
+    from docx.oxml.ns import qn
+    from docx.shared import Cm, Pt
 
-    document = Document()
-    section = document.sections[0]
-    section.top_margin = Cm(2.1)
-    section.bottom_margin = Cm(1.8)
-    section.left_margin = Cm(2.0)
-    section.right_margin = Cm(2.0)
+    # Fail clearly if the user's template is unavailable; never substitute Document().
+    document = Document(str(template_path))
+    body = document._element.body
+    for child in list(body):
+        if child.tag != qn("w:sectPr"):
+            body.remove(child)
     document.core_properties.title = title
-    document.core_properties.subject = "Research report"
-    document.core_properties.keywords = "research, report, investment"
 
-    normal = document.styles["Normal"]
-    normal.font.size = Pt(10.5)
-    _set_style_fonts(normal, western="Aptos", east_asian="Microsoft YaHei")
-    for level in range(1, 4):
-        heading = document.styles[f"Heading {level}"]
-        heading.font.color.rgb = RGBColor(41, 38, 27)
-        heading.font.size = Pt({1: 16, 2: 13, 3: 11}[level])
-        _set_style_fonts(heading, western="Aptos Display", east_asian="Microsoft YaHei")
-    caption = document.styles["Caption"]
-    caption.font.size = Pt(9)
-    _set_style_fonts(caption, western="Aptos", east_asian="Microsoft YaHei")
-
-    cover = document.add_heading(title, level=0)
-    cover.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    if template == "research_report":
-        subtitle = document.add_paragraph("研究报告 · 多角色交叉质证与数据审校")
-        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        subtitle.runs[0].font.color.rgb = RGBColor(99, 95, 83)
-        header = section.header.paragraphs[0]
-        header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        header.add_run("TPARUYI · ASSET RESEARCH")
-        document.add_page_break()
-        document.add_heading("报告目录", level=1)
-        for level, heading in _research_toc(content, title):
-            paragraph = document.add_paragraph()
-            paragraph.paragraph_format.left_indent = Cm(0.35 + (level - 1) * 0.42)
-            run = paragraph.add_run(heading)
-            run.bold = level <= 2
-        document.add_page_break()
-    else:
-        document.add_page_break()
+    if classification:
+        _add_paragraph(document, classification, style="Classification")
+    _add_paragraph(document, title, style="Title")
+    if recipient:
+        _add_paragraph(document, recipient, style="Recipient")
 
     for kind, value in _markdown_blocks(content):
         if re.fullmatch(r"h[1-6]", kind):
@@ -296,48 +266,45 @@ def _render_docx(content: str, source: Path, output: Path, title: str, template:
             heading_text = _plain_markdown(value)
             if level == 1 and heading_text == title:
                 continue
-            document.add_heading(heading_text, level=min(3, max(1, level - 1)))
+            _add_paragraph(document, heading_text, style=f"Heading {min(3, max(1, level - 1))}")
         elif kind == "image":
             caption, image_ref = value
             _add_image(document, source, image_ref, caption)
         elif kind == "paragraph":
-            paragraph = document.add_paragraph()
-            _add_inline(paragraph, value)
+            _add_paragraph(document, value)
         elif kind == "bullet":
-            paragraph = document.add_paragraph(style="List Bullet")
-            _add_inline(paragraph, value)
+            _add_paragraph(document, "• " + value)
         elif kind == "numbered":
-            _number, item = value
-            paragraph = document.add_paragraph(style="List Number")
-            _add_inline(paragraph, item)
+            number, item = value
+            _add_paragraph(document, f"{number}. {item}")
         elif kind == "blockquote":
-            paragraph = document.add_paragraph()
+            paragraph = _add_paragraph(document)
             paragraph.paragraph_format.left_indent = Cm(0.7)
             paragraph.paragraph_format.right_indent = Cm(0.4)
             _add_inline(paragraph, value)
             for run in paragraph.runs:
                 run.italic = True
         elif kind == "hr":
-            document.add_paragraph("—" * 30).alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _add_paragraph(document, "—" * 30).alignment = WD_ALIGN_PARAGRAPH.CENTER
         elif kind == "code":
-            paragraph = document.add_paragraph()
+            paragraph = _add_paragraph(document)
             paragraph.paragraph_format.left_indent = Cm(0.5)
             run = paragraph.add_run(value)
             run.font.name = "Menlo"
             run.font.size = Pt(8.5)
         elif kind == "mermaid":
-            paragraph = document.add_paragraph()
-            paragraph.add_run("图示源（请在 HTML/PDF 版本查看渲染图）：\n").bold = True
+            paragraph = _add_paragraph(document)
+            paragraph.add_run("图示源：\n").bold = True
             run = paragraph.add_run(value)
             run.font.name = "Menlo"
             run.font.size = Pt(8.5)
         elif kind == "table":
             _add_table(document, value)
 
-    footer = section.footer.paragraphs[0]
-    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    footer.add_run("TpaRuyi · ")
-    _add_page_number(footer)
+    if signatory:
+        _add_paragraph(document, signatory, style="Signature")
+    if document_date:
+        _add_paragraph(document, document_date, style="Document Date")
     output.parent.mkdir(parents=True, exist_ok=True)
     document.save(str(output))
 

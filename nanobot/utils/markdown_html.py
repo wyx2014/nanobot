@@ -89,8 +89,8 @@ def _fallback_html(markdown: str, title: str) -> str:
 </html>"""
 
 
-def _active_html_template() -> str:
-    """Resolve the explicit per-node template without guessing from content."""
+def _active_html_template() -> str | None:
+    """Only expert workflow nodes opt in to automatic HTML companions."""
     try:
         from nanobot.agent.tools.context import current_request_context
 
@@ -102,7 +102,7 @@ def _active_html_template() -> str:
         )
     except (AttributeError, ImportError):
         template = None
-    return template if template in _HTML_TEMPLATES else "simple"
+    return template if template in _HTML_TEMPLATES else None
 
 
 def write_html_companion(
@@ -111,7 +111,10 @@ def write_html_companion(
     *,
     template: str | None = None,
 ) -> Path | None:
-    """Write `<source-stem>.html`, preserving unrelated hand-authored HTML."""
+    """Write HTML only on explicit opt-in or inside an expert workflow node."""
+    resolved_template = template if template in _HTML_TEMPLATES else _active_html_template()
+    if resolved_template is None:
+        return None
     if not should_generate_html_companion(source) or not markdown.strip():
         return None
     output = source.with_suffix(".html")
@@ -123,7 +126,6 @@ def write_html_companion(
         except OSError:
             return None
     title = _title(markdown, source)
-    resolved_template = template if template in _HTML_TEMPLATES else _active_html_template()
     rendered = (
         _desktop_html(markdown, title, source, resolved_template)
         or _fallback_html(markdown, title)

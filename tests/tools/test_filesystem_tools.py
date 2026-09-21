@@ -3,6 +3,7 @@
 import pytest
 
 from nanobot.agent.skill_scope import bind_allowed_workspace_skills, reset_allowed_workspace_skills
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
@@ -435,17 +436,24 @@ class TestWorkspaceRestriction:
         assert (writable / "ok.txt").read_text(encoding="utf-8") == "allowed"
 
     @pytest.mark.asyncio
-    async def test_markdown_write_creates_html_artifact(self, tmp_path, monkeypatch):
+    async def test_expert_markdown_write_creates_html_artifact(self, tmp_path, monkeypatch):
         workspace = tmp_path / "ws"
         workspace.mkdir()
         monkeypatch.delenv("NANOBOT_HTML_RENDER_URL", raising=False)
         monkeypatch.delenv("NANOBOT_HTML_RENDER_TOKEN", raising=False)
         tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
 
-        result = await tool.execute(
-            path=str(workspace / "research.md"),
-            content="# 研究报告\n\n## 结论\n\n这是报告正文。",
-        )
+        token = bind_request_context(RequestContext(
+            channel="websocket", chat_id="research",
+            metadata={"_html_template": "research_report"},
+        ))
+        try:
+            result = await tool.execute(
+                path=str(workspace / "research.md"),
+                content="# 研究报告\n\n## 结论\n\n这是报告正文。",
+            )
+        finally:
+            reset_request_context(token)
 
         assert isinstance(result, dict)
         assert result["files"][0]["path"] == str(workspace / "research.html")

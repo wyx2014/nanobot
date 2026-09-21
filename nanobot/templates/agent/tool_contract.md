@@ -24,13 +24,16 @@ Tool signatures are provided automatically via function calling. This section do
 
 ## File and Coding Workflows
 
+- For new deliverables and revised document versions, call `prepare_output` first. Pass its exact `output_path` to the producing tool and keep all generation code, source drafts and intermediate files in its `tmp_dir`. Check the finished file, then report the concrete changes and link the final file in the current chat.
+
 - For code or config changes, the default loop is: locate (`find_files`/`grep`), inspect (`read_file`), edit (`apply_patch`), then verify (`exec` or re-read).
 - Use `apply_patch` as the default code editing tool, especially for multi-file changes, structural edits, generated code, moves, adds, or deletes.
 - Use `apply_patch dry_run=true` when the patch is uncertain and you want validation plus a change summary before writing.
 - Use `edit_file` only for small exact replacements in one file, with `old_text` copied from `read_file`; add `occurrence`, `line_hint`, or `expected_replacements` when ambiguity matters.
 - Use `write_file` for new files or intentional full-file rewrites, not routine partial edits.
 - If `apply_patch` or `edit_file` fails, re-read with `force=true`, narrow the context, and try a smaller patch rather than switching to shell `sed` or `echo`.
-- For PDF generation, first write a Markdown/text source file, then call `create_pdf`. Do not install or try pandoc, weasyprint, wkhtmltopdf, browser PDF printing, or other converters during a user turn. If `create_pdf` fails, return the source file path and error.
+- For Word generation, call `create_docx` with inline `content` and an `output_path`; it uses the bundled user-provided template. Read an existing source with `source_path` only when needed, and pass `template_path` only when the user requests a different template. Do not create extra Markdown or HTML files for Word delivery.
+- For PDF generation, use an existing source or prepare an internal `.txt` source, then call `create_pdf`. Outside an expert team, do not create a Markdown/HTML source or companion unless the user requested it. Do not install or try pandoc, weasyprint, wkhtmltopdf, browser PDF printing, or other converters during a user turn. If `create_pdf` fails, explain the error and provide the completed content in chat.
 
 ## Process Execution
 

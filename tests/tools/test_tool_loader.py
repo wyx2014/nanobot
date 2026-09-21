@@ -93,6 +93,7 @@ def test_discover_finds_concrete_tools():
     assert "CreatePdfTool" in class_names
     assert "CreateResearchChartTool" in class_names
     assert "InstallSkillTool" in class_names
+    assert "PrepareOutputTool" in class_names
     assert "MessageTool" in class_names
     assert "SpawnTool" in class_names
     assert "WriteStdinTool" in class_names
@@ -143,6 +144,7 @@ def test_loader_registers_exec_with_real_tools_config(tmp_path):
     assert "import_presentation_asset" in registered
     assert "create_research_chart" in registered
     assert "install_skill" in registered
+    assert "prepare_output" in registered
     assert registry.has("exec")
     assert registry.has("create_docx")
     assert registry.has("create_presentation")

@@ -241,7 +241,8 @@ class PresentationService:
         folder = Path(document.get("project_path", ""))
         root = Path(document.get("project_root", ""))
         if (not folder.is_absolute() or not root.is_absolute()
-                or folder != root / "presentations" / document_id
+                or folder not in {root / "tmp" / "presentations" / document_id,
+                                  root / "presentations" / document_id}
                 or folder.resolve() != folder):
             raise PresentationError("Presentation project path has changed")
         return document
@@ -285,7 +286,7 @@ class PresentationService:
             if source is None:
                 raise PresentationError("Presentation source missing")
             root = Path(project_root).expanduser().resolve()
-            folder = root / "presentations" / document_id
+            folder = root / "tmp" / "presentations" / document_id
             if not folder.resolve().is_relative_to(root) or folder.resolve() != folder:
                 raise PresentationError("Presentation path is outside the project")
             folder.mkdir(parents=True, exist_ok=False)
@@ -368,7 +369,7 @@ def presentation_runtime_lines(metadata: Any) -> list[str]:
         "Presentation selection is explicitly bound by the user and takes precedence over generic PPT skill discovery.",
         f"Document ID: {document['document_id']}; template: {template['id']}; output: {template['format']}; project: {folder}.",
         details,
-        "Keep all sources and media inside this document project. Never replace the selected template with another family.",
+        "Keep all sources and media inside this document project under workspace tmp. Existing legacy projects remain editable in their original location. Never replace the selected template with another family.",
         "The .source snapshot and presentation.json are gateway-owned. Read them but never edit them.",
         "Do not install tools, update skills, use a different exporter, or upload source material to another service. The gateway owns dependency checks and export.",
         "First outline the conclusions and evidence. " + (
@@ -377,5 +378,5 @@ def presentation_runtime_lines(metadata: Any) -> list[str]:
             "Create or revise the requested document, keeping unaffected pages unchanged."
         ),
         f"The user selected page {document['page']} for revision. Keep all other pages unchanged." if document.get("page") else "",
-        f"After writing sources call export_presentation with document_id={document['document_id']}. It selects the pinned exporter and records artifacts. Never claim success before this tool succeeds.",
+        f"After writing sources call export_presentation with document_id={document['document_id']} and the output_path from prepare_output. It selects the pinned exporter and publishes a versioned final file outside tmp, preserving previous exports. Never claim success before this tool succeeds. Summarize the actual changes and link the returned final file.",
     ]

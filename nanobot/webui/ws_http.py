@@ -91,6 +91,7 @@ from nanobot.webui.session_artifacts import (
     SessionArtifactError,
     artifact_content_type,
     discover_session_artifacts,
+    is_temporary_artifact_path,
     read_session_artifact,
     registered_artifact_row,
     resolve_session_artifact,
@@ -927,6 +928,7 @@ class GatewayHTTPHandler:
             session_key,
             turn_id=artifact_turn_id,
         )
+        artifacts = [record for record in artifacts if not is_temporary_artifact_path(record.relative_path)]
         watermark = recovery_watermark
         last_event_seq = int(watermark.get("last_event_seq") or 0)
 
@@ -1307,6 +1309,7 @@ class GatewayHTTPHandler:
             self.state.list_session_artifacts,
             decoded_key,
         )
+        records = [record for record in records if not is_temporary_artifact_path(record.relative_path)]
         await asyncio.to_thread(
             self.logs.write,
             level="warning" if migration_failures else "info",

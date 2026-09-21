@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,7 @@ def guizang(service, tmp_path):
 def test_binding_survives_restart_and_pins_source(service, tmp_path):
     source = guizang(service, tmp_path)
     document = bind(service, "guizang-editorial")
+    assert Path(document["project_path"]).parent == tmp_path / "tmp" / "presentations"
     (source / "SKILL.md").write_text("Changed upstream")
     restarted = PresentationService(tmp_path)
     rebound = bind(restarted, "guizang-editorial")
@@ -71,10 +73,10 @@ def test_binding_rejects_other_session_template_changes_and_invalid_pages(servic
 def test_project_symlink_and_snapshot_symlink_are_rejected(service, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
-    (tmp_path / "presentations").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "tmp").symlink_to(outside, target_is_directory=True)
     with pytest.raises(PresentationError):
         bind(service)
-    (tmp_path / "presentations").unlink()
+    (tmp_path / "tmp").unlink()
     source = guizang(service, tmp_path)
     (source / "scripts").symlink_to(outside, target_is_directory=True)
     with pytest.raises(PresentationError, match="symlinks"):
@@ -93,19 +95,31 @@ async def test_taiping_real_export_uses_snapshot_and_records_artifacts(service, 
     from nanobot.agent.tools import presentation_export
     script = presentation_export._script
 
-    async def without_pdf(arguments, cwd, **kwargs):
+    async def with_test_preview(arguments, cwd, **kwargs):
         if any("render_preview.py" in value for value in arguments):
-            raise PresentationError("No preview renderer in test")
+            from pypdf import PdfWriter
+            preview = Path(arguments[arguments.index("--output") + 1])
+            assert preview.is_relative_to(service.workspace / "tmp")
+            writer = PdfWriter()
+            writer.add_blank_page(width=595, height=842)
+            writer.write(preview)
+            return "{}"
         assert str(folder / ".source/assets/ppt-template.pptx") in arguments
         return await script(arguments, cwd, **kwargs)
 
-    monkeypatch.setattr(presentation_export, "_script", without_pdf)
+    monkeypatch.setattr(presentation_export, "_script", with_test_preview)
     monkeypatch.setattr(PresentationService, "source", lambda *_: None)
     result = await ExportPresentationTool(workspace=service.workspace).execute(document["document_id"])
     assert isinstance(result, dict), result
-    assert len(Presentation(folder / "presentation.pptx").slides) == 3
+    output = Path(result["files"][0]["path"])
+    assert output.parent == service.workspace
+    assert re.fullmatch(r"年度分析\d{10}\.pptx", output.name)
+    assert len(Presentation(output).slides) == 3
+    assert len(result["files"]) == 1
     saved = service.document(document["document_id"])
     assert saved["status"] == "ready" and saved["page_count"] == 3
+    preview = Path(saved["artifacts"][1]["path"])
+    assert preview.is_file() and preview.is_relative_to(service.workspace / "tmp")
     assert json.loads((folder / "presentation.json").read_text())["status"] == "ready"
 
 
@@ -119,13 +133,33 @@ async def test_html_assets_export_and_failed_revision_preserves_output(service, 
     tool = ExportPresentationTool(workspace=service.workspace)
     result = await tool.execute(document["document_id"])
     assert isinstance(result, dict), result
-    output = (folder / "presentation.html").read_text()
+    first_path = Path(result["files"][0]["path"])
+    assert first_path.parent == service.workspace
+    output = first_path.read_text()
     assert "data:image/png;base64," in output and 'src="media/chart.png"' not in output
+    (folder / "index.html").write_text('<html><section class="slide">更新结论</section></html>')
+    revision = await tool.execute(document["document_id"])
+    assert isinstance(revision, dict), revision
+    revised_path = Path(revision["files"][0]["path"])
+    assert revised_path.name == first_path.stem + "v2.html"
+    assert "更新结论" in revised_path.read_text()
     (folder / "index.html").write_text("<!-- SLIDES_HERE -->")
     assert (await tool.execute(document["document_id"])).startswith("Error:")
-    assert (folder / "presentation.html").read_text() == output
+    assert first_path.read_text() == output
+    assert {path.name for path in service.workspace.glob("*.html")} == {first_path.name, revised_path.name}
     (folder / ".source/SKILL.md").write_text("Modified template")
     assert "snapshot has changed" in await tool.execute(document["document_id"])
+
+
+def test_legacy_presentation_project_remains_editable(service, tmp_path):
+    guizang(service, tmp_path)
+    document = bind(service, "guizang-editorial")
+    legacy = service.workspace / "presentations" / document["document_id"]
+    legacy.parent.mkdir()
+    Path(document["project_path"]).rename(legacy)
+    document["project_path"] = str(legacy)
+    (service.root / "documents" / f"{document['document_id']}.json").write_text(json.dumps(document))
+    assert bind(service, "guizang-editorial")["project_path"] == str(legacy)
 
 
 def test_portable_html_rejects_external_local_path(tmp_path):

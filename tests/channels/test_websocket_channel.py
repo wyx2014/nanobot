@@ -2171,6 +2171,31 @@ async def test_send_rejects_and_logs_tool_output_outside_session_project(
 
 
 @pytest.mark.asyncio
+async def test_tmp_file_edit_events_do_not_register_deliverables(tmp_path: Path) -> None:
+    bus = MagicMock()
+    gateway = _basic_handler(bus, workspace_path=tmp_path)
+    project = gateway.state.ensure_project(tmp_path)
+    gateway.state.bind_session("websocket:chat-1", project.id)
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus, gateway=gateway)
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+    script = tmp_path / "tmp" / "generate.py"
+    script.parent.mkdir()
+    script.write_text("print('generate report')")
+
+    for phase, status in [("start", "editing"), ("end", "done")]:
+        await channel.send_file_edit_events("chat-1", [{
+            "phase": phase, "status": status, "path": "tmp/generate.py",
+            "operation": "create", "call_id": "generate-call",
+        }])
+
+    assert gateway.state.list_session_artifacts("websocket:chat-1") == []
+    assert [json.loads(call.args[0])["event"] for call in mock_ws.send.await_args_list] == [
+        "file_edit", "file_edit",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_send_file_edit_progress_uses_file_edit_event(tmp_path: Path) -> None:
     bus = MagicMock()
     project = tmp_path / "project"

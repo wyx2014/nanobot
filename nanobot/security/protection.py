@@ -659,7 +659,10 @@ class SecurityService:
                     params.get("document_id", ""), session_key
                 )
                 folder = Path(document["project_path"])
-                paths = [folder, folder / f"presentation.{document['format']}", folder / "preview.pdf"]
+                project_root = Path(document["project_root"])
+                paths = [folder, project_root, project_root / "tmp"]
+                if params.get("output_path"):
+                    paths.append(_canonical(params["output_path"], root))
             except (PresentationError, OSError):
                 return SecurityAssessment(
                     "block", "high", "file", "write", "presentation.invalid_document",
@@ -988,12 +991,12 @@ class SecurityService:
         return tool_name in {
             "write_file", "edit_file", "apply_patch", "create_docx", "create_pdf",
             "create_research_chart", "create_presentation", "import_presentation_asset",
-            "export_presentation", "install_skill",
+            "export_presentation", "install_skill", "prepare_output",
         }
 
     @staticmethod
     def _file_action(tool_name: str) -> str:
-        if tool_name.startswith("create_") or tool_name == "install_skill":
+        if tool_name.startswith("create_") or tool_name in {"install_skill", "prepare_output"}:
             return "create"
         if tool_name == "apply_patch":
             return "patch"
@@ -1004,7 +1007,9 @@ class SecurityService:
     @staticmethod
     def _tool_paths(tool_name: str, params: dict[str, Any], workspace: Path) -> list[Path]:
         values: list[str] = []
-        if tool_name == "apply_patch":
+        if tool_name == "prepare_output":
+            values.extend([params.get("directory") or ".", "tmp/.output-reservations"])
+        elif tool_name == "apply_patch":
             for edit in params.get("edits") or []:
                 if isinstance(edit, dict) and isinstance(edit.get("path"), str):
                     values.append(edit["path"])

@@ -41,7 +41,8 @@ _ASSET_USER_AGENT = (
             min_length=1,
         ),
         output_path=StringSchema(
-            "Optional PPTX output path. Defaults to source_path with .pptx.",
+            "Use the output_path returned by prepare_output. Defaults to a versioned source filename; "
+            "always use the actual returned file path.",
             nullable=True,
         ),
         preview_path=StringSchema(
@@ -50,7 +51,7 @@ _ASSET_USER_AGENT = (
             nullable=True,
         ),
         force=BooleanSchema(
-            description="Replace existing PPTX and preview files. Defaults to false.",
+            description="Allow replacing scratch files. Final deliverables always get a new version.",
             default=False,
             nullable=True,
         ),
@@ -115,27 +116,37 @@ class CreatePresentationTool(_FsTool):
             return self._error("render_failed", "preview_path must end in .pdf", str(source))
 
         try:
+            output = self._versioned_output_path(output)
+            staged = self._staged_output_path(output)
+            if preview is not None:
+                preview = self._versioned_output_path(preview)
             generation = await asyncio.to_thread(
                 _run_skill_script,
                 "generate_deck.py",
                 [
                     str(source),
                     "--output",
-                    str(output),
+                    str(staged),
                     *(["--force"] if force else []),
                 ],
             )
             validation = await asyncio.to_thread(
                 _run_skill_script,
                 "validate_deck.py",
-                [str(output), "--spec", str(source)],
+                [str(staged), "--spec", str(source)],
             )
         except PresentationScriptError as exc:
             return self._error(exc.code, exc.message, str(source))
+        except (OSError, ValueError) as exc:
+            return self._error("render_failed", str(exc), str(source))
 
         if not validation.get("ok"):
             errors = "; ".join(str(item) for item in validation.get("errors", []))
             return self._error("validation_failed", errors or "unknown validation error", str(source))
+        try:
+            self._publish_output(staged, output)
+        except (OSError, ValueError) as exc:
+            return self._error("publish_failed", str(exc), str(source))
 
         files = [_artifact(output, _PPTX_MIME)]
         messages = [
@@ -151,20 +162,24 @@ class CreatePresentationTool(_FsTool):
 
         if preview is not None:
             try:
+                staged_preview = self._staged_output_path(preview)
                 await asyncio.to_thread(
                     _run_skill_script,
                     "render_preview.py",
                     [
                         str(output),
                         "--output",
-                        str(preview),
+                        str(staged_preview),
                         *(["--force"] if force else []),
                     ],
                 )
+                self._publish_output(staged_preview, preview)
                 files.append(_artifact(preview, "application/pdf"))
                 messages.append(f"preview_path: {preview}")
             except PresentationScriptError as exc:
                 warnings.append(f"PDF preview unavailable: {exc.message}")
+            except (OSError, ValueError) as exc:
+                warnings.append(f"PDF preview unavailable: {exc}")
 
         if warnings:
             messages.append("warnings:")
@@ -193,7 +208,7 @@ class CreatePresentationTool(_FsTool):
             nullable=True,
         ),
         output_path=StringSchema(
-            "Destination .png, .jpg or .jpeg path below the active project, normally media/<name>.",
+            "Destination .png, .jpg or .jpeg path inside workspace tmp or the bound presentation source project.",
             min_length=1,
         ),
         force=BooleanSchema(

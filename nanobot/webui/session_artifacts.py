@@ -6,7 +6,7 @@ import json
 import mimetypes
 import os
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -33,6 +33,7 @@ _EXCLUDED_DIR_NAMES = frozenset({
     "node_modules",
     "sessions",
     "skills",
+    "tmp",
     "venv",
 })
 _DOCUMENT_EXTENSIONS = frozenset({
@@ -84,6 +85,19 @@ class SessionArtifactError(ValueError):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def is_temporary_artifact_path(raw_path: str, root: Path | None = None) -> bool:
+    """Scratch files can remain on disk without entering the deliverables panel."""
+    if root is not None:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        try:
+            raw_path = path.resolve(strict=False).relative_to(root.resolve()).as_posix()
+        except ValueError:
+            return False  # The workspace boundary is validated separately.
+    return any(part.casefold() == "tmp" for part in PurePosixPath(raw_path.replace("\\", "/")).parts[:-1])
 
 
 def discover_session_artifacts(
@@ -421,7 +435,7 @@ def _add_candidate(
 
 
 def _excluded_name(name: str) -> bool:
-    return name.startswith(".") or name in _EXCLUDED_DIR_NAMES
+    return name.startswith(".") or name in _EXCLUDED_DIR_NAMES or name.casefold() == "tmp"
 
 
 def _path_is_excluded(path: Path, root: Path) -> bool:

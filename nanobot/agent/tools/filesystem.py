@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import mimetypes
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -88,7 +89,7 @@ class _FsTool(Tool):
         sandbox_restricts = bool(ctx.config.exec.sandbox)
         allowed_dir = Path(ctx.workspace) if restrict else None
         extra_read = [BUILTIN_SKILLS_DIR]
-        return cls(
+        tool = cls(
             workspace=Path(ctx.workspace),
             allowed_dir=allowed_dir,
             extra_read_allowed_dirs=extra_read,
@@ -96,6 +97,8 @@ class _FsTool(Tool):
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             sandbox_restricts_workspace=sandbox_restricts,
         )
+        tool._timezone = getattr(ctx, "timezone", None)
+        return tool
 
     @property
     def _file_states(self) -> FileStates:
@@ -174,6 +177,33 @@ class _FsTool(Tool):
 
     def _resolve(self, path: str) -> Path:
         return self._resolve_read(path)
+
+    def _versioned_output_path(self, path: Path) -> Path:
+        from nanobot.utils.output_paths import prepared_output_path
+
+        workspace = self._display_workspace() or path.parent
+        self._resolve_write("tmp/.output-reservations")
+        output = prepared_output_path(workspace, path, timezone=getattr(self, "_timezone", None))
+        return self._resolve_write(str(output))
+
+    def _staged_output_path(self, output: Path) -> Path:
+        workspace = self._display_workspace() or output.parent
+        scratch = self._resolve_write(str(workspace / "tmp"))
+        if not scratch.is_relative_to(workspace.resolve()):
+            raise ValueError("workspace tmp directory must not point outside the project")
+        scratch.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="render-", dir=scratch)) / output.name
+
+    def _publish_output(self, staged: Path, output: Path) -> None:
+        from nanobot.utils.output_paths import publish_output
+
+        output = self._resolve_write(str(output))
+        workspace = self._display_workspace() or output.parent
+        if output.is_relative_to(workspace.resolve() / "tmp"):
+            output.parent.mkdir(parents=True, exist_ok=True)
+            staged.replace(output)
+        else:
+            publish_output(staged, output)
 
     def _display_workspace(self) -> Path | None:
         return current_tool_workspace(self._workspace).project_path

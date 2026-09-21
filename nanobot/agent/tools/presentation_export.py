@@ -166,6 +166,10 @@ def _preview_input(presentation, path: Path) -> Path:
 
 @tool_parameters(tool_parameters_schema(
     document_id=StringSchema("Document ID assigned by the presentation picker.", min_length=8),
+    output_path=StringSchema(
+        "Final output_path returned by prepare_output. Defaults to a new version in the document workspace.",
+        nullable=True,
+    ),
     required=["document_id"],
 ))
 class ExportPresentationTool(_FsTool):
@@ -184,11 +188,11 @@ class ExportPresentationTool(_FsTool):
             "Never install dependencies or use another renderer to bypass an export error."
         )
 
-    async def execute(self, document_id: str, **kwargs: Any) -> str | dict[str, Any]:
+    async def execute(self, document_id: str, output_path: str | None = None, **kwargs: Any) -> str | dict[str, Any]:
         with operation("presentation.export", document_id=document_id, stage="preflight") as observed:
-            return await self._execute(document_id, observed)
+            return await self._execute(document_id, observed, output_path)
 
-    async def _execute(self, document_id: str, observed: Operation) -> str | dict[str, Any]:
+    async def _execute(self, document_id: str, observed: Operation, output_path: str | None) -> str | dict[str, Any]:
         try:
             service = PresentationService(self._workspace or Path.cwd())
             session_key = current_request_session_key()
@@ -210,22 +214,35 @@ class ExportPresentationTool(_FsTool):
             if missing:
                 observed.fail("PRESENTATION_DEPENDENCY_MISSING")
                 return "Error: presentation unavailable: " + ", ".join(missing)
-            output = self._resolve_write(str(folder / f"presentation.{template['format']}"))
+            root = Path(document["project_root"])
+            business_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", document["title"]).strip(" .")[:80] or "演示文稿"
+            filename = f"{business_name}.{template['format']}"
+            for artifact in document.get("artifacts", []):
+                previous = Path(artifact["path"])
+                if previous.parent == root and previous.suffix == f".{template['format']}":
+                    filename = previous.name
+                    break
+            output = self._resolve_write(output_path or str(root / filename))
+            if output.suffix.lower() != f".{template['format']}":
+                raise PresentationError(f"output_path must end in .{template['format']}")
+            if output.is_relative_to(root / "tmp") or output.is_relative_to(folder):
+                raise PresentationError("Final presentations must be outside the source project and tmp")
+            output = self._versioned_output_path(output)
+            staged = self._staged_output_path(output)
             warnings = []
             # Publish only validated output; failed revisions preserve the last successful export.
-            with tempfile.TemporaryDirectory(prefix=".export-", dir=folder) as staging:
-                staged = Path(staging) / output.name
-                observed.details["stage"] = "render"
-                with operation("presentation.render", template_id=template["id"]):
-                    artifacts, page_count, warnings = await self._export(template, folder, source, staged)
-                observed.details["stage"] = "publish"
-                with operation("storage.artifact_publish", document_id=document_id):
-                    os.replace(staged, output)
-                artifacts.insert(0, _artifact(output, "text/html" if template["format"] == "html" else
-                                             "application/vnd.openxmlformats-officedocument.presentationml.presentation"))
+            observed.details["stage"] = "render"
+            with operation("presentation.render", template_id=template["id"]):
+                previews, page_count, warnings = await self._export(template, folder, source, staged)
+            observed.details["stage"] = "publish"
+            with operation("storage.artifact_publish", document_id=document_id):
+                self._publish_output(staged, output)
+            artifacts = [_artifact(output, "text/html" if template["format"] == "html" else
+                                   "application/vnd.openxmlformats-officedocument.presentationml.presentation")]
             observed.details["stage"] = "register"
             with operation("storage.artifact_register", document_id=document_id, page_count=page_count):
-                service.complete(document_id, artifacts=artifacts, page_count=page_count)
+                # Keep internal previews available to the presentation picker, but return only finals.
+                service.complete(document_id, artifacts=[*artifacts, *previews], page_count=page_count)
             observed.details.update({"page_count": page_count, "warning_count": len(warnings), "artifact_count": len(artifacts)})
             return {"text": json.dumps({"document_id": document_id, "template_id": template["id"],
                                         "page_count": page_count, "project_path": str(folder),
@@ -249,7 +266,7 @@ class ExportPresentationTool(_FsTool):
             warnings.extend(json.loads(validation).get("warnings", []))
             from pptx import Presentation
             page_count = len(Presentation(output).slides)
-            preview = self._resolve_write(str(folder / "preview.pdf"))
+            preview = output.parent / "preview.pdf"
             try:
                 await _script([sys.executable, str(source / "scripts/render_preview.py"),
                                str(output), "--output", str(preview), "--force"], folder)
@@ -279,18 +296,15 @@ class ExportPresentationTool(_FsTool):
             from pptx import Presentation
             presentation = Presentation(output)
             page_count = len(presentation.slides)
-            artifacts.append(_artifact(manifest, "application/yaml"))
             from nanobot.agent.skills import BUILTIN_SKILLS_DIR
             preview_script = source / "scripts/render_preview.py"
             if not preview_script.is_file():
                 preview_script = BUILTIN_SKILLS_DIR / "corporate-ppt/scripts/render_preview.py"
-            preview = self._resolve_write(str(folder / "preview.pdf"))
-            staged_preview = output.parent / "preview.pdf"
+            preview = output.parent / "preview.pdf"
             try:
                 preview_deck = _preview_input(presentation, output.parent / "preview-input.pptx")
                 await _script([sys.executable, str(preview_script), str(preview_deck),
-                               "--output", str(staged_preview), "--force"], folder)
-                os.replace(staged_preview, preview)
+                               "--output", str(preview), "--force"], folder)
                 artifacts.append(_artifact(preview, "application/pdf"))
             except (PresentationError, asyncio.TimeoutError) as exc:
                 warnings.append(f"PDF preview unavailable: {exc}")

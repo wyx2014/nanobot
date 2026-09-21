@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from PIL import Image
 
@@ -7,10 +9,11 @@ from nanobot.agent.tools.research_chart import CreateResearchChartTool
 
 
 @pytest.mark.asyncio
-async def test_create_research_chart_from_source_backed_data(tmp_path):
-    output = tmp_path / "reports" / "assets" / "revenue.png"
+@pytest.mark.parametrize("directory", ["reports", "tmp/charts"])
+async def test_create_research_chart_from_source_backed_data(tmp_path, directory):
+    requested_output = tmp_path / directory / "revenue.png"
     result = await CreateResearchChartTool(workspace=tmp_path).execute(
-        output_path=str(output),
+        output_path=str(requested_output),
         chart_type="line",
         title="收入与利润趋势",
         data={
@@ -26,6 +29,8 @@ async def test_create_research_chart_from_source_backed_data(tmp_path):
 
     assert isinstance(result, dict)
     assert "Research chart created successfully" in result["text"]
+    output = Path(result["files"][0]["path"])
+    assert (output == requested_output) == directory.startswith("tmp/")
     assert output.exists()
     assert Image.open(output).size == (1600, 900)
     assert result["files"][0]["mime_type"] == "image/png"

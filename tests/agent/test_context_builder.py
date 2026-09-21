@@ -249,6 +249,16 @@ class TestBundledToolContract:
         assert "They never override the current project root" in prompt
         assert prompt.index(str(external)) < prompt.index(boundary)
 
+    def test_deliverable_contract_covers_versions_scratch_and_final_handoff(self, tmp_path):
+        prompt = _builder(tmp_path, timezone="Asia/Shanghai").build_system_prompt(channel="websocket")
+        assert "call `prepare_output`" in prompt
+        assert "周报2026092010.docx" in prompt
+        assert "周报2026092010v2.docx" in prompt
+        assert f"{tmp_path}/tmp/" in prompt
+        assert "Preserve prior deliverables" in prompt
+        assert "1–3 concrete points" in prompt
+        assert "clickable link to each final file" in prompt
+
 
 # ---------------------------------------------------------------------------
 # _build_user_content

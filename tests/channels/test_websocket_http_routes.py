@@ -930,6 +930,12 @@ async def test_session_artifact_routes_list_and_serve_workspace_file(
             unrelated,
             relation_type="referenced",
         )
+        scratch = tmp_path / "tmp" / "preview.pdf"
+        scratch.parent.mkdir()
+        scratch.write_bytes(b"%PDF-internal-preview")
+        channel.gateway.state.register_artifact(
+            "websocket:artifact-chat", scratch, relation_type="generated",
+        )
         repaired = await _http_get(
             "http://127.0.0.1:29938/api/sessions/"
             "websocket%3Aartifact-chat/thread",
@@ -937,7 +943,7 @@ async def test_session_artifact_routes_list_and_serve_workspace_file(
         )
         assert repaired.status_code == 200
         assert all(
-            artifact["path"] != "reports/another-session.pdf"
+            artifact["path"] not in {"reports/another-session.pdf", "tmp/preview.pdf"}
             for artifact in repaired.json()["artifacts"]
         )
         listing = await _http_get(
@@ -946,6 +952,7 @@ async def test_session_artifact_routes_list_and_serve_workspace_file(
             headers=auth,
         )
         assert listing.status_code == 200
+        assert all(artifact["path"] != "tmp/preview.pdf" for artifact in listing.json()["artifacts"])
         row = next(
             artifact
             for artifact in listing.json()["artifacts"]

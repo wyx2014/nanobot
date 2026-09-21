@@ -102,6 +102,7 @@ async def test_create_presentation_from_corporate_spec(tmp_path: Path) -> None:
     )
 
     assert isinstance(result, dict), result
+    output = Path(result["files"][0]["path"])
     assert result["files"] == [
         {
             "path": str(output),
@@ -178,6 +179,7 @@ async def test_preview_failure_keeps_valid_pptx(
     )
 
     assert isinstance(result, dict), result
+    output = Path(result["files"][0]["path"])
     assert output.is_file()
     assert not preview.exists()
     assert len(result["files"]) == 1
@@ -270,6 +272,7 @@ async def test_rich_visual_slides_remain_editable(tmp_path: Path) -> None:
     )
 
     assert isinstance(result, dict), result
+    output = Path(result["files"][0]["path"])
     presentation = Presentation(output)
     assert len(presentation.slides) == 7
     assert sum(
@@ -306,6 +309,7 @@ async def test_long_content_title_stays_clear_of_template_logo(tmp_path: Path) -
     )
 
     assert isinstance(result, dict), result
+    output = Path(result["files"][0]["path"])
     presentation = Presentation(output)
     title_shape = next(
         shape for shape in presentation.slides[1].shapes if getattr(shape, "text", "") == title

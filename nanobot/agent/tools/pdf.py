@@ -25,7 +25,7 @@ _MARKDOWN_IMAGE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
 @tool_parameters(
     tool_parameters_schema(
         source_path=StringSchema("Path to the Markdown or plain-text source file.", min_length=1),
-        output_path=StringSchema("Optional PDF output path. Defaults to source_path with .pdf.", nullable=True),
+        output_path=StringSchema("Use the output_path returned by prepare_output. Defaults to a versioned source filename; always use the actual returned file path.", nullable=True),
         title=StringSchema("Optional document title.", nullable=True),
         template=StringSchema("Optional template name: simple or research_report.", nullable=True),
         timeout_seconds=IntegerSchema(
@@ -90,12 +90,14 @@ class CreatePdfTool(_FsTool):
         timeout = timeout_seconds or _DEFAULT_TIMEOUT_SECONDS
         try:
             render_title = title or _title_from_source(source)
+            output = self._versioned_output_path(output)
+            staged = self._staged_output_path(output)
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     _render_pdf,
                     content,
                     source,
-                    output,
+                    staged,
                     render_title,
                     template or "simple",
                 ),
@@ -108,9 +110,13 @@ class CreatePdfTool(_FsTool):
         except Exception as exc:
             return self._error("render_failed", str(exc), str(source))
 
-        ok, validation_error = _validate_pdf(output)
+        ok, validation_error = _validate_pdf(staged)
         if not ok:
             return self._error("validation_failed", validation_error, str(source))
+        try:
+            self._publish_output(staged, output)
+        except (OSError, ValueError) as exc:
+            return self._error("publish_failed", str(exc), str(source))
 
         size = output.stat().st_size
         return {

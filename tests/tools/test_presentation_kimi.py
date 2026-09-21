@@ -193,10 +193,13 @@ async def test_bound_local_export_and_failed_revision_preserves_last_file(tmp_pa
         assert json.loads(result["text"])["page_count"] == 2
         assert service.document(document["document_id"])["status"] == "ready"
         assert "export_presentation" in await CreatePresentationTool(workspace=tmp_path).execute(spec_path=str(folder / "deck.pptd"))
-        before = (folder / "presentation.pptx").read_bytes()
+        output = Path(result["files"][0]["path"])
+        assert output.parent == tmp_path
+        assert len(result["files"]) == 1
+        before = output.read_bytes()
         data["elements"][0]["series"][0]["type"] = "waterfall"
         (folder / "pages/data.page").write_text(yaml.safe_dump(data))
         assert (await tool.execute(document["document_id"])).startswith("Error:")
-        assert (folder / "presentation.pptx").read_bytes() == before
+        assert output.read_bytes() == before
     finally:
         reset_request_context(token)

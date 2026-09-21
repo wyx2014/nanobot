@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import base64
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 from PIL import Image
-
 from pypdf import PdfReader, PdfWriter
 
 import nanobot.agent.tools.pdf as pdf_tools
@@ -128,12 +128,13 @@ async def test_create_pdf_from_markdown(tmp_path):
 
     assert isinstance(result, dict)
     assert "PDF created successfully" in result["text"]
+    output = Path(result["files"][0]["path"])
     assert output.exists()
     assert output.stat().st_size > 1_000
     assert "page_count:" in result["text"]
     assert result["files"] == [{
         "path": str(output),
-        "name": "report.pdf",
+        "name": output.name,
         "mime_type": "application/pdf",
         "size": output.stat().st_size,
     }]

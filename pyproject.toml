@@ -172,6 +172,7 @@ include = [
     "nanobot/skills/**/*.json",
     "nanobot/skills/**/*.js",
     "nanobot/skills/**/*.pptx",
+    "nanobot/skills/**/*.docx",
     "nanobot/skills/**/*.sh",
     "nanobot/skills/**/*.yaml",
     "nanobot/skills/**/*.yml",

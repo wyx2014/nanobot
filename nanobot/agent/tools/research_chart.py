@@ -21,7 +21,8 @@ _HEIGHT = 900
 @tool_parameters(
     tool_parameters_schema(
         output_path=StringSchema(
-            "PNG output path, relative to the current project. Put report figures under reports/assets/.",
+            "PNG path. Put embedded report figures inside workspace tmp. For a standalone final chart, "
+            "use output_path from prepare_output; always read the actual path returned by this tool.",
             min_length=1,
         ),
         chart_type=StringSchema(
@@ -67,7 +68,7 @@ class CreateResearchChartTool(_FsTool):
         return (
             "Create a source-backed local PNG chart for a research report. Use only figures already collected "
             "from cited sources; never estimate or fabricate values merely to make a chart. After success, insert "
-            "the returned relative PNG path into Markdown as ![caption](assets/file.png)."
+            "the returned chart_path into the requested document; embedded figures belong in workspace tmp."
         )
 
     async def execute(
@@ -89,14 +90,20 @@ class CreateResearchChartTool(_FsTool):
             if output.suffix.lower() != ".png":
                 return "Error: render_failed: output_path must end in .png"
             categories, series = _normalize_chart_data(data)
-            await asyncio.to_thread(_render_chart, output, chart_type, title, categories, series, unit or "", source)
+            output = self._versioned_output_path(output)
+            staged = self._staged_output_path(output)
+            await asyncio.to_thread(_render_chart, staged, chart_type, title, categories, series, unit or "", source)
+            from PIL import Image
+            with Image.open(staged) as rendered:
+                rendered.verify()
+            self._publish_output(staged, output)
         except ModuleNotFoundError as exc:
             return f"Error: dependency_missing: missing dependency: {exc.name}"
         except Exception as exc:
             return f"Error: render_failed: {exc}"
 
         size = output.stat().st_size
-        markdown_reference = f"assets/{output.name}" if output.parent.name == "assets" else output.name
+        markdown_reference = str(output)
         return {
             "text": (
                 "Research chart created successfully\n"
