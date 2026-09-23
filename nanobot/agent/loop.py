@@ -46,6 +46,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.command.t46u import execute_dial_intent, parse_dial_intent
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.cron.session_turns import (
     cron_history_overrides,
@@ -3623,7 +3624,25 @@ class AgentLoop:
         cmd_ctx = CommandContext(
             msg=ctx.msg, session=ctx.session, key=ctx.session_key, raw=raw, loop=self
         )
-        result = await self.commands.dispatch(cmd_ctx)
+        result = None
+        # Desktop phone commands must not depend on the model discovering a
+        # Markdown skill or choosing to call exec. Run only direct instructions.
+        if os.environ.get("NANOBOT_DESKTOP_GATEWAY") == "1" and ctx.msg.channel == "websocket":
+            intent = parse_dial_intent(raw)
+            if intent and any(
+                entry["name"] == "call"
+                for entry in self.context.skills.list_skills()
+            ):
+                content = await asyncio.to_thread(execute_dial_intent, self.workspace, intent)
+                logger.info("Desktop skill call handled {} instruction", intent.action)
+                result = OutboundMessage(
+                    channel=ctx.msg.channel,
+                    chat_id=ctx.msg.chat_id,
+                    content=content,
+                    metadata=dict(ctx.msg.metadata or {}),
+                )
+        if result is None:
+            result = await self.commands.dispatch(cmd_ctx)
         if result is not None:
             ctx.outbound = result
             # Shortcut commands skip BUILD and SAVE, so we must persist the

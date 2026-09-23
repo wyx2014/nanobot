@@ -1,0 +1,8 @@
+{
+  "caller": "本机四位分机号",
+  "pbx_ip": "12.100.10.9",
+  "username": "admin",
+  "password": "话机登录密码",
+  "scheme": "https",
+  "outgoing_prefix": "9"
+}
