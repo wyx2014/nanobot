@@ -22,6 +22,20 @@ _BLOCKED_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),         # link-local v6
 ]
 
+# Explicitly configured MCP services may live on LANs, VPNs, or localhost.
+# The exception is scoped to their origin; link-local/metadata stays blocked.
+_CONFIGURED_SERVICE_NETWORKS = [
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "172.16.0.0/12",
+        "192.168.0.0/16", "::1/128", "fc00::/7",
+    )
+]
+_CLOUD_METADATA_ADDRESSES = {
+    ipaddress.ip_address("100.100.100.200"),
+    ipaddress.ip_address("fd00:ec2::254"),
+}
+
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
 _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
@@ -106,13 +120,19 @@ def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return any(normalized in net for net in _BLOCKED_NETWORKS)
 
 
-def validate_url_target(url: str, *, allow_loopback: bool = False) -> tuple[bool, str]:
+def validate_url_target(
+    url: str, *, allow_loopback: bool = False, configured_service_url: str | None = None,
+) -> tuple[bool, str]:
     """Validate a URL is safe to fetch: scheme, hostname, and resolved IPs.
 
     ``allow_loopback`` is intentionally narrow: it only permits literal
     loopback hosts (localhost, 127.0.0.0/8, ::1) when every resolved address is
     loopback. It does not allow RFC1918, link-local, metadata, or public DNS
     names that happen to resolve to loopback.
+
+    ``configured_service_url`` permits LAN/VPN/loopback addresses only for
+    that explicitly configured service's scheme, hostname, and port. Other
+    destinations, including redirects, retain the default SSRF checks.
 
     Returns (ok, error_message).  When ok is True, error_message is empty.
     """
@@ -148,8 +168,25 @@ def validate_url_target(url: str, *, allow_loopback: bool = False) -> tuple[bool
         addrs.append(addr)
     if allow_loopback and _is_allowed_loopback_target(hostname, addrs):
         return True, ""
+    configured_origin = False
+    if configured_service_url:
+        try:
+            service = urlparse(configured_service_url)
+            configured_origin = (
+                p.scheme == service.scheme
+                and hostname.lower().rstrip(".") == (service.hostname or "").lower().rstrip(".")
+                and (p.port if p.port is not None else (443 if p.scheme == "https" else 80))
+                == (service.port if service.port is not None else (443 if service.scheme == "https" else 80))
+            )
+        except ValueError:
+            configured_origin = False
     for addr in addrs:
         if _is_private(addr):
+            normalized = _normalize_addr(addr)
+            if configured_origin and normalized not in _CLOUD_METADATA_ADDRESSES and any(
+                normalized in net for net in _CONFIGURED_SERVICE_NETWORKS
+            ):
+                continue
             return False, f"Blocked: {hostname} resolves to private/internal address {addr}"
 
     return True, ""

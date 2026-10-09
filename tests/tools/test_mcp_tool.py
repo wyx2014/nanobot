@@ -489,10 +489,100 @@ async def test_connect_mcp_servers_logs_stdio_pollution_hint(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "host", ["10.17.22.116", "10.94.211.66", "172.20.1.2", "192.168.50.10", "127.0.0.1"],
+)
+@pytest.mark.parametrize("transport", ["sse", "streamableHttp"])
+async def test_configured_private_mcp_connects_without_global_whitelist(
+    host, transport, fake_mcp_runtime, monkeypatch,
+):
+    endpoint = f"http://{host}:32300/mcp"
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+    sent = []
+
+    async def reachable(_url):
+        return True
+
+    def handler(request):
+        sent.append(str(request.url))
+        return httpx.Response(200, json={}, request=request)
+
+    original_client = httpx.AsyncClient
+
+    def client(**kwargs):
+        return original_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    @asynccontextmanager
+    async def sse(url, httpx_client_factory):
+        async with httpx_client_factory() as http_client:
+            await http_client.post(url)
+        yield object(), object()
+
+    @asynccontextmanager
+    async def http(url, http_client):
+        await http_client.post(url)
+        yield object(), object(), object()
+
+    monkeypatch.setattr(mcp_mod, "_probe_http_url", reachable)
+    monkeypatch.setattr(mcp_mod.httpx, "AsyncClient", client)
+    monkeypatch.setattr(sys.modules["mcp.client.sse"], "sse_client", sse)
+    monkeypatch.setattr(sys.modules["mcp.client.streamable_http"], "streamable_http_client", http)
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers({"internal": MCPServerConfig(type=transport, url=endpoint)}, registry)
+    try:
+        assert sent == [endpoint]
+        assert registry.tool_names == ["mcp_internal_demo"]
+        assert mcp_mod.validate_url_target(endpoint)[0] is False
+    finally:
+        for stack in stacks.values():
+            await stack.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["sse", "streamableHttp"])
+async def test_private_mcp_redirects_keep_the_configured_origin_boundary(transport, monkeypatch):
+    endpoint = "http://10.17.22.116:32300/mcp"
+    sent = []
+
+    async def reachable(_url):
+        return True
+
+    def handler(request):
+        sent.append(str(request.url))
+        location = "/messages" if request.url.path == "/mcp" else "http://10.17.22.117:32300/private"
+        return httpx.Response(302, headers={"Location": location}, request=request)
+
+    original_client = httpx.AsyncClient
+
+    def client(**kwargs):
+        return original_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    @asynccontextmanager
+    async def sse(url, httpx_client_factory):
+        async with httpx_client_factory() as http_client:
+            await http_client.get(url)
+        yield object(), object()
+
+    @asynccontextmanager
+    async def http(url, http_client):
+        await http_client.get(url)
+        yield object(), object(), object()
+
+    monkeypatch.setattr(mcp_mod, "_probe_http_url", reachable)
+    monkeypatch.setattr(mcp_mod.httpx, "AsyncClient", client)
+    monkeypatch.setattr(sys.modules["mcp.client.sse"], "sse_client", sse)
+    monkeypatch.setattr(sys.modules["mcp.client.streamable_http"], "streamable_http_client", http)
+    registry = ToolRegistry()
+    assert await connect_mcp_servers({"internal": MCPServerConfig(type=transport, url=endpoint)}, registry) == {}
+    assert sent == [endpoint, "http://10.17.22.116:32300/messages"]
+    assert registry.tool_names == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "config",
     [
-        MCPServerConfig(url="http://127.0.0.1:9/sse"),
-        MCPServerConfig(type="streamableHttp", url="http://127.0.0.1:9/mcp"),
+        MCPServerConfig(url="http://169.254.169.254:9/sse"),
+        MCPServerConfig(type="streamableHttp", url="http://169.254.169.254:9/mcp"),
     ],
 )
 async def test_connect_mcp_servers_rejects_unsafe_http_urls_before_probe(
@@ -541,7 +631,8 @@ async def test_connect_mcp_servers_http_clients_reject_unsafe_redirect_targets(
     sent_urls: list[str] = []
     used_transports: list[str] = []
 
-    def _validate(url: str) -> tuple[bool, str]:
+    def _validate(url: str, *, configured_service_url: str | None = None) -> tuple[bool, str]:
+        assert configured_service_url == config.url
         checked_urls.append(url)
         if url == "http://127.0.0.1/private":
             return False, "loopback blocked"
@@ -656,7 +747,7 @@ async def test_connect_mcp_servers_streamable_http_uses_finite_timeout(
     async def _reachable(_url: str) -> bool:
         return True
 
-    def _validate(_url: str) -> tuple[bool, str]:
+    def _validate(_url: str, **_kwargs) -> tuple[bool, str]:
         return True, ""
 
     @asynccontextmanager

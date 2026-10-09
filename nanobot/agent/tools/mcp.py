@@ -8,6 +8,7 @@ import time
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
+from functools import partial
 from pathlib import Path
 from typing import Any, Mapping
 from weakref import WeakKeyDictionary
@@ -204,9 +205,13 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
         return False
 
 
-async def _validate_mcp_request_url(request: httpx.Request) -> None:
+async def _validate_mcp_request_url(
+    request: httpx.Request, *, configured_service_url: str | None = None,
+) -> None:
     """Validate each outgoing MCP HTTP request, including redirect targets."""
-    ok, error = validate_url_target(str(request.url))
+    ok, error = validate_url_target(
+        str(request.url), configured_service_url=configured_service_url,
+    )
     if not ok:
         raise httpx.RequestError(
             f"Blocked unsafe MCP URL {request.url} ({error})",
@@ -961,7 +966,7 @@ async def connect_mcp_servers(
                     return name, None
 
             if transport_type in {"sse", "streamableHttp"}:
-                ok, error = validate_url_target(cfg.url)
+                ok, error = validate_url_target(cfg.url, configured_service_url=cfg.url)
                 if not ok:
                     record_connection(name, "failed", "Endpoint blocked by network policy. Check the allowed network ranges.")
                     logger.warning(
@@ -1011,7 +1016,7 @@ async def connect_mcp_servers(
                     }
                     return httpx.AsyncClient(
                         headers=merged_headers or None,
-                        event_hooks={"request": [_validate_mcp_request_url]},
+                        event_hooks={"request": [partial(_validate_mcp_request_url, configured_service_url=cfg.url)]},
                         follow_redirects=True,
                         timeout=timeout,
                         auth=auth,
@@ -1030,7 +1035,7 @@ async def connect_mcp_servers(
                 http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
-                        event_hooks={"request": [_validate_mcp_request_url]},
+                        event_hooks={"request": [partial(_validate_mcp_request_url, configured_service_url=cfg.url)]},
                         follow_redirects=True,
                         timeout=httpx.Timeout(30.0, connect=10.0),
                     )

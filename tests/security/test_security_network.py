@@ -10,6 +10,8 @@ import pytest
 from nanobot.security.network import (
     configure_ssrf_whitelist,
     contains_internal_url,
+    reset_network_policy,
+    set_network_policy,
     validate_url_target,
 )
 
@@ -83,6 +85,47 @@ def _fake_resolve_v6(host: str, results: list[str]):
             return entries
         raise socket.gaierror(f"cannot resolve {hostname}")
     return _resolver
+
+
+@pytest.mark.parametrize("address", [
+    "10.17.22.116", "10.94.211.66", "172.16.5.1", "192.168.1.10",
+    "100.64.1.2", "127.0.0.1", "::1", "fd00::123", "::ffff:10.17.22.116",
+])
+def test_configured_service_allows_its_private_origin_without_global_exception(address):
+    endpoint = "http://mcp.corp:32300/api/proxy/mcp"
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_v6("mcp.corp", [address])):
+        assert validate_url_target(endpoint, configured_service_url=endpoint) == (True, "")
+        assert validate_url_target(endpoint + "/messages", configured_service_url=endpoint) == (True, "")
+        assert validate_url_target(endpoint)[0] is False
+
+
+@pytest.mark.parametrize("endpoint", [
+    "http://other.corp:32300/mcp", "http://mcp.corp:32301/mcp", "https://mcp.corp:32300/mcp",
+])
+def test_configured_service_does_not_grant_other_private_origins(endpoint):
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve("mcp.corp", ["10.17.22.116"])):
+        assert validate_url_target(
+            "http://mcp.corp:32300/mcp", configured_service_url=endpoint,
+        )[0] is False
+
+
+@pytest.mark.parametrize("address", [
+    "169.254.169.254", "169.254.1.1", "0.0.0.0", "fe80::1", "::ffff:169.254.169.254",
+    "100.100.100.200", "::ffff:100.100.100.200", "fd00:ec2::254",
+])
+def test_configured_service_still_blocks_metadata_and_link_local(address):
+    endpoint = "http://mcp.corp/mcp"
+    with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_v6("mcp.corp", [address])):
+        assert validate_url_target(endpoint, configured_service_url=endpoint)[0] is False
+
+
+def test_configured_service_respects_domain_policy():
+    endpoint = "http://mcp.corp/mcp"
+    token = set_network_policy(block_all=False, allow_domains=[], deny_domains=["mcp.corp"])
+    try:
+        assert validate_url_target(endpoint, configured_service_url=endpoint)[0] is False
+    finally:
+        reset_network_policy(token)
 
 
 def test_blocks_ipv6_mapped_loopback():
