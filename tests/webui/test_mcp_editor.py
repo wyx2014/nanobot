@@ -1,6 +1,7 @@
 """Desktop MCP configuration regression tests using an isolated config file."""
 
 import json
+import socket
 import sys
 from contextlib import AsyncExitStack
 from unittest.mock import AsyncMock
@@ -148,6 +149,47 @@ async def test_ssrf_remains_blocked(reload_mcp):
     result = await editor.mcp_editor_action("probe", remote(url="http://169.254.169.254/mcp"), reload_mcp)
     assert result["probe"]["ok"] is False
     assert loader.load_config().tools.mcp_servers == {}
+
+
+@pytest.mark.parametrize("transport", ["sse", "streamableHttp"])
+@pytest.mark.parametrize("host", ["10.20.30.40", "172.20.1.2", "192.168.1.2", "docs.corp"])
+async def test_unsaved_private_probe_reaches_transport_without_granting_global_access(
+    host, transport, reload_mcp, monkeypatch,
+):
+    from nanobot.agent.tools import mcp
+    from nanobot.security.network import validate_url_target
+
+    # Simulate intranet DNS and stop at the TCP boundary; no network access is needed.
+    monkeypatch.setattr("nanobot.security.network.socket.getaddrinfo", lambda *_: [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.20.30.40", 0)),
+    ])
+    probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(mcp, "_probe_http_url", probe)
+    endpoint = f"http://{host}:32300/mcp"
+    result = await editor.mcp_editor_action("probe", remote(url=endpoint, type=transport), reload_mcp)
+    probe.assert_awaited_once_with(endpoint)
+    assert "Cannot reach the server" in result["probe"]["message"]
+    assert loader.load_config().tools.mcp_servers == {}
+    assert not validate_url_target(endpoint)[0]
+    reload_mcp.assert_not_called()
+
+
+async def test_probe_dns_failure_is_not_reported_as_policy_block(reload_mcp, monkeypatch):
+    from nanobot.agent.tools import mcp
+
+    def unresolved(*_args):
+        raise socket.gaierror("offline test")
+
+    monkeypatch.setattr("nanobot.security.network.socket.getaddrinfo", unresolved)
+    probe = AsyncMock()
+    monkeypatch.setattr(mcp, "_probe_http_url", probe)
+    result = await editor.mcp_editor_action(
+        "probe", remote(url="http://missing.corp/mcp?api_key=test-secret"), reload_mcp,
+    )
+    assert result["probe"]["ok"] is False
+    assert "Cannot resolve" in result["probe"]["message"]
+    assert "test-secret" not in json.dumps(result)
+    probe.assert_not_awaited()
 
 
 async def test_existing_mixed_case_identifier_survives_edit_toggle_and_remove(reload_mcp):

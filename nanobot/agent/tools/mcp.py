@@ -968,11 +968,16 @@ async def connect_mcp_servers(
             if transport_type in {"sse", "streamableHttp"}:
                 ok, error = validate_url_target(cfg.url, configured_service_url=cfg.url)
                 if not ok:
-                    record_connection(name, "failed", "Endpoint blocked by network policy. Check the allowed network ranges.")
+                    if error.startswith("Cannot resolve hostname:"):
+                        message = "Cannot resolve the MCP hostname. Check the server address and intranet DNS."
+                    elif error.startswith(("Blocked by denied domain rule:", "Blocked by default network policy:")):
+                        message = "Endpoint blocked by domain policy. Check the allowed and denied domains."
+                    else:
+                        message = "Endpoint blocked by network policy. Check the allowed network ranges."
+                    record_connection(name, "failed", message)
                     logger.warning(
-                        "MCP server '{}': blocked unsafe URL {} ({})",
+                        "MCP server '{}': blocked unsafe URL ({})",
                         name,
-                        cfg.url,
                         error,
                     )
                     await server_stack.aclose()

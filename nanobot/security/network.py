@@ -39,6 +39,7 @@ _CLOUD_METADATA_ADDRESSES = {
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
 _allowed_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+_configured_mcp_origins: frozenset[tuple[str, str, int]] = frozenset()
 _domain_policy: ContextVar[tuple[bool, tuple[str, ...], tuple[str, ...]] | None] = (
     ContextVar("nanobot_network_domain_policy", default=None)
 )
@@ -98,6 +99,40 @@ def configure_ssrf_whitelist(cidrs: list[str]) -> None:
     _allowed_networks = nets
 
 
+def _url_origin(url: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.hostname:
+            port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+            return parsed.scheme, parsed.hostname.lower().rstrip("."), port
+    except ValueError:
+        pass
+    return None
+
+
+def configure_mcp_service_urls(urls: list[str]) -> None:
+    """Replace trusted origins from enabled remote MCP configuration; discard secrets."""
+    global _configured_mcp_origins
+    _configured_mcp_origins = frozenset(origin for url in urls if (origin := _url_origin(url)))
+
+
+def _is_configured_origin(url: str, configured_service_url: str | None = None) -> bool:
+    origin = _url_origin(url)
+    if origin is None:
+        return False
+    if configured_service_url is not None:
+        # A transport's requests must stay scoped to its own service, including redirects.
+        return origin == _url_origin(configured_service_url)
+    return origin in _configured_mcp_origins
+
+
+def _is_configured_service_address(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    normalized = _normalize_addr(addr)
+    return normalized not in _CLOUD_METADATA_ADDRESSES and any(
+        normalized in net for net in _CONFIGURED_SERVICE_NETWORKS
+    )
+
+
 def _normalize_addr(
     addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -133,6 +168,8 @@ def validate_url_target(
     ``configured_service_url`` permits LAN/VPN/loopback addresses only for
     that explicitly configured service's scheme, hostname, and port. Other
     destinations, including redirects, retain the default SSRF checks.
+    Without it, enabled remote MCP origins loaded from config are recognized
+    by the shared web and command guards as well.
 
     Returns (ok, error_message).  When ok is True, error_message is empty.
     """
@@ -168,24 +205,10 @@ def validate_url_target(
         addrs.append(addr)
     if allow_loopback and _is_allowed_loopback_target(hostname, addrs):
         return True, ""
-    configured_origin = False
-    if configured_service_url:
-        try:
-            service = urlparse(configured_service_url)
-            configured_origin = (
-                p.scheme == service.scheme
-                and hostname.lower().rstrip(".") == (service.hostname or "").lower().rstrip(".")
-                and (p.port if p.port is not None else (443 if p.scheme == "https" else 80))
-                == (service.port if service.port is not None else (443 if service.scheme == "https" else 80))
-            )
-        except ValueError:
-            configured_origin = False
+    configured_origin = _is_configured_origin(url, configured_service_url)
     for addr in addrs:
         if _is_private(addr):
-            normalized = _normalize_addr(addr)
-            if configured_origin and normalized not in _CLOUD_METADATA_ADDRESSES and any(
-                normalized in net for net in _CONFIGURED_SERVICE_NETWORKS
-            ):
+            if configured_origin and _is_configured_service_address(addr):
                 continue
             return False, f"Blocked: {hostname} resolves to private/internal address {addr}"
 
@@ -207,9 +230,10 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
     if not policy_ok:
         return False, policy_error
 
+    configured_origin = _is_configured_origin(url)
     try:
         addr = ipaddress.ip_address(hostname)
-        if _is_private(addr):
+        if _is_private(addr) and not (configured_origin and _is_configured_service_address(addr)):
             return False, f"Redirect target is a private address: {addr}"
     except ValueError:
         # hostname is a domain name, resolve it
@@ -222,7 +246,7 @@ def validate_resolved_url(url: str) -> tuple[bool, str]:
                 addr = ipaddress.ip_address(info[4][0])
             except ValueError:
                 continue
-            if _is_private(addr):
+            if _is_private(addr) and not (configured_origin and _is_configured_service_address(addr)):
                 return False, f"Redirect target {hostname} resolves to private address {addr}"
 
     return True, ""

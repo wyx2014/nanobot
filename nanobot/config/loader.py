@@ -61,14 +61,24 @@ def load_config(config_path: Path | None = None) -> Config:
 
 
 def _apply_ssrf_whitelist(config: Config) -> None:
-    """Apply SSRF whitelist from config to the network security module."""
+    """Refresh explicit CIDRs and enabled MCP service origins from configuration."""
     from nanobot.runtime.dependencies import configure_package_sources, package_source_cidrs
-    from nanobot.security.network import configure_ssrf_whitelist
+    from nanobot.security.network import configure_mcp_service_urls, configure_ssrf_whitelist
 
     configure_package_sources(config.tools.package_sources)
     configure_ssrf_whitelist([
         *config.tools.ssrf_whitelist, *package_source_cidrs(config.tools.package_sources),
     ])
+    service_urls = []
+    for server in config.tools.mcp_servers.values():
+        if not server.enabled or server.type == "stdio" or (not server.type and server.command):
+            continue
+        try:
+            service_urls.append(_resolve_in_place(server.url))
+        except ValueError:
+            # An unresolved service must not grant access or break the settings editor.
+            continue
+    configure_mcp_service_urls(service_urls)
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
@@ -86,6 +96,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    _apply_ssrf_whitelist(config)
 
 
 _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")

@@ -18,6 +18,8 @@ All outbound HTTP requests from agent tools must pass through `validate_url_targ
 
 General tool exceptions use `configure_ssrf_whitelist(cidrs)`, which reads from `config.tools.ssrf_whitelist` at load time.
 
+Enabled remote MCP services also grant the shared web and command URL guards access to their exact scheme, hostname, and port. `configure_mcp_service_urls` replaces these origins when configuration is loaded or saved, so changing, disabling, or removing a service revokes its previous origin. It stores no credentials and does not grant access to the service's whole IP range. Domain policies, link-local and metadata restrictions still apply. Unsaved MCP probes do not register an origin globally.
+
 HTTP/SSE MCP transports are part of this boundary: validate configured MCP URLs before probing or constructing clients, and validate each outgoing HTTP request before redirects are followed. An explicitly configured MCP endpoint grants LAN/VPN/loopback access only to its own scheme, hostname, and port via `validate_url_target(..., configured_service_url=...)`. This does not change the global whitelist or permit other private redirect targets. Link-local and cloud metadata endpoints remain blocked unless explicitly whitelisted. Stdio MCP servers are not part of the HTTP SSRF path.
 
 **Rule**: Do not add direct `httpx.get` / `requests.get` calls in tools. Route through the existing web fetch utilities or replicate the `validate_url_target` check.
